@@ -1,0 +1,46 @@
+{
+  "name": "claude-workflow",
+  "version": "0.1.0",
+  "description": "Claude Code launcher with a local Anthropic-compatible gateway for Codex-backed workflow subagents.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "claude-workflow": "js/cli/claude-workflow.js",
+    "claude-workflow-gateway": "js/anthropic-gateway-index.js"
+  },
+  "scripts": {
+    "start": "node js/cli/claude-workflow.js",
+    "start:gateway": "node js/anthropic-gateway-index.js",
+    "check": "node --check js/cli/claude-workflow.js js/anthropic-gateway-index.js js/gateway/anthropic-format.js js/gateway/codex-provider.js js/gateway/config.js js/gateway/model-routing.js js/gateway/proxy.js js/gateway/server.js js/gateway/trace.js js/utils/env-loader.js js/utils/safe-path.js test/gateway.test.js test/lifecycle/_helpers.js",
+    "test": "node test/gateway.test.js"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "workflow",
+    "gateway",
+    "anthropic"
+  ],
+  "author": "yshaaban",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yshaaban/claude-workflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yshaaban/claude-workflow/issues"
+  },
+  "dependencies": {
+    "dotenv": "16.3.1",
+    "express": "5.1.0",
+    "undici": "6.26.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "js",
+    "README.md",
+    "LICENSE"
+  ]
+}

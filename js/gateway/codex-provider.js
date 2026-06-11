@@ -835,8 +835,8 @@ class CodexAppServerConnection extends EventEmitter {
 
     const initializeResult = await this.rawRequest('initialize', {
       clientInfo: {
-        name: 'ultrathink_gateway',
-        title: 'UltraThink Gateway',
+        name: 'claude_workflow_gateway',
+        title: 'Claude Workflow Gateway',
         version: '1.0.0',
       },
       capabilities: {
@@ -1237,7 +1237,7 @@ class CodexGatewaySession {
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
-      serviceName: 'ultrathink_gateway',
+      serviceName: 'claude_workflow_gateway',
     });
 
     this.threadId = result.thread?.id || null;
@@ -1543,7 +1543,7 @@ class CodexGatewaySession {
           this.latestTotalUsage = tokenUsage.total;
         } else {
           boundary.usage = tokenUsage.last || emptyUsage();
-          this.latestTotalUsage = addUsage(this.latestTotalUsage, boundary.usage);
+          this.latestTotalUsage = addUsage(boundary.usageBaseline, boundary.usage);
         }
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,

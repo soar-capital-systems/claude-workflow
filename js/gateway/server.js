@@ -1144,7 +1144,7 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   app.get('/healthz', function healthz(req, res) {
     res.json({
       ok: true,
-      service: 'ultrathink-anthropic-gateway',
+      service: 'claude-workflow-gateway',
       codex_target_model: config.codex?.model || null,
       codex_sandbox: config.codex?.sandbox || null,
       codex_approval_policy: config.codex?.approvalPolicy || null,

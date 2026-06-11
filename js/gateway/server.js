@@ -779,6 +779,10 @@ function normalizeCodexUsage(usage) {
   return normalized;
 }
 
+function sameUsage(left, right) {
+  return JSON.stringify(left || {}) === JSON.stringify(right || {});
+}
+
 function outputOnlyUsage(usage) {
   return {
     input_tokens: 0,
@@ -805,10 +809,7 @@ function codexOutcomeToAnthropic(outcome, requestedModel) {
     content,
     stop_reason: outcome.type === 'tool_use' ? 'tool_use' : 'end_turn',
     stop_sequence: null,
-    usage: outcome.usage || {
-      input_tokens: 0,
-      output_tokens: 0,
-    },
+    usage: normalizeCodexUsage(outcome.usage),
   };
 }
 
@@ -868,11 +869,8 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
-    const unchanged =
-      emittedUsage &&
-      emittedUsage.input_tokens === state.usage.input_tokens &&
-      emittedUsage.output_tokens === state.usage.output_tokens;
+    state.usage = normalizeCodexUsage(usage);
+    const unchanged = emittedUsage && sameUsage(emittedUsage, state.usage);
     if (stopReason === null && unchanged) {
       return;
     }
@@ -894,7 +892,7 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
+    state.usage = normalizeCodexUsage(usage);
     await closeTextBlock(res, state);
     await ensureTextBlockStartedNoText(res, state);
     const toolBlockIndex = state.textBlockIndex;
@@ -932,7 +930,7 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
+    state.usage = normalizeCodexUsage(usage);
     await closeTextBlock(res, state);
     await ensureTextBlockStartedNoText(res, state);
     await writeUsageDelta(usage, 'end_turn');
@@ -1146,7 +1144,7 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   app.get('/healthz', function healthz(req, res) {
     res.json({
       ok: true,
-      service: 'claude-workflow-gateway',
+      service: 'ultrathink-anthropic-gateway',
       codex_target_model: config.codex?.model || null,
       codex_sandbox: config.codex?.sandbox || null,
       codex_approval_policy: config.codex?.approvalPolicy || null,

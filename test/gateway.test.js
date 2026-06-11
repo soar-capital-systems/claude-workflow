@@ -814,16 +814,16 @@ await runTest('gateway config expands home-relative Codex and trace paths', asyn
   };
 
   try {
-    process.env.ULTRATHINK_GATEWAY_TRACE_DIR = '~/claude-workflow-gateway-trace';
-    process.env.ULTRATHINK_GATEWAY_CODEX_CWD = '~/claude-workflow-codex-cwd';
+    process.env.ULTRATHINK_GATEWAY_TRACE_DIR = '~/ultrathink-gateway-trace';
+    process.env.ULTRATHINK_GATEWAY_CODEX_CWD = '~/ultrathink-codex-cwd';
     const config = loadGatewayConfig();
     assert.equal(
       config.traceDir,
-      path.resolve(path.join(os.homedir(), 'claude-workflow-gateway-trace'))
+      path.resolve(path.join(os.homedir(), 'ultrathink-gateway-trace'))
     );
     assert.equal(
       config.codex.cwd,
-      path.resolve(path.join(os.homedir(), 'claude-workflow-codex-cwd'))
+      path.resolve(path.join(os.homedir(), 'ultrathink-codex-cwd'))
     );
     ok('gateway config expands home-relative trace and Codex cwd paths');
   } finally {
@@ -1063,6 +1063,9 @@ await runTest('gateway can expose routed Codex response model metadata', async f
         usage: {
           input_tokens: 9,
           output_tokens: 3,
+          cache_read_input_tokens: 4,
+          reasoning_output_tokens: 2,
+          total_tokens: 14,
         },
       };
     },
@@ -1101,6 +1104,11 @@ await runTest('gateway can expose routed Codex response model metadata', async f
     assert.equal(seenRoute.provider, 'codex');
     assert.equal(payload.model, routedResponseModel(seenRoute));
     assert.equal(payload.content[0].text, 'DISPLAY_MODEL_OK');
+    assert.deepEqual(payload.usage, {
+      input_tokens: 9,
+      output_tokens: 3,
+      cache_read_input_tokens: 4,
+    });
     ok('Codex JSON responses can report routed provider/upstream metadata without changing the request');
   } finally {
     await closeServer(server);
@@ -1895,7 +1903,7 @@ await runTest('Codex session identity keys cannot collide through raw header sep
 await runTest(
   'Codex app-server parallel tool calls reject later calls without clobbering the pending call',
   async function testCodexParallelToolCallsDoNotClobberPendingCall() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-parallel-tool-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-parallel-tool-'));
     const codexPath = path.join(tempDir, 'codex-parallel-tool');
     const responsesPath = path.join(tempDir, 'tool-responses.json');
 
@@ -2056,8 +2064,97 @@ await runTest(
   }
 );
 
+await runTest(
+  'Codex app-server usage reports per-boundary input cache and reasoning deltas',
+  async function testCodexUsageDeltas() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-delta-'));
+    const codexPath = path.join(tempDir, 'codex-usage-delta');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const readline = require('node:readline');\n" +
+          'let turnCount = 0;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'const usages = [\n' +
+          '  { inputTokens: 100, cachedInputTokens: 20, outputTokens: 30, reasoningOutputTokens: 5, totalTokens: 115 },\n' +
+          '  { inputTokens: 160, cachedInputTokens: 50, outputTokens: 45, reasoningOutputTokens: 7, totalTokens: 162 },\n' +
+          '];\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-usage' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const turnId = `turn-${turnCount + 1}`;\n' +
+          '    const usage = usages[turnCount];\n' +
+          '    turnCount += 1;\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function completeTurn() {\n' +
+          "      send({ method: 'item/agentMessage/delta', params: { turnId, itemId: `${turnId}-message`, delta: `done ${turnId}` } });\n" +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { total: usage } } });\n" +
+          "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+        },
+      });
+
+      try {
+        const req = claudeSessionRequest('codex-usage-delta');
+        const firstOutcome = await manager.processRequest(
+          req,
+          codexUserRequest('First usage turn.'),
+          codexRoute()
+        );
+        const secondOutcome = await manager.processRequest(
+          req,
+          codexUserRequest('Second usage turn.'),
+          codexRoute()
+        );
+
+        assert.deepEqual(firstOutcome.usage, {
+          input_tokens: 80,
+          output_tokens: 35,
+          cache_read_input_tokens: 20,
+          reasoning_output_tokens: 5,
+          total_tokens: 115,
+        });
+        assert.deepEqual(secondOutcome.usage, {
+          input_tokens: 30,
+          output_tokens: 17,
+          cache_read_input_tokens: 30,
+          reasoning_output_tokens: 2,
+          total_tokens: 47,
+        });
+        ok('Codex cumulative usage is translated into per-response Claude usage deltas');
+      } finally {
+        await manager.close();
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
 await runTest('Codex app-server invalid JSON rejects startup without crashing the gateway', async function testCodexInvalidJsonRejectsStartup() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-invalid-json-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-invalid-json-'));
   const codexPath = path.join(tempDir, 'codex-invalid-json');
 
   try {
@@ -2097,7 +2194,7 @@ await runTest('Codex app-server invalid JSON rejects startup without crashing th
 });
 
 await runTest('Codex app-server control socket resets fail and evict the session immediately', async function testCodexControlSocketResetEvictsSession() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-control-reset-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-control-reset-'));
   const codexPath = path.join(tempDir, 'codex-control-reset');
 
   try {
@@ -2151,7 +2248,7 @@ await runTest('Codex app-server control socket resets fail and evict the session
 });
 
 await runTest('Codex app-server signal exits reject pending startup requests', async function testCodexSignalExitRejectsStartup() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-signal-exit-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-signal-exit-'));
   const codexPath = path.join(tempDir, 'codex-signal-exit');
 
   try {
@@ -2190,7 +2287,7 @@ await runTest('Codex app-server signal exits reject pending startup requests', a
 });
 
 await runTest('Codex app-server clean exits reject pending requests instead of timing out', async function testCodexCleanExitRejectsPendingRequest() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-clean-exit-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-clean-exit-'));
   const codexPath = path.join(tempDir, 'codex-clean-exit');
 
   try {
@@ -2245,7 +2342,7 @@ await runTest('Codex app-server clean exits reject pending requests instead of t
 });
 
 await runTest('Codex app-server clean exits reject active turns after turn/start resolves', async function testCodexCleanExitRejectsActiveTurn() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-clean-midturn-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-clean-midturn-'));
   const codexPath = path.join(tempDir, 'codex-clean-midturn');
 
   try {
@@ -2301,7 +2398,7 @@ await runTest('Codex app-server clean exits reject active turns after turn/start
 });
 
 await runTest('Codex app-server close force-kills SIGTERM-resistant children', async function testCodexCloseForceKillsStubbornChild() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-stubborn-close-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-stubborn-close-'));
   const codexPath = path.join(tempDir, 'codex-stubborn-close');
 
   try {
@@ -2516,7 +2613,7 @@ await runTest('Codex tool_result routing survives missing follow-up tool_choice'
 });
 
 await runTest('fresh Codex sessions seed the app-server turn with the supplied transcript', async function testCodexFreshSessionIncludesTranscript() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-transcript-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-transcript-'));
   const codexPath = path.join(tempDir, 'codex-transcript');
   const turnParamsPath = path.join(tempDir, 'turn-params.json');
 
@@ -2592,7 +2689,7 @@ await runTest('fresh Codex sessions seed the app-server turn with the supplied t
 });
 
 await runTest('Codex transcript budget includes omission notices and separators', async function testCodexTranscriptBudgetIncludesNotices() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-budget-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-budget-'));
   const codexPath = path.join(tempDir, 'codex-budget');
   const turnParamsPath = path.join(tempDir, 'turn-params.json');
   const inputMaxTokens = 24;
@@ -2669,7 +2766,7 @@ await runTest('Codex transcript budget includes omission notices and separators'
 });
 
 await runTest('fresh Codex fork sessions start from the current request only', async function testCodexForkSessionSkipsOldTranscript() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-fork-input-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-fork-input-'));
   const codexPath = path.join(tempDir, 'codex-fork-input');
   const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
 
@@ -2803,7 +2900,7 @@ await runTest('Codex context-ish 502s that miss recovery matching are traced', a
 });
 
 await runTest('Codex context-window failures retry once on a fresh latest-request thread', async function testCodexContextWindowRecovery() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-context-retry-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-context-retry-'));
   const codexPath = path.join(tempDir, 'codex-context-retry');
   const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
   const failureMarkerPath = path.join(tempDir, 'failed-once');
@@ -3382,7 +3479,7 @@ await runTest(
 await runTest(
   'claude-workflow requires a gateway-side Anthropic key when a shared secret protects an Anthropic main route',
   async function testWorkflowCliSharedSecretRequiresAnthropicKey() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-shared-secret-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-shared-secret-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -3421,7 +3518,7 @@ await runTest(
 await runTest(
   'claude-workflow reports missing command and Codex login preflight failures',
   async function testWorkflowCliCommandAndLoginPreflightFailures() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-preflight-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-preflight-'));
     const claudePath = path.join(tempDir, 'claude');
     const loggedInCodexPath = path.join(tempDir, 'codex-logged-in');
     const loggedOutCodexPath = path.join(tempDir, 'codex-logged-out');
@@ -3485,7 +3582,7 @@ await runTest(
 await runTest(
   'claude-workflow injects the gateway shared secret into the child Claude process',
   async function testWorkflowCliInjectsGatewaySecret() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-launch-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-launch-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const capturedEnvPath = path.join(tempDir, 'claude-env.json');
@@ -3546,7 +3643,7 @@ await runTest(
 await runTest(
   'claude-workflow enables routed model display metadata by default',
   async function testWorkflowCliDisplayRoutedModelDefault() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-display-model-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-display-model-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -3705,7 +3802,7 @@ await runTest(
 await runTest(
   'claude-workflow launches concurrent folders on distinct dynamic ports',
   async function testWorkflowCliConcurrentDynamicPorts() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-dynamic-ports-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-dynamic-ports-'));
     const projectA = path.join(tempDir, 'project-a');
     const projectB = path.join(tempDir, 'project-b');
     const claudePath = path.join(tempDir, 'claude');
@@ -3786,7 +3883,7 @@ await runTest(
 await runTest(
   'claude-workflow reports fixed gateway port collisions clearly',
   async function testWorkflowCliFixedPortCollision() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-port-collision-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-port-collision-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const gatewayPort = await freePort();
@@ -3831,7 +3928,7 @@ await runTest(
 await runTest(
   'claude-workflow rejects unauthenticated non-loopback gateway binds',
   async function testWorkflowCliRejectsUnauthenticatedExternalBind() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-nonloopback-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-nonloopback-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -3888,7 +3985,7 @@ await runTest(
 await runTest(
   'claude-workflow defaults to auto mode and keeps yolo flags out of prompts',
   async function testWorkflowCliYoloPermissionFlags() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-yolo-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-yolo-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -3983,7 +4080,7 @@ await runTest(
 await runTest(
   'claude-workflow forwards SIGTERM to Claude and exits conventionally',
   async function testWorkflowCliSignalHandling() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-signal-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-signal-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const startedPath = path.join(tempDir, 'claude-started');
@@ -5082,6 +5179,7 @@ await runTest(
           usage: {
             input_tokens: 42,
             output_tokens: 1,
+            cache_read_input_tokens: 5,
           },
         });
         await sleep(5);
@@ -5095,6 +5193,7 @@ await runTest(
           usage: {
             input_tokens: 42,
             output_tokens: 7,
+            cache_read_input_tokens: 5,
           },
         });
         await sleep(5);
@@ -5105,6 +5204,9 @@ await runTest(
             usage: {
               input_tokens: 42,
               output_tokens: 7,
+              cache_read_input_tokens: 5,
+              reasoning_output_tokens: 3,
+              total_tokens: 50,
             },
           },
         });
@@ -5114,6 +5216,9 @@ await runTest(
           usage: {
             input_tokens: 42,
             output_tokens: 7,
+            cache_read_input_tokens: 5,
+            reasoning_output_tokens: 3,
+            total_tokens: 50,
           },
         };
       },
@@ -5180,15 +5285,20 @@ await runTest(
       assert.equal(seenRequestBody.model, 'claude-sonnet-4-7');
       assert.equal(seenRoute.provider, 'codex');
       assert.equal(messageStart.payload.message.model, routedResponseModel(seenRoute));
-      assert.equal(messageStart.payload.message.usage.input_tokens, 0);
+      assert.equal(messageStart.payload.message.usage.input_tokens, 42);
       assert.equal(messageStart.payload.message.usage.output_tokens, 1);
+      assert.equal(messageStart.payload.message.usage.cache_read_input_tokens, 5);
       assert.equal(nonTerminalDeltas.length >= 1, true);
-      assert.equal(nonTerminalDeltas.at(-1).payload.usage.input_tokens, 0);
+      assert.equal(nonTerminalDeltas.at(-1).payload.usage.input_tokens, 42);
       assert.equal(nonTerminalDeltas.at(-1).payload.usage.output_tokens, 7);
+      assert.equal(nonTerminalDeltas.at(-1).payload.usage.cache_read_input_tokens, 5);
       assert.equal(textDelta.payload.delta.text, 'STREAM_USAGE_OK');
-      assert.equal(terminalDelta.payload.usage.input_tokens, 0);
+      assert.equal(terminalDelta.payload.usage.input_tokens, 42);
       assert.equal(terminalDelta.payload.usage.output_tokens, 7);
-      ok('Codex streaming path emits output-only live usage updates before the terminal boundary');
+      assert.equal(terminalDelta.payload.usage.cache_read_input_tokens, 5);
+      assert.equal('reasoning_output_tokens' in terminalDelta.payload.usage, false);
+      assert.equal('total_tokens' in terminalDelta.payload.usage, false);
+      ok('Codex streaming path emits live Anthropic-compatible usage before the terminal boundary');
     } finally {
       await closeServer(server);
     }

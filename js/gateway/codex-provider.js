@@ -214,18 +214,49 @@ function requestFingerprint(requestBody) {
   );
 }
 
-function normalizeUsage(tokenUsage) {
-  const source = tokenUsage?.total || tokenUsage?.last || {};
+function usageField(source, camelKey, snakeKey) {
+  const value = Number(source?.[camelKey] ?? source?.[snakeKey] ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function normalizeUsageBreakdown(source) {
+  const inputTokens = usageField(source, 'inputTokens', 'input_tokens');
+  const cachedInputTokens = usageField(source, 'cachedInputTokens', 'cached_input_tokens');
+  const outputTokens = usageField(source, 'outputTokens', 'output_tokens');
+  const reasoningOutputTokens = usageField(
+    source,
+    'reasoningOutputTokens',
+    'reasoning_output_tokens'
+  );
+  const totalTokens = usageField(source, 'totalTokens', 'total_tokens');
   const normalized = {
-    input_tokens: source.inputTokens || 0,
-    output_tokens: source.outputTokens || 0,
+    input_tokens: Math.max(0, inputTokens - cachedInputTokens),
+    output_tokens: outputTokens + reasoningOutputTokens,
   };
 
-  if ((source.cachedInputTokens || 0) > 0) {
-    normalized.cache_read_input_tokens = source.cachedInputTokens;
+  if (cachedInputTokens > 0) {
+    normalized.cache_read_input_tokens = cachedInputTokens;
+  }
+
+  if (reasoningOutputTokens > 0) {
+    normalized.reasoning_output_tokens = reasoningOutputTokens;
+  }
+
+  if (totalTokens > 0) {
+    normalized.total_tokens = totalTokens;
   }
 
   return normalized;
+}
+
+function normalizeCodexTokenUsage(tokenUsage) {
+  const total = tokenUsage?.total ? normalizeUsageBreakdown(tokenUsage.total) : null;
+  const last = tokenUsage?.last ? normalizeUsageBreakdown(tokenUsage.last) : null;
+  return {
+    total,
+    last,
+    model_context_window: tokenUsage?.modelContextWindow || null,
+  };
 }
 
 function emptyUsage() {
@@ -233,6 +264,86 @@ function emptyUsage() {
     input_tokens: 0,
     output_tokens: 0,
   };
+}
+
+function usageNumber(usage, key) {
+  const value = Number(usage?.[key] || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function usageDelta(current, baseline) {
+  // Codex app-server totals are expected to be monotonic; clamp anyway so compaction
+  // or replay quirks cannot surface negative Anthropic usage.
+  const inputTokens = Math.max(
+    0,
+    usageNumber(current, 'input_tokens') - usageNumber(baseline, 'input_tokens')
+  );
+  const outputTokens = Math.max(
+    0,
+    usageNumber(current, 'output_tokens') - usageNumber(baseline, 'output_tokens')
+  );
+  const delta = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  const cacheReadInputTokens = Math.max(
+    0,
+    usageNumber(current, 'cache_read_input_tokens') -
+      usageNumber(baseline, 'cache_read_input_tokens')
+  );
+  if (cacheReadInputTokens > 0) {
+    delta.cache_read_input_tokens = cacheReadInputTokens;
+  }
+
+  const reasoningOutputTokens = Math.max(
+    0,
+    usageNumber(current, 'reasoning_output_tokens') -
+      usageNumber(baseline, 'reasoning_output_tokens')
+  );
+  if (reasoningOutputTokens > 0) {
+    delta.reasoning_output_tokens = reasoningOutputTokens;
+  }
+
+  const totalTokens = Math.max(
+    0,
+    usageNumber(current, 'total_tokens') - usageNumber(baseline, 'total_tokens')
+  );
+  if (totalTokens > 0) {
+    delta.total_tokens = totalTokens;
+  }
+
+  return delta;
+}
+
+function addUsage(left, right) {
+  const inputTokens = usageNumber(left, 'input_tokens') + usageNumber(right, 'input_tokens');
+  const outputTokens = usageNumber(left, 'output_tokens') + usageNumber(right, 'output_tokens');
+  const total = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  const cacheReadInputTokens =
+    usageNumber(left, 'cache_read_input_tokens') +
+    usageNumber(right, 'cache_read_input_tokens');
+  if (cacheReadInputTokens > 0) {
+    total.cache_read_input_tokens = cacheReadInputTokens;
+  }
+
+  const reasoningOutputTokens =
+    usageNumber(left, 'reasoning_output_tokens') +
+    usageNumber(right, 'reasoning_output_tokens');
+  if (reasoningOutputTokens > 0) {
+    total.reasoning_output_tokens = reasoningOutputTokens;
+  }
+
+  const totalTokens = usageNumber(left, 'total_tokens') + usageNumber(right, 'total_tokens');
+  if (totalTokens > 0) {
+    total.total_tokens = totalTokens;
+  }
+
+  return total;
 }
 
 function estimateTokensFromJson(value) {
@@ -328,16 +439,17 @@ function hasMatchingToolResult(requestBody, pendingToolCall) {
   return false;
 }
 
-function createBoundary(turnId, requestBody, initialUsage = emptyUsage()) {
+function createBoundary(turnId, requestBody, usageBaseline = emptyUsage()) {
   const listeners = new Set();
   const boundary = {
     turnId,
     requestFingerprint: requestFingerprint(requestBody),
     events: [],
     text: '',
-    usage: {
+    usage: emptyUsage(),
+    usageBaseline: {
       ...emptyUsage(),
-      ...(initialUsage || {}),
+      ...(usageBaseline || {}),
     },
     deltaItemIds: new Set(),
     finished: false,
@@ -723,8 +835,8 @@ class CodexAppServerConnection extends EventEmitter {
 
     const initializeResult = await this.rawRequest('initialize', {
       clientInfo: {
-        name: 'claude_workflow_gateway',
-        title: 'Claude Workflow Gateway',
+        name: 'ultrathink_gateway',
+        title: 'UltraThink Gateway',
         version: '1.0.0',
       },
       capabilities: {
@@ -1001,7 +1113,7 @@ class CodexGatewaySession {
     this.pendingToolCall = null;
     this.activeBoundary = null;
     this.routingReservation = null;
-    this.latestUsage = emptyUsage();
+    this.latestTotalUsage = emptyUsage();
     this.idleTimer = null;
     this.lastUsedAt = Date.now();
     this.disposed = false;
@@ -1125,7 +1237,7 @@ class CodexGatewaySession {
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
-      serviceName: 'claude_workflow_gateway',
+      serviceName: 'ultrathink_gateway',
     });
 
     this.threadId = result.thread?.id || null;
@@ -1141,7 +1253,6 @@ class CodexGatewaySession {
   async startTurn(requestBody) {
     const threadExists = Boolean(this.threadId);
     await this.ensureThread();
-    this.latestUsage = emptyUsage();
     const latestUserText = threadExists
       ? limitTextByTokenBudget(extractLatestUserText(requestBody), this.inputMaxTokens())
       : this.initialTurnInput(requestBody);
@@ -1196,7 +1307,7 @@ class CodexGatewaySession {
 
     const turnId = this.pendingToolCall.turnId;
     this.pendingToolCall = null;
-    const boundary = createBoundary(turnId, requestBody, this.latestUsage);
+    const boundary = createBoundary(turnId, requestBody, this.latestTotalUsage);
     this.activeBoundary = boundary;
     return this.beginBoundary(boundary, turnId, requestBody, requestTracer);
   }
@@ -1265,7 +1376,7 @@ class CodexGatewaySession {
       return this.continuePendingToolCall(requestBody, requestTracer);
     }
 
-    const boundary = createBoundary(null, requestBody, this.latestUsage);
+    const boundary = createBoundary(null, requestBody, this.latestTotalUsage);
     this.activeBoundary = boundary;
 
     try {
@@ -1426,11 +1537,20 @@ class CodexGatewaySession {
         message.params?.turnId === turnId &&
         (message.params?.tokenUsage?.total || message.params?.tokenUsage?.last)
       ) {
-        boundary.usage = normalizeUsage(message.params.tokenUsage);
-        this.latestUsage = boundary.usage;
+        const tokenUsage = normalizeCodexTokenUsage(message.params.tokenUsage);
+        if (tokenUsage.total) {
+          boundary.usage = usageDelta(tokenUsage.total, boundary.usageBaseline);
+          this.latestTotalUsage = tokenUsage.total;
+        } else {
+          boundary.usage = tokenUsage.last || emptyUsage();
+          this.latestTotalUsage = addUsage(this.latestTotalUsage, boundary.usage);
+        }
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,
           usage: boundary.usage,
+          total_usage: tokenUsage.total,
+          last_usage: tokenUsage.last,
+          model_context_window: tokenUsage.model_context_window,
         });
         boundary.emit({
           type: 'usage',

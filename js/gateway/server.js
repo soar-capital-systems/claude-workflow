@@ -779,8 +779,17 @@ function normalizeCodexUsage(usage) {
   return normalized;
 }
 
+function usageValue(usage, key) {
+  return usage?.[key] || 0;
+}
+
 function sameUsage(left, right) {
-  return JSON.stringify(left || {}) === JSON.stringify(right || {});
+  return (
+    usageValue(left, 'input_tokens') === usageValue(right, 'input_tokens') &&
+    usageValue(left, 'output_tokens') === usageValue(right, 'output_tokens') &&
+    usageValue(left, 'cache_read_input_tokens') ===
+      usageValue(right, 'cache_read_input_tokens')
+  );
 }
 
 function outputOnlyUsage(usage) {

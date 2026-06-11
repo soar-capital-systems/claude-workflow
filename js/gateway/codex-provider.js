@@ -219,6 +219,12 @@ function usageField(source, camelKey, snakeKey) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function addPositiveUsageField(usage, key, value) {
+  if (value > 0) {
+    usage[key] = value;
+  }
+}
+
 function normalizeUsageBreakdown(source) {
   const inputTokens = usageField(source, 'inputTokens', 'input_tokens');
   const cachedInputTokens = usageField(source, 'cachedInputTokens', 'cached_input_tokens');
@@ -234,17 +240,9 @@ function normalizeUsageBreakdown(source) {
     output_tokens: outputTokens + reasoningOutputTokens,
   };
 
-  if (cachedInputTokens > 0) {
-    normalized.cache_read_input_tokens = cachedInputTokens;
-  }
-
-  if (reasoningOutputTokens > 0) {
-    normalized.reasoning_output_tokens = reasoningOutputTokens;
-  }
-
-  if (totalTokens > 0) {
-    normalized.total_tokens = totalTokens;
-  }
+  addPositiveUsageField(normalized, 'cache_read_input_tokens', cachedInputTokens);
+  addPositiveUsageField(normalized, 'reasoning_output_tokens', reasoningOutputTokens);
+  addPositiveUsageField(normalized, 'total_tokens', totalTokens);
 
   return normalized;
 }
@@ -292,26 +290,20 @@ function usageDelta(current, baseline) {
     usageNumber(current, 'cache_read_input_tokens') -
       usageNumber(baseline, 'cache_read_input_tokens')
   );
-  if (cacheReadInputTokens > 0) {
-    delta.cache_read_input_tokens = cacheReadInputTokens;
-  }
+  addPositiveUsageField(delta, 'cache_read_input_tokens', cacheReadInputTokens);
 
   const reasoningOutputTokens = Math.max(
     0,
     usageNumber(current, 'reasoning_output_tokens') -
       usageNumber(baseline, 'reasoning_output_tokens')
   );
-  if (reasoningOutputTokens > 0) {
-    delta.reasoning_output_tokens = reasoningOutputTokens;
-  }
+  addPositiveUsageField(delta, 'reasoning_output_tokens', reasoningOutputTokens);
 
   const totalTokens = Math.max(
     0,
     usageNumber(current, 'total_tokens') - usageNumber(baseline, 'total_tokens')
   );
-  if (totalTokens > 0) {
-    delta.total_tokens = totalTokens;
-  }
+  addPositiveUsageField(delta, 'total_tokens', totalTokens);
 
   return delta;
 }
@@ -327,21 +319,15 @@ function addUsage(left, right) {
   const cacheReadInputTokens =
     usageNumber(left, 'cache_read_input_tokens') +
     usageNumber(right, 'cache_read_input_tokens');
-  if (cacheReadInputTokens > 0) {
-    total.cache_read_input_tokens = cacheReadInputTokens;
-  }
+  addPositiveUsageField(total, 'cache_read_input_tokens', cacheReadInputTokens);
 
   const reasoningOutputTokens =
     usageNumber(left, 'reasoning_output_tokens') +
     usageNumber(right, 'reasoning_output_tokens');
-  if (reasoningOutputTokens > 0) {
-    total.reasoning_output_tokens = reasoningOutputTokens;
-  }
+  addPositiveUsageField(total, 'reasoning_output_tokens', reasoningOutputTokens);
 
   const totalTokens = usageNumber(left, 'total_tokens') + usageNumber(right, 'total_tokens');
-  if (totalTokens > 0) {
-    total.total_tokens = totalTokens;
-  }
+  addPositiveUsageField(total, 'total_tokens', totalTokens);
 
   return total;
 }

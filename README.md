@@ -54,6 +54,8 @@ Do not export `ANTHROPIC_BASE_URL` yourself when using the launcher. It starts t
 
 Safe multi-folder behavior is the default. Leave `ULTRATHINK_GATEWAY_PORT` unset, or set it to `0`, so each `claude-workflow` process gets its own localhost port. If you force a fixed port such as `4318`, only one process can use it at a time.
 
+To keep long-running workflows from overflowing Codex's context window, the gateway bounds each single Codex input with `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` (default `64000`, set `0` to disable). Fresh canonical sessions still seed Codex with recent transcript context, but temporary fork sessions start from the current request instead of replaying the whole accumulated Claude history. If Codex still reports a context-window exhaustion before any stream output is forwarded, the gateway evicts the exhausted Codex thread and retries once on a clean thread with the current request.
+
 Permission flags:
 
 ```bash
@@ -90,6 +92,7 @@ ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT=low
 ULTRATHINK_GATEWAY_CODEX_VERBOSITY=low
 ULTRATHINK_GATEWAY_CODEX_SANDBOX=workspace-write
 ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY=never
+ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=64000
 ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS=30000
 ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
 ```

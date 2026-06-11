@@ -730,6 +730,17 @@ await runTest('gateway config exposes the Codex close kill timeout knob', async 
   );
 });
 
+await runTest('gateway config exposes the Codex input budget', async function testCodexInputBudgetConfig() {
+  await withTemporaryEnv(
+    { ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '4096' },
+    async function assertInputBudgetConfig() {
+      const config = loadGatewayConfig();
+      assert.equal(config.codex.inputMaxTokens, 4096);
+      ok('Codex app-server input budget is configurable through the gateway config');
+    }
+  );
+});
+
 await runTest('gateway config exposes the Codex session pool cap', async function testCodexMaxSessionsConfig() {
   await withTemporaryEnv(
     { ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS: '3' },
@@ -2545,6 +2556,189 @@ await runTest('fresh Codex sessions seed the app-server turn with the supplied t
       } else {
         process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = previousTarget;
       }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('fresh Codex fork sessions start from the current request only', async function testCodexForkSessionSkipsOldTranscript() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-fork-input-'));
+  const codexPath = path.join(tempDir, 'codex-fork-input');
+  const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        "    send({ id: message.id, result: { thread: { id: `thread-${message.id}` } } });\n" +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, `${JSON.stringify(message.params)}\\n`, "utf8");\n' +
+        '    const turnId = `turn-${message.id}`;\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        "    setTimeout(function completeTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } }); }, 10);\n" +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = turnParamsPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          forkIdleTimeoutMs: 0,
+        },
+      });
+      const req = claudeSessionRequest('session-fork-input');
+      const route = codexRoute();
+      const firstBody = codexUserRequest('Primary canonical request.');
+
+      await manager.processRequest(req, firstBody, route);
+      const canonical = manager.ensureSession(req, firstBody, route);
+      canonical.pendingToolCall = { callId: 'call_waiting' };
+
+      await manager.processRequest(
+        req,
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Very old workflow context that should not enter a fork.' },
+            { role: 'assistant', content: 'Prior canonical answer that belongs to another thread.' },
+            { role: 'user', content: 'Current fork side request.' },
+          ],
+          tools: [],
+        },
+        route
+      );
+
+      const turnParams = (await fs.readFile(turnParamsPath, 'utf8'))
+        .trim()
+        .split(/\n/u)
+        .map(function parseLine(line) {
+          return JSON.parse(line);
+        });
+      const forkInput = turnParams.at(-1).input[0].text;
+      assert.equal(forkInput.includes('Current fork side request.'), true);
+      assert.equal(forkInput.includes('Very old workflow context'), false);
+      assert.equal(forkInput.includes('Prior canonical answer'), false);
+      await manager.close();
+      ok('forked side traffic no longer replays the whole accumulated Claude transcript');
+    } finally {
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('Codex context-window failures retry once on a fresh latest-request thread', async function testCodexContextWindowRecovery() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-context-retry-'));
+  const codexPath = path.join(tempDir, 'codex-context-retry');
+  const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
+  const failureMarkerPath = path.join(tempDir, 'failed-once');
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        "    send({ id: message.id, result: { thread: { id: `thread-${message.id}` } } });\n" +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, `${JSON.stringify(message.params)}\\n`, "utf8");\n' +
+        '    const turnId = `turn-${message.id}`;\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        '    if (!fs.existsSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER)) {\n' +
+        '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, "1", "utf8");\n' +
+        "      setTimeout(function failTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'failed', error: { message: \"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.\" } } } }); }, 10);\n" +
+        '      return;\n' +
+        '    }\n' +
+        "    setTimeout(function completeTurn() {\n" +
+        "      send({ method: 'item/completed', params: { turnId, item: { id: 'msg-1', type: 'agentMessage', text: 'RECOVERED' } } });\n" +
+        "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+        '    }, 10);\n' +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previous = {
+      ULTRATHINK_TEST_CODEX_TURN_PARAMS: process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS,
+      ULTRATHINK_TEST_CODEX_FAILURE_MARKER:
+        process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER,
+    };
+    process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = turnParamsPath;
+    process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER = failureMarkerPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+        },
+      });
+
+      const outcome = await manager.processRequest(
+        claudeSessionRequest('session-context-retry'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Very old context that should be dropped on recovery.' },
+            { role: 'assistant', content: 'Prior answer that exhausted the old thread.' },
+            { role: 'user', content: 'Current request after context overflow.' },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      const turnParams = (await fs.readFile(turnParamsPath, 'utf8'))
+        .trim()
+        .split(/\n/u)
+        .map(function parseLine(line) {
+          return JSON.parse(line);
+        });
+      assert.equal(outcome.text, 'RECOVERED');
+      assert.equal(turnParams.length, 2);
+      assert.equal(turnParams[0].input[0].text.includes('Very old context'), true);
+      assert.equal(turnParams[1].input[0].text.includes('Current request after context overflow.'), true);
+      assert.equal(turnParams[1].input[0].text.includes('Very old context'), false);
+      await manager.close();
+      ok('context-window exhaustion is recovered by starting a clean Codex thread once');
+    } finally {
+      restoreEnv(previous);
     }
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });

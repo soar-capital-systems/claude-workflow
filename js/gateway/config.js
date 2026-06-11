@@ -158,6 +158,11 @@ export function loadGatewayConfig() {
       model: codexProfileValue('model', 'gpt-5.5'),
       reasoningEffort: codexProfileValue('reasoningEffort', 'low'),
       verbosity: codexProfileValue('verbosity', 'low'),
+      inputMaxTokens: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS,
+        64_000,
+        { min: 0, max: 1_000_000 }
+      ),
       idleTimeoutMs: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS,
         10 * 60_000,

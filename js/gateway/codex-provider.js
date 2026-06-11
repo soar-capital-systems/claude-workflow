@@ -6,7 +6,10 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_INPUT_MAX_TOKENS = 64_000;
 const DEFAULT_MAX_SESSIONS = 16;
+const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
+const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';
 const NON_RESERVING_SELECTION_REASONS = new Set([
   'matching_tool_result',
   'boundary_replay',
@@ -17,6 +20,8 @@ const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
   /WebSocket protocol error: Connection reset without closing handshake/iu,
 ];
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
+  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
 
 function noop() {}
 
@@ -236,6 +241,41 @@ function estimateTokensFromText(text) {
   return Math.max(1, Math.ceil(String(text || '').length / 4));
 }
 
+function maxCharsForTokenBudget(maxTokens) {
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.floor(maxTokens * 4));
+}
+
+function limitTextByTokenBudget(text, maxTokens) {
+  const value = String(text || '');
+  const maxChars = maxCharsForTokenBudget(maxTokens);
+  if (!Number.isFinite(maxChars) || value.length <= maxChars) {
+    return value;
+  }
+
+  const marker = `\n\n${INPUT_TRUNCATION_NOTICE}\n\n`;
+  if (marker.length >= maxChars) {
+    return value.slice(-maxChars);
+  }
+
+  const remainingChars = maxChars - marker.length;
+  const headChars = Math.ceil(remainingChars / 2);
+  const tailChars = Math.floor(remainingChars / 2);
+  return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
+}
+
+function codexInputMaxTokens(config) {
+  const maxTokens = numberOrDefault(config?.codex?.inputMaxTokens, DEFAULT_INPUT_MAX_TOKENS);
+  if (maxTokens <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxTokens));
+}
+
 function populateEstimatedUsage(boundary, requestBody, outcome) {
   if ((boundary.usage.output_tokens || 0) > 0) {
     return;
@@ -400,27 +440,89 @@ function renderTranscriptBlock(block) {
   return '';
 }
 
-function renderTranscriptInput(requestBody) {
-  const parts = [];
+function renderMessageTranscript(message) {
+  if (message?.role === 'system') {
+    return '';
+  }
+
+  const content = normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`)
+    .map(renderTranscriptBlock)
+    .filter(Boolean)
+    .join('\n\n');
+  if (!content) {
+    return '';
+  }
+
+  return `[${message.role || 'unknown'}]\n${content}`;
+}
+
+function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'user') {
+      continue;
+    }
+
+    const rendered = renderMessageTranscript(message);
+    if (rendered) {
+      return limitTextByTokenBudget(rendered, maxTokens);
+    }
+
+    break;
+  }
+
+  return limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
+}
+
+function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+  const renderedMessages = [];
   const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
 
   for (const message of messages) {
-    if (message?.role === 'system') {
+    const rendered = renderMessageTranscript(message);
+    if (!rendered) {
       continue;
     }
 
-    const content = normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`)
-      .map(renderTranscriptBlock)
-      .filter(Boolean)
-      .join('\n\n');
-    if (!content) {
-      continue;
-    }
-
-    parts.push(`[${message.role || 'unknown'}]\n${content}`);
+    renderedMessages.push(rendered);
   }
 
-  return joinTextParts(parts) || extractLatestUserText(requestBody);
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return joinTextParts(renderedMessages) || extractLatestUserText(requestBody);
+  }
+
+  const selected = [];
+  let usedTokens = 0;
+  let omittedCount = 0;
+  for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
+    const rendered = renderedMessages[index];
+    const tokens = estimateTokensFromText(rendered);
+    if (usedTokens + tokens <= maxTokens) {
+      selected.unshift(rendered);
+      usedTokens += tokens;
+      continue;
+    }
+
+    if (selected.length === 0) {
+      selected.unshift(limitTextByTokenBudget(rendered, maxTokens));
+      omittedCount = index;
+    } else {
+      omittedCount = index + 1;
+    }
+    break;
+  }
+
+  if (omittedCount > 0) {
+    selected.unshift(`${TRANSCRIPT_OMISSION_NOTICE}: ${omittedCount} message(s).`);
+  }
+
+  return joinTextParts(selected) || renderLatestUserTranscriptInput(requestBody, maxTokens);
+}
+
+function isCodexContextWindowError(error) {
+  return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
 }
 
 function extractToolResultPayload(requestBody, pendingToolCall) {
@@ -829,7 +931,7 @@ class CodexAppServerConnection extends EventEmitter {
 }
 
 class CodexGatewaySession {
-  constructor(config, route, req, requestBody, sessionKey = null, tracer = null) {
+  constructor(config, route, req, requestBody, sessionKey = null, tracer = null, options = {}) {
     this.config = config;
     this.route = route;
     this.requestedModel = route.requestedModel;
@@ -849,6 +951,7 @@ class CodexGatewaySession {
     }) || null;
     this.systemPrompt = renderSystemPrompt(requestBody);
     this.connection = new CodexAppServerConnection(config);
+    this.bootstrapMode = options.bootstrapMode || '';
     this.threadId = null;
     this.pendingToolCall = null;
     this.activeBoundary = null;
@@ -904,6 +1007,31 @@ class CodexGatewaySession {
 
   isForkSession() {
     return this.sessionKey !== this.baseSessionKey;
+  }
+
+  inputMaxTokens() {
+    return codexInputMaxTokens(this.config);
+  }
+
+  initialInputMode() {
+    if (this.bootstrapMode) {
+      return this.bootstrapMode;
+    }
+
+    if (this.isForkSession()) {
+      return 'latest';
+    }
+
+    return 'transcript';
+  }
+
+  initialTurnInput(requestBody) {
+    const maxTokens = this.inputMaxTokens();
+    if (this.initialInputMode() === 'latest') {
+      return renderLatestUserTranscriptInput(requestBody, maxTokens);
+    }
+
+    return renderTranscriptInput(requestBody, maxTokens);
   }
 
   assertCompatible(route, requestBody, options = {}) {
@@ -970,8 +1098,8 @@ class CodexGatewaySession {
     await this.ensureThread();
     this.latestUsage = emptyUsage();
     const latestUserText = threadExists
-      ? extractLatestUserText(requestBody)
-      : renderTranscriptInput(requestBody);
+      ? limitTextByTokenBudget(extractLatestUserText(requestBody), this.inputMaxTokens())
+      : this.initialTurnInput(requestBody);
     const result = await this.connection.request('turn/start', {
       threadId: this.threadId,
       input: [
@@ -996,7 +1124,11 @@ class CodexGatewaySession {
       throw new GatewayError(500, 'api_error', 'no pending Codex tool call exists');
     }
 
-    const toolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const toolResult = {
+      ...rawToolResult,
+      text: limitTextByTokenBudget(rawToolResult.text, this.inputMaxTokens()),
+    };
     const tracer = this.scopedTracer(requestTracer);
     traceLog(tracer, 'codex.tool_result.continued', {
       call_id: this.pendingToolCall.callId,
@@ -1432,7 +1564,7 @@ export class CodexSessionManager {
     this.createSession =
       typeof options.createSession === 'function'
         ? options.createSession
-        : (route, req, requestBody, sessionKey, requestTracer = null) =>
+        : (route, req, requestBody, sessionKey, requestTracer = null, sessionOptions = {}) =>
             new CodexGatewaySession(
               this.config,
               route,
@@ -1442,7 +1574,8 @@ export class CodexSessionManager {
               (requestTracer || this.tracer)?.scope?.({
                 requested_model: route.requestedModel,
                 upstream_model: route.upstreamModel,
-              }) || null
+              }) || null,
+              sessionOptions
             );
   }
 
@@ -1582,7 +1715,7 @@ export class CodexSessionManager {
     };
   }
 
-  ensureSessionEntry(req, requestBody, route, requestTracer = null) {
+  ensureSessionEntry(req, requestBody, route, requestTracer = null, options = {}) {
     validateCodexRequestControls(requestBody);
     const selection = this.resolveSessionEntry(req, requestBody, route);
     let session = selection.session;
@@ -1596,7 +1729,14 @@ export class CodexSessionManager {
     });
 
     if (!session) {
-      session = this.createSession(route, req, requestBody, selection.sessionKey, requestTracer);
+      session = this.createSession(
+        route,
+        req,
+        requestBody,
+        selection.sessionKey,
+        requestTracer,
+        options
+      );
       this.sessions.set(selection.sessionKey, session);
       this.watchSession(selection.sessionKey, session);
     } else {
@@ -1616,8 +1756,8 @@ export class CodexSessionManager {
     return this.ensureSessionEntry(req, requestBody, route, requestTracer).session;
   }
 
-  prepareSessionRequest(req, requestBody, route, requestTracer = null) {
-    const selection = this.ensureSessionEntry(req, requestBody, route, requestTracer);
+  prepareSessionRequest(req, requestBody, route, requestTracer = null, options = {}) {
+    const selection = this.ensureSessionEntry(req, requestBody, route, requestTracer, options);
     return {
       ...selection,
       reservation: this.reserveSessionForRequest(selection.session, selection, requestTracer),
@@ -1625,23 +1765,90 @@ export class CodexSessionManager {
   }
 
   async processRequest(req, requestBody, route, requestTracer = null) {
-    const { session, reservation } = this.prepareSessionRequest(req, requestBody, route, requestTracer);
-    return this.runSessionRequest(
-      session,
-      function advanceSession() {
+    return this.runRecoverableSessionRequest({
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      run(session) {
         return session.advance(requestBody, requestTracer);
       },
-      req.abortSignal,
-      reservation
-    );
+    });
   }
 
   async streamRequest(req, requestBody, route, onEvent, requestTracer = null) {
-    const { session, reservation } = this.prepareSessionRequest(req, requestBody, route, requestTracer);
+    let forwardedEventCount = 0;
+    function retryAwareOnEvent(event) {
+      forwardedEventCount += 1;
+      return onEvent(event);
+    }
+
+    return this.runRecoverableSessionRequest({
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      canRetry() {
+        return forwardedEventCount === 0;
+      },
+      run(session) {
+        return session.stream(requestBody, retryAwareOnEvent, requestTracer);
+      },
+    });
+  }
+
+  async runRecoverableSessionRequest(options) {
+    try {
+      return await this.runPreparedSessionRequest(options);
+    } catch (error) {
+      if (!this.canRecoverFromContextOverflow(error, options)) {
+        throw error;
+      }
+
+      traceLog(options.requestTracer || this.tracer, 'codex.session.context_recovery_retry', {
+        error_message: error?.message || String(error),
+      });
+
+      return this.runPreparedSessionRequest({
+        ...options,
+        sessionOptions: {
+          ...(options.sessionOptions || {}),
+          bootstrapMode: 'latest',
+        },
+      });
+    }
+  }
+
+  canRecoverFromContextOverflow(error, options) {
+    if (!isCodexContextWindowError(error)) {
+      return false;
+    }
+
+    if (options.req?.abortSignal?.aborted) {
+      return false;
+    }
+
+    if (typeof options.canRetry === 'function' && !options.canRetry()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  async runPreparedSessionRequest(options) {
+    const { req, requestBody, route, requestTracer, sessionOptions = {} } = options;
+    const { session, reservation } = this.prepareSessionRequest(
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      sessionOptions
+    );
+
     return this.runSessionRequest(
       session,
-      function streamSession() {
-        return session.stream(requestBody, onEvent, requestTracer);
+      function runSession() {
+        return options.run(session);
       },
       req.abortSignal,
       reservation
@@ -1661,7 +1868,7 @@ export class CodexSessionManager {
 
   isEvictableFailure(error) {
     if (error instanceof GatewayError) {
-      return error.status >= 499;
+      return error.status >= 499 || isCodexContextWindowError(error);
     }
 
     return true;

@@ -6,7 +6,7 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_INPUT_MAX_TOKENS = 64_000;
+const DEFAULT_INPUT_MAX_TOKENS = 256_000;
 const DEFAULT_MAX_SESSIONS = 16;
 const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
 const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';

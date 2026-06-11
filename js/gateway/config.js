@@ -160,7 +160,7 @@ export function loadGatewayConfig() {
       verbosity: codexProfileValue('verbosity', 'low'),
       inputMaxTokens: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS,
-        64_000,
+        256_000,
         { min: 0, max: 1_000_000 }
       ),
       idleTimeoutMs: clampNumber(

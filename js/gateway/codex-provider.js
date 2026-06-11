@@ -22,6 +22,8 @@ const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
   /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
+const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
+  /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 
 function noop() {}
 
@@ -476,6 +478,37 @@ function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIV
   return limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
 }
 
+function fitTranscriptInputToBudget(selectedMessages, omittedCount, maxTokens) {
+  if (omittedCount <= 0) {
+    return limitTextByTokenBudget(joinTextParts(selectedMessages), maxTokens);
+  }
+
+  const notice = `${TRANSCRIPT_OMISSION_NOTICE}: ${omittedCount} message(s).`;
+  const maxChars = maxCharsForTokenBudget(maxTokens);
+  if (!Number.isFinite(maxChars)) {
+    return joinTextParts([notice, ...selectedMessages]);
+  }
+
+  const remainingMessages = selectedMessages.slice();
+  let input = joinTextParts([notice, ...remainingMessages]);
+  while (remainingMessages.length > 1 && input.length > maxChars) {
+    remainingMessages.shift();
+    input = joinTextParts([notice, ...remainingMessages]);
+  }
+
+  if (input.length <= maxChars) {
+    return input;
+  }
+
+  const latestMessage = remainingMessages.at(-1) || '';
+  const prefix = `${notice}\n\n`;
+  if (prefix.length >= maxChars) {
+    return prefix.slice(0, maxChars);
+  }
+
+  return `${prefix}${latestMessage.slice(-(maxChars - prefix.length))}`;
+}
+
 function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
   const renderedMessages = [];
   const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
@@ -514,15 +547,27 @@ function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY
     break;
   }
 
-  if (omittedCount > 0) {
-    selected.unshift(`${TRANSCRIPT_OMISSION_NOTICE}: ${omittedCount} message(s).`);
+  if (selected.length > 0) {
+    return fitTranscriptInputToBudget(selected, omittedCount, maxTokens);
   }
 
-  return joinTextParts(selected) || renderLatestUserTranscriptInput(requestBody, maxTokens);
+  return renderLatestUserTranscriptInput(requestBody, maxTokens);
 }
 
 function isCodexContextWindowError(error) {
   return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
+}
+
+function isPossibleCodexContextWindowError(error) {
+  if (isCodexContextWindowError(error)) {
+    return false;
+  }
+
+  return (
+    error instanceof GatewayError &&
+    error.status === 502 &&
+    CODEX_CONTEXT_WINDOW_DRIFT_PATTERN.test(error.message || '')
+  );
 }
 
 function extractToolResultPayload(requestBody, pendingToolCall) {
@@ -1802,6 +1847,7 @@ export class CodexSessionManager {
       return await this.runPreparedSessionRequest(options);
     } catch (error) {
       if (!this.canRecoverFromContextOverflow(error, options)) {
+        this.traceContextRecoverySkipped(error, options);
         throw error;
       }
 
@@ -1815,6 +1861,25 @@ export class CodexSessionManager {
           ...(options.sessionOptions || {}),
           bootstrapMode: 'latest',
         },
+      });
+    }
+  }
+
+  traceContextRecoverySkipped(error, options) {
+    const tracer = options.requestTracer || this.tracer;
+    if (isCodexContextWindowError(error)) {
+      traceLog(tracer, 'codex.session.context_recovery_skipped', {
+        error_message: error?.message || String(error),
+        aborted: options.req?.abortSignal?.aborted === true,
+      });
+      return;
+    }
+
+    if (isPossibleCodexContextWindowError(error)) {
+      traceLog(tracer, 'codex.session.context_recovery_unmatched', {
+        error_message: error?.message || String(error),
+        gateway_error_status: error.status,
+        gateway_error_type: error.type,
       });
     }
   }

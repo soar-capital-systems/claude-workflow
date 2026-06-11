@@ -411,6 +411,35 @@ function restoreEnv(previous) {
   }
 }
 
+function captureTracer() {
+  const entries = [];
+
+  function scopedTracer(scopeFields = {}) {
+    return {
+      log(event, details = {}) {
+        entries.push({
+          event,
+          details: {
+            ...scopeFields,
+            ...details,
+          },
+        });
+      },
+      scope(childFields = {}) {
+        return scopedTracer({
+          ...scopeFields,
+          ...childFields,
+        });
+      },
+    };
+  }
+
+  return {
+    entries,
+    tracer: scopedTracer(),
+  };
+}
+
 async function withTemporaryEnv(updates, run) {
   const previous = {};
   for (const key of Object.keys(updates)) {
@@ -2562,6 +2591,83 @@ await runTest('fresh Codex sessions seed the app-server turn with the supplied t
   }
 });
 
+await runTest('Codex transcript budget includes omission notices and separators', async function testCodexTranscriptBudgetIncludesNotices() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-budget-'));
+  const codexPath = path.join(tempDir, 'codex-budget');
+  const turnParamsPath = path.join(tempDir, 'turn-params.json');
+  const inputMaxTokens = 24;
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, JSON.stringify(message.params), "utf8");\n' +
+        "    send({ id: message.id, result: { turn: { id: 'turn-1' } } });\n" +
+        "    setTimeout(function completeTurn() { send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } }); }, 10);\n" +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = turnParamsPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          inputMaxTokens,
+        },
+      });
+
+      await manager.processRequest(
+        gatewayRequest(),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Old requirement. '.repeat(40) },
+            { role: 'assistant', content: 'Old answer. '.repeat(40) },
+            { role: 'user', content: 'Newest request should survive the budget.' },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      const turnParams = JSON.parse(await fs.readFile(turnParamsPath, 'utf8'));
+      const inputText = turnParams.input[0].text;
+      assert.equal(inputText.length <= inputMaxTokens * 4, true);
+      assert.equal(inputText.includes('survive the budget.'), true);
+      await manager.close();
+      ok('final Codex transcript bootstrap stays inside the configured input budget');
+    } finally {
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 await runTest('fresh Codex fork sessions start from the current request only', async function testCodexForkSessionSkipsOldTranscript() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-fork-input-'));
   const codexPath = path.join(tempDir, 'codex-fork-input');
@@ -2650,6 +2756,50 @@ await runTest('fresh Codex fork sessions start from the current request only', a
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
+});
+
+await runTest('Codex context-ish 502s that miss recovery matching are traced', async function testCodexContextDriftTracing() {
+  const { entries, tracer } = captureTracer();
+  const manager = new CodexSessionManager(
+    {
+      codex: {
+        idleTimeoutMs: 0,
+        forkIdleTimeoutMs: 0,
+        maxSessions: 16,
+      },
+    },
+    {
+      tracer,
+      createSession(route, req, requestBody, sessionKey) {
+        return stubCodexSession(sessionKey, {
+          async advance() {
+            throw new GatewayError(
+              502,
+              'api_error',
+              'provider input token budget exceeded before generation'
+            );
+          },
+        });
+      },
+    }
+  );
+
+  await assert.rejects(
+    manager.processRequest(
+      claudeSessionRequest('session-context-drift'),
+      codexUserRequest('Trigger unmatched context-ish 502.'),
+      codexRoute()
+    ),
+    /token budget exceeded/u
+  );
+
+  assert.equal(
+    entries.some(function hasDriftTrace(entry) {
+      return entry.event === 'codex.session.context_recovery_unmatched';
+    }),
+    true
+  );
+  ok('context-like Codex 502 wording drift is traceable even when recovery does not engage');
 });
 
 await runTest('Codex context-window failures retry once on a fresh latest-request thread', async function testCodexContextWindowRecovery() {

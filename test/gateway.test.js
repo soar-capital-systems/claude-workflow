@@ -195,13 +195,26 @@ const CLEAN_PROXY_ENV = Object.freeze({
   no_proxy: '',
 });
 const CLEAN_WORKFLOW_ENV = Object.freeze({
+  CLAUDE_WORKFLOW_MAIN_PROVIDER: '',
   CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID: '',
+  DEEPSEEK_API_KEY: '',
+  DEEPSEEK_BASE_URL: '',
+  DEEPSEEK_DEFAULT_MODEL_ID: '',
   ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: '',
+  ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: '',
+  ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: '',
+  ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: '',
+  ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_MAIN_MODEL_ID: '',
+  ULTRATHINK_GATEWAY_MAIN_PROVIDER: '',
+  ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL: '',
   ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID: '',
   ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: '',
   ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY: '',
+  ULTRATHINK_DEEPSEEK_REASONING_EFFORT: '',
+  ULTRATHINK_THINKING_LEVEL: '',
 });
 
 function cleanProxyEnv(overrides = {}) {
@@ -258,6 +271,13 @@ function gatewayConfig(overrides = {}) {
       reasoningEffort: 'low',
       verbosity: 'low',
     },
+    deepseek: {
+      apiKey: '',
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'deepseek-v4-pro',
+      reasoningEffort: 'max',
+      thinking: { type: 'enabled' },
+    },
     anthropic: {
       apiKey: '',
       baseUrl: 'http://127.0.0.1:1',
@@ -276,11 +296,73 @@ function gatewayConfig(overrides = {}) {
       ...baseConfig.openai,
       ...overrides.openai,
     },
+    deepseek: {
+      ...baseConfig.deepseek,
+      ...overrides.deepseek,
+    },
     anthropic: {
       ...baseConfig.anthropic,
       ...overrides.anthropic,
     },
   };
+}
+
+function lookupWeatherTool() {
+  return {
+    name: 'lookup_weather',
+    description: 'Fetch weather.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        city: { type: 'string' },
+      },
+      required: ['city'],
+    },
+  };
+}
+
+function deepSeekFableGatewayConfig(gatewayPort, deepSeekPort, overrides = {}) {
+  const configOverrides = overrides.config || {};
+  const deepSeekOverrides = overrides.deepseek || {};
+  const routeOverrides = overrides.route || {};
+
+  return gatewayConfig({
+    ...configOverrides,
+    port: gatewayPort,
+    exposedModels: ['claude-fable-5[1m]'],
+    routeMap: {
+      'claude-fable-5[1m]': {
+        provider: 'deepseek',
+        model: 'deepseek-v4-pro',
+        reasoningEffort: 'max',
+        ...routeOverrides,
+      },
+    },
+    anthropicPassthroughModels: ['claude-fable-5*'],
+    deepseek: {
+      apiKey: 'deepseek-key',
+      baseUrl: `http://127.0.0.1:${deepSeekPort}`,
+      model: 'deepseek-v4-flash',
+      reasoningEffort: 'high',
+      thinking: { type: 'enabled' },
+      ...deepSeekOverrides,
+    },
+  });
+}
+
+function deepSeekReasoningHeaders(sessionId) {
+  return jsonHeaders({
+    'x-claude-code-session-id': sessionId,
+    'x-claude-code-agent-id': 'agent-weather',
+  });
+}
+
+function assertDeepSeekReasoningReplay(capturedBodies) {
+  const assistantMessage = capturedBodies[1].messages.find(function findAssistant(message) {
+    return message.role === 'assistant';
+  });
+  assert.equal(assistantMessage.reasoning_content, 'Need weather.');
+  assert.equal(assistantMessage.tool_calls[0].id, 'call_weather');
 }
 
 function gatewayRequest(headers = {}) {
@@ -691,6 +773,32 @@ await runTest('gateway config prefers Codex-profile aliases for the OpenAI remap
   }
 });
 
+await runTest('gateway config reads an independent DeepSeek route profile', async function testDeepSeekGatewayProfile() {
+  await withTemporaryEnv(
+    {
+      ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: 'gateway-deepseek-key',
+      DEEPSEEK_API_KEY: 'ambient-deepseek-key',
+      ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: 'http://127.0.0.1:9876',
+      DEEPSEEK_BASE_URL: 'http://should-not-win',
+      ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: 'deepseek-v4-pro',
+      DEEPSEEK_DEFAULT_MODEL_ID: 'deepseek-v4-flash',
+      ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'high',
+      ULTRATHINK_DEEPSEEK_REASONING_EFFORT: 'max',
+      ULTRATHINK_THINKING_LEVEL: 'OFF',
+    },
+    async function assertDeepSeekGatewayProfile() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.deepseek.apiKey, 'gateway-deepseek-key');
+      assert.equal(config.deepseek.baseUrl, 'http://127.0.0.1:9876');
+      assert.equal(config.deepseek.model, 'deepseek-v4-pro');
+      assert.equal(config.deepseek.reasoningEffort, 'high');
+      assert.equal(config.deepseek.thinking.type, 'disabled');
+      ok('DeepSeek gateway routing has its own credentials, endpoint, model, and thinking profile');
+    }
+  );
+});
+
 await runTest('gateway defaults Codex-backed routes to writable never-approval sessions', async function testCodexSessionDefaults() {
   const previous = {
     ULTRATHINK_GATEWAY_CODEX_ENABLED: process.env.ULTRATHINK_GATEWAY_CODEX_ENABLED,
@@ -746,6 +854,35 @@ await runTest('gateway keeps wildcard Anthropic passthrough defaults for standal
   assert.equal(route.provider, 'anthropic');
   assert.equal(route.upstreamModel, 'claude-opus-4-8-20260601');
   ok('standalone gateway default still preserves Opus wildcard passthrough');
+});
+
+await runTest('gateway wildcard route-map entries override passthrough patterns', async function testWildcardRouteMapEntry() {
+  const route = resolveModelRoute(
+    'claude-fable-5[1m]',
+    gatewayConfig({
+      routeMap: {
+        'claude-fable-5*': {
+          provider: 'deepseek',
+          model: 'deepseek-v4-pro',
+          reasoningEffort: 'max',
+        },
+      },
+      anthropicPassthroughModels: ['claude-fable-5*'],
+      deepseek: {
+        apiKey: 'deepseek-key',
+        baseUrl: 'http://127.0.0.1:1',
+        model: 'deepseek-v4-flash',
+        reasoningEffort: 'high',
+        thinking: { type: 'enabled' },
+      },
+    })
+  );
+
+  assert.equal(route.provider, 'deepseek');
+  assert.equal(route.upstreamModel, 'deepseek-v4-pro');
+  assert.equal(route.reasoningEffort, 'max');
+  assert.deepEqual(route.thinking, { type: 'enabled' });
+  ok('wildcard route-map entries are applied before the Anthropic passthrough fallback');
 });
 
 await runTest('gateway config exposes the Codex close kill timeout knob', async function testCodexCloseKillTimeoutConfig() {
@@ -3813,6 +3950,12 @@ await runTest(
         ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.5',
         ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT: 'xhigh',
       });
+      const deepSeekMainHealth = await runWithDisplayEnv('deepseek-main-health.json', {
+        ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'deepseek',
+        ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: 'deepseek-key',
+        ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: 'deepseek-v4-pro',
+        ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'max',
+      });
       const collisionHealth = await runWithDisplayEnv('main-subagent-collision-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-sonnet-4-7',
         ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID: 'claude-sonnet-4-7',
@@ -3863,6 +4006,14 @@ await runTest(
       assert.equal(
         frontierHealth.subagentModel,
         'codex-gpt-5.5-xhigh-via-claude-sonnet-4-7'
+      );
+      assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
+      assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
+      assert.equal(
+        deepSeekMainHealth.models.data.find(function isFableModel(model) {
+          return model.id === 'claude-fable-5[1m]';
+        })?.display_name,
+        'DeepSeek Main Route'
       );
       assert.equal(
         collisionHealth.models.data.find(function isRawSubagentModel(model) {
@@ -4996,6 +5147,318 @@ await runTest('gateway applies explicit route-map entries before default routing
   }
 });
 
+await runTest('gateway routes configured models to DeepSeek-compatible chat completions', async function testDeepSeekGatewayRouting() {
+  const deepSeekPort = await freePort();
+  let capturedBody = null;
+  let capturedUrl = null;
+  let capturedAuthorization = '';
+
+  const deepSeekServer = http.createServer(async function handleDeepSeek(req, res) {
+    capturedUrl = req.url;
+    capturedAuthorization = req.headers.authorization || '';
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-deepseek-route',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'DeepSeek route ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 21,
+          completion_tokens: 5,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    deepSeekServer.once('error', reject);
+    deepSeekServer.listen(deepSeekPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(deepSeekFableGatewayConfig(gatewayPort, deepSeekPort, {
+    config: {
+      displayRoutedModel: true,
+      openai: {
+        apiKey: 'openai-key-should-not-be-used',
+        baseUrl: 'http://127.0.0.1:1',
+      },
+    },
+    route: {
+      reasoningEffort: 'high',
+      displayName: 'Fable via DeepSeek',
+    },
+    deepseek: {
+      reasoningEffort: 'max',
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'claude-fable-5[1m]',
+        system: 'You are terse.',
+        max_tokens: 128,
+        messages: [
+          {
+            role: 'user',
+            content: 'Use DeepSeek.',
+          },
+        ],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'tool',
+          name: 'lookup_weather',
+          disable_parallel_tool_use: true,
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+
+    assert.equal(capturedUrl, '/chat/completions');
+    assert.equal(capturedAuthorization, 'Bearer deepseek-key');
+    assert.equal(capturedBody.model, 'deepseek-v4-pro');
+    assert.equal(capturedBody.reasoning_effort, 'high');
+    assert.equal(capturedBody.max_tokens, 128);
+    assert.equal(capturedBody.max_completion_tokens, undefined);
+    assert.deepEqual(capturedBody.thinking, { type: 'enabled' });
+    assert.equal(capturedBody.tools[0].function.name, 'lookup_weather');
+    assert.equal(capturedBody.tool_choice, undefined);
+    assert.equal(capturedBody.parallel_tool_calls, undefined);
+    assert.deepEqual(
+      capturedBody.messages.map(function roles(message) {
+        return message.role;
+      }),
+      ['system', 'user']
+    );
+    assert.equal(
+      payload.model,
+      routedResponseModel({
+        provider: 'deepseek',
+        upstreamModel: 'deepseek-v4-pro',
+        reasoningEffort: 'high',
+        requestedModel: 'claude-fable-5[1m]',
+      })
+    );
+    assert.equal(payload.usage.input_tokens, 21);
+    assert.equal(payload.usage.output_tokens, 5);
+    assert.equal(payload.content[0].text, 'DeepSeek route ok.');
+    ok('DeepSeek routes use their own credentials, endpoint, request shape, and response metadata');
+  } finally {
+    await runtime.close();
+    await closeServer(deepSeekServer);
+  }
+});
+
+await runTest('gateway omits DeepSeek reasoning effort when thinking is disabled', async function testDeepSeekDisabledThinkingRouting() {
+  const deepSeekPort = await freePort();
+  let capturedBody = null;
+
+  const deepSeekServer = http.createServer(async function handleDeepSeek(req, res) {
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-deepseek-disabled-thinking',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'DeepSeek no thinking ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    deepSeekServer.once('error', reject);
+    deepSeekServer.listen(deepSeekPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(deepSeekFableGatewayConfig(gatewayPort, deepSeekPort, {
+    deepseek: {
+      thinking: { type: 'disabled' },
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'claude-fable-5[1m]',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Use DeepSeek without thinking.' }],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'auto',
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+
+    assert.equal(capturedBody.reasoning_effort, undefined);
+    assert.deepEqual(capturedBody.thinking, { type: 'disabled' });
+    assert.equal(capturedBody.tool_choice, 'auto');
+    ok('DeepSeek disabled-thinking requests omit reasoning_effort while keeping normal tool_choice translation');
+  } finally {
+    await runtime.close();
+    await closeServer(deepSeekServer);
+  }
+});
+
+await runTest(
+  'gateway preserves DeepSeek reasoning content across JSON tool-result turns',
+  async function testDeepSeekReasoningToolLoopJson() {
+    const deepSeekPort = await freePort();
+    const capturedBodies = [];
+
+    const deepSeekServer = http.createServer(async function handleDeepSeek(req, res) {
+      capturedBodies.push(await readJsonBody(req));
+      res.writeHead(200, jsonHeaders());
+
+      if (capturedBodies.length === 1) {
+        res.end(
+          JSON.stringify({
+            id: 'chatcmpl-deepseek-tool',
+            choices: [
+              {
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: null,
+                  reasoning_content: 'Need weather.',
+                  tool_calls: [
+                    {
+                      id: 'call_weather',
+                      type: 'function',
+                      function: {
+                        name: 'lookup_weather',
+                        arguments: JSON.stringify({ city: 'SF' }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+            usage: {
+              prompt_tokens: 20,
+              completion_tokens: 6,
+            },
+          })
+        );
+        return;
+      }
+
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-deepseek-final',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'Weather checked.',
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 35,
+            completion_tokens: 4,
+          },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      deepSeekServer.once('error', reject);
+      deepSeekServer.listen(deepSeekPort, '127.0.0.1', resolve);
+    });
+
+    const gatewayPort = await freePort();
+    const runtime = createGatewayServer(deepSeekFableGatewayConfig(gatewayPort, deepSeekPort));
+
+    await waitForListening(runtime.server);
+
+    const headers = deepSeekReasoningHeaders('session-deepseek-json-reasoning');
+
+    try {
+      const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-fable-5[1m]',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'Check weather.' }],
+          tools: [lookupWeatherTool()],
+        }),
+      });
+      assert.equal(firstResponse.status, 200);
+      const firstPayload = await firstResponse.json();
+      const toolUse = firstPayload.content.find(function findToolUse(block) {
+        return block.type === 'tool_use';
+      });
+      assert.equal(toolUse.id, 'call_weather');
+
+      const secondResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-fable-5[1m]',
+          max_tokens: 256,
+          messages: [
+            { role: 'user', content: 'Check weather.' },
+            {
+              role: 'assistant',
+              content: [toolUse],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_weather',
+                  content: '72F',
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(secondResponse.status, 200);
+
+      assertDeepSeekReasoningReplay(capturedBodies);
+      ok('DeepSeek JSON tool loops replay reasoning_content on the assistant tool-call message');
+    } finally {
+      await runtime.close();
+      await closeServer(deepSeekServer);
+    }
+  }
+);
+
 await runTest('gateway streams OpenAI chunks as Anthropic SSE events', async function testStreaming() {
   const openAiPort = await freePort();
 
@@ -5280,6 +5743,164 @@ await runTest('gateway streams tool calls with Anthropic input_json_delta events
     await closeServer(openAiServer);
   }
 });
+
+await runTest(
+  'gateway preserves DeepSeek reasoning content across streamed tool-result turns',
+  async function testDeepSeekReasoningToolLoopStream() {
+    const deepSeekPort = await freePort();
+    const capturedBodies = [];
+
+    const deepSeekServer = http.createServer(async function handleDeepSeek(req, res) {
+      capturedBodies.push(await readJsonBody(req));
+
+      if (capturedBodies.length === 1) {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+        });
+        res.write(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl-deepseek-tool-stream',
+            choices: [
+              {
+                delta: {
+                  reasoning_content: 'Need weather.',
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\r\n\r\n`
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl-deepseek-tool-stream',
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_weather',
+                      type: 'function',
+                      function: {
+                        name: 'lookup_weather',
+                        arguments: JSON.stringify({ city: 'SF' }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\r\n\r\n`
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl-deepseek-tool-stream',
+            choices: [{ delta: {}, finish_reason: 'tool_calls' }],
+            usage: { prompt_tokens: 15, completion_tokens: 6 },
+          })}\r\n\r\n`
+        );
+        res.write('data: [DONE]\r\n\r\n');
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, jsonHeaders());
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-deepseek-stream-final',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'Weather checked.',
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 35,
+            completion_tokens: 4,
+          },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      deepSeekServer.once('error', reject);
+      deepSeekServer.listen(deepSeekPort, '127.0.0.1', resolve);
+    });
+
+    const gatewayPort = await freePort();
+    const runtime = createGatewayServer(deepSeekFableGatewayConfig(gatewayPort, deepSeekPort));
+
+    await waitForListening(runtime.server);
+
+    const headers = deepSeekReasoningHeaders('session-deepseek-stream-reasoning');
+
+    try {
+      const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-fable-5[1m]',
+          stream: true,
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'Check weather.' }],
+          tools: [lookupWeatherTool()],
+        }),
+      });
+      assert.equal(firstResponse.status, 200);
+
+      const events = parseSsePayloads(await firstResponse.text());
+      const toolStart = events.find(function findToolStart(event) {
+        return (
+          event.name === 'content_block_start' &&
+          event.payload?.content_block?.type === 'tool_use'
+        );
+      });
+      assert.equal(toolStart.payload.content_block.id, 'call_weather');
+
+      const secondResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-fable-5[1m]',
+          max_tokens: 256,
+          messages: [
+            { role: 'user', content: 'Check weather.' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  ...toolStart.payload.content_block,
+                  input: { city: 'SF' },
+                },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_weather',
+                  content: '72F',
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(secondResponse.status, 200);
+
+      assertDeepSeekReasoningReplay(capturedBodies);
+      ok('DeepSeek streaming tool loops replay reasoning_content on the assistant tool-call message');
+    } finally {
+      await runtime.close();
+      await closeServer(deepSeekServer);
+    }
+  }
+);
 
 await runTest(
   'gateway streams live Codex usage updates before the terminal boundary',

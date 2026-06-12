@@ -84,6 +84,7 @@ Common values:
 
 ```bash
 ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]
+ULTRATHINK_GATEWAY_MAIN_PROVIDER=anthropic
 ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-fable-5*
 ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID=claude-sonnet-4-7
 ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.5
@@ -106,6 +107,29 @@ ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
 ```
 
 `ULTRATHINK_GATEWAY_CODEX_COMMAND` is only the executable name or path. Do not set it to `codex app-server`; the gateway appends `app-server` itself.
+
+DeepSeek main route:
+
+```bash
+ULTRATHINK_GATEWAY_MAIN_PROVIDER=deepseek
+ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]
+ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY=your_deepseek_api_key
+ULTRATHINK_GATEWAY_DEEPSEEK_MODEL=deepseek-v4-pro
+ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT=max
+# Optional: ULTRATHINK_THINKING_LEVEL=OFF
+```
+
+DeepSeek thinking-mode routes omit `tool_choice` because the live API rejects that field while thinking is enabled. Tools are still advertised, and DeepSeek can choose tool calls normally.
+Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
+
+Standalone route-map entries can also use exact keys or wildcard keys. Exact keys win before wildcard keys:
+
+```bash
+ULTRATHINK_GATEWAY_EXPOSED_MODELS=claude-fable-5[1m]
+ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"claude-fable-5*":{"provider":"deepseek","model":"deepseek-v4-pro","reasoningEffort":"max","displayName":"Fable 5 via DeepSeek V4 Pro"}}'
+```
+
+Wildcard route-map keys match requests, but they are not concrete model ids. Set `ULTRATHINK_GATEWAY_EXPOSED_MODELS` when a standalone client depends on `/v1/models` discovery.
 
 If you bind the gateway to a non-loopback host, set `ULTRATHINK_GATEWAY_SHARED_SECRET`. `claude-workflow` rejects unauthenticated non-loopback launches. If the shared secret is set and your main route still uses Anthropic passthrough, also set `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` on the gateway.
 

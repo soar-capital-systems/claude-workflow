@@ -25,12 +25,14 @@ export class GatewayError extends Error {
 
 const ROUTE_PROVIDERS = Object.freeze({
   ANTHROPIC: 'anthropic',
+  DEEPSEEK: 'deepseek',
   OPENAI: 'openai',
   CODEX: 'codex',
 });
 
 const ROUTE_PROVIDER_BUILDERS = Object.freeze({
   [ROUTE_PROVIDERS.ANTHROPIC]: buildAnthropicRoute,
+  [ROUTE_PROVIDERS.DEEPSEEK]: buildDeepSeekRoute,
   [ROUTE_PROVIDERS.OPENAI]: buildOpenAiRoute,
   [ROUTE_PROVIDERS.CODEX]: buildCodexRoute,
 });
@@ -47,6 +49,9 @@ export const ROUTE_ENTRY_REASONING_KEYS = Object.freeze([
 const ROUTE_ENTRY_DISPLAY_NAME_KEYS = Object.freeze([
   'displayName',
   'display_name',
+]);
+const ROUTE_ENTRY_THINKING_KEYS = Object.freeze([
+  'thinking',
 ]);
 
 const VALID_CODEX_SANDBOXES = Object.freeze([
@@ -107,13 +112,18 @@ function buildDisplayName(modelId, entry, fallback) {
   return routeEntryValue(entry, ROUTE_ENTRY_DISPLAY_NAME_KEYS, fallback);
 }
 
-function routeMapEntry(modelId, config) {
-  const routeMap = config.routeMap || {};
-  const entry = routeMap[modelId];
-  if (entry === undefined) {
-    return null;
+function routeObjectValue(entry, keys, fallback = undefined) {
+  for (const key of keys) {
+    const value = entry?.[key];
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value;
+    }
   }
 
+  return fallback;
+}
+
+function validateRouteMapEntry(modelId, entry) {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
     throw new GatewayError(
       500,
@@ -123,6 +133,24 @@ function routeMapEntry(modelId, config) {
   }
 
   return entry;
+}
+
+function routeMapEntry(modelId, config) {
+  const routeMap = config.routeMap || {};
+  const exactEntry = routeMap[modelId];
+  if (exactEntry !== undefined) {
+    return validateRouteMapEntry(modelId, exactEntry);
+  }
+
+  for (const [pattern, entry] of Object.entries(routeMap)) {
+    if (pattern === modelId || !matchesModelPattern(modelId, pattern)) {
+      continue;
+    }
+
+    return validateRouteMapEntry(pattern, entry);
+  }
+
+  return null;
 }
 
 function buildAnthropicRoute(modelId, config, entry = null) {
@@ -136,39 +164,68 @@ function buildAnthropicRoute(modelId, config, entry = null) {
   };
 }
 
-function buildOpenAiRoute(modelId, config, entry = null) {
-  if (!config.openai.apiKey) {
+function buildOpenAiCompatibleRoute(modelId, config, entry, options) {
+  const providerConfig = config[options.configKey] || {};
+  if (!providerConfig.apiKey) {
     throw new GatewayError(
       500,
       'api_error',
-      'Codex-targeted OpenAI routing is configured but ULTRATHINK_GATEWAY_CODEX_API_KEY, ULTRATHINK_GATEWAY_OPENAI_API_KEY, or OPENAI_API_KEY is missing'
+      options.missingKeyMessage
     );
   }
 
   const upstreamModel = routeEntryValue(
     entry,
     ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
-    config.openai.model
+    providerConfig.model
   );
   const reasoningEffort = routeEntryValue(
     entry,
     ROUTE_ENTRY_REASONING_KEYS,
-    config.openai.reasoningEffort
+    providerConfig.reasoningEffort
   );
-  const verbosity = routeValue(entry?.verbosity, config.openai.verbosity);
+  const verbosity = routeValue(entry?.verbosity, providerConfig.verbosity);
+  const thinking = routeObjectValue(entry, ROUTE_ENTRY_THINKING_KEYS, providerConfig.thinking);
 
   return {
-    provider: ROUTE_PROVIDERS.OPENAI,
+    provider: options.provider,
     requestedModel: modelId,
     upstreamModel,
     reasoningEffort,
     verbosity,
+    thinking,
+    maxTokensField: options.maxTokensField,
+    systemRole: options.systemRole,
     displayName: buildDisplayName(
       modelId,
       entry,
-      `${formatClaudeFamily(modelId)} via Codex profile ${upstreamModel}/${reasoningEffort}`
+      `${formatClaudeFamily(modelId)} via ${options.displayProvider} ${upstreamModel}/${reasoningEffort}`
     ),
   };
+}
+
+function buildOpenAiRoute(modelId, config, entry = null) {
+  return buildOpenAiCompatibleRoute(modelId, config, entry, {
+    provider: ROUTE_PROVIDERS.OPENAI,
+    configKey: 'openai',
+    displayProvider: 'Codex profile',
+    maxTokensField: 'max_completion_tokens',
+    systemRole: 'developer',
+    missingKeyMessage:
+      'Codex-targeted OpenAI routing is configured but ULTRATHINK_GATEWAY_CODEX_API_KEY, ULTRATHINK_GATEWAY_OPENAI_API_KEY, or OPENAI_API_KEY is missing',
+  });
+}
+
+function buildDeepSeekRoute(modelId, config, entry = null) {
+  return buildOpenAiCompatibleRoute(modelId, config, entry, {
+    provider: ROUTE_PROVIDERS.DEEPSEEK,
+    configKey: 'deepseek',
+    displayProvider: 'DeepSeek',
+    maxTokensField: 'max_tokens',
+    systemRole: 'system',
+    missingKeyMessage:
+      'DeepSeek routing is configured but ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY is missing',
+  });
 }
 
 function buildCodexRoute(modelId, config, entry = null) {
@@ -227,14 +284,14 @@ function buildCodexRoute(modelId, config, entry = null) {
 
 function configuredProvider(entry, modelId) {
   const provider = routeValue(entry?.provider).toLowerCase();
-  if (provider in ROUTE_PROVIDER_BUILDERS) {
+  if (Object.hasOwn(ROUTE_PROVIDER_BUILDERS, provider)) {
     return provider;
   }
 
   throw new GatewayError(
     500,
     'api_error',
-    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "openai", or "anthropic"`
+    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "openai", or "anthropic"`
   );
 }
 

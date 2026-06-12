@@ -144,6 +144,54 @@ function routeReasoningEffort(route, fallback = '') {
   return routeEntryValue(route, ROUTE_ENTRY_REASONING_KEYS, fallback);
 }
 
+function normalizedRouteProvider(value, fallback = 'anthropic') {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized || fallback;
+}
+
+function mainRouteDefaultModel(provider, mainModelId, baseConfig) {
+  switch (provider) {
+    case 'anthropic':
+      return mainModelId;
+    case 'codex':
+      return baseConfig.codex.model;
+    case 'deepseek':
+      return baseConfig.deepseek.model;
+    case 'openai':
+      return baseConfig.openai.model;
+    default:
+      return mainModelId;
+  }
+}
+
+function mainRouteDefaultReasoningEffort(provider, baseConfig) {
+  switch (provider) {
+    case 'codex':
+      return baseConfig.codex.reasoningEffort;
+    case 'deepseek':
+      return baseConfig.deepseek.reasoningEffort;
+    case 'openai':
+      return baseConfig.openai.reasoningEffort;
+    default:
+      return '';
+  }
+}
+
+function mainRouteDisplayName(provider) {
+  switch (provider) {
+    case 'anthropic':
+      return 'Claude Workflow Frontier Route';
+    case 'codex':
+      return 'Codex Main Route';
+    case 'deepseek':
+      return 'DeepSeek Main Route';
+    case 'openai':
+      return 'OpenAI-Compatible Main Route';
+    default:
+      return 'Claude Workflow Main Route';
+  }
+}
+
 function routedModelId(provider, upstreamModel, reasoningEffort, requestedModel) {
   const effort = reasoningEffort ? `-${modelIdPart(reasoningEffort)}` : '';
   return [
@@ -306,6 +354,17 @@ function isHelpRequest(rawArgs) {
 function buildGatewayConfig() {
   const baseConfig = loadGatewayConfig();
   const mainModelId = envString('ULTRATHINK_GATEWAY_MAIN_MODEL_ID', DEFAULT_MAIN_MODEL_ID);
+  const mainProvider = normalizedRouteProvider(
+    envString('ULTRATHINK_GATEWAY_MAIN_PROVIDER', envString('CLAUDE_WORKFLOW_MAIN_PROVIDER'))
+  );
+  const mainUpstreamModel = envString(
+    'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL',
+    mainRouteDefaultModel(mainProvider, mainModelId, baseConfig)
+  );
+  const mainReasoningEffort = envString(
+    'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT',
+    mainRouteDefaultReasoningEffort(mainProvider, baseConfig)
+  );
   const rawSubagentModelId = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID',
     'claude-sonnet-4-7'
@@ -320,9 +379,10 @@ function buildGatewayConfig() {
   );
   const subagentVerbosity = envString('ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY', 'high');
   const defaultMainRoute = {
-    provider: 'anthropic',
-    model: mainModelId,
-    displayName: 'Claude Workflow Frontier Route',
+    provider: mainProvider,
+    model: mainUpstreamModel,
+    ...(mainReasoningEffort ? { reasoningEffort: mainReasoningEffort } : {}),
+    displayName: mainRouteDisplayName(mainProvider),
   };
   const defaultSubagentRoute = {
     provider: 'codex',
@@ -544,13 +604,13 @@ async function main() {
 
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildGatewayConfig();
-  const mainRoute = resolveModelRoute(mainModelId, config);
+  const resolvedMainRoute = resolveModelRoute(mainModelId, config);
   // Fail fast on launcher-managed subagent routes before starting Claude.
   resolveModelRoute(rawSubagentModelId, config);
   if (subagentModelId !== rawSubagentModelId) {
     resolveModelRoute(subagentModelId, config);
   }
-  assertPreflight(config, mainRoute);
+  assertPreflight(config, resolvedMainRoute);
 
   let runtime = null;
   let claudeChild = null;
@@ -578,6 +638,11 @@ async function main() {
     const gatewayBaseUrl = `http://${config.host}:${resolvedGatewayPort(runtime.server)}`;
     process.stderr.write(`claude-workflow: gateway ready at ${gatewayBaseUrl}\n`);
     process.stderr.write(`claude-workflow: main model ${mainModelId}\n`);
+    if (routeProvider(resolvedMainRoute) !== 'anthropic') {
+      process.stderr.write(
+        `claude-workflow: main route ${mainModelId} -> ${routeTargetSummary(resolvedMainRoute)}\n`
+      );
+    }
     process.stderr.write(`claude-workflow: subagent model ${subagentModelId}\n`);
     if (subagentModelId !== rawSubagentModelId) {
       process.stderr.write(

@@ -25,6 +25,13 @@ const CODEX_PROFILE_ENV = Object.freeze({
   ],
   verbosity: ['ULTRATHINK_GATEWAY_CODEX_VERBOSITY', 'ULTRATHINK_GATEWAY_OPENAI_VERBOSITY'],
 });
+const DEEPSEEK_PROFILE_ENV = Object.freeze({
+  model: ['ULTRATHINK_GATEWAY_DEEPSEEK_MODEL', 'DEEPSEEK_DEFAULT_MODEL_ID'],
+  reasoningEffort: [
+    'ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT',
+    'ULTRATHINK_DEEPSEEK_REASONING_EFFORT',
+  ],
+});
 
 function firstDefinedString(...values) {
   for (const value of values) {
@@ -102,6 +109,19 @@ function codexProfileValue(key, fallback) {
   return firstEnvString(CODEX_PROFILE_ENV[key], fallback);
 }
 
+function deepSeekProfileValue(key, fallback) {
+  return firstEnvString(DEEPSEEK_PROFILE_ENV[key], fallback);
+}
+
+function deepSeekThinking() {
+  const thinkingLevel = firstEnvString(['ULTRATHINK_THINKING_LEVEL']).toUpperCase();
+  if (thinkingLevel === 'OFF') {
+    return { type: 'disabled' };
+  }
+
+  return { type: 'enabled' };
+}
+
 export function isGatewayLoopbackHost(host) {
   const normalized = String(host || '').trim().toLowerCase();
   if (LOOPBACK_HOSTS.has(normalized)) {
@@ -113,8 +133,11 @@ export function isGatewayLoopbackHost(host) {
 
 export function loadGatewayConfig() {
   const routeMap = parseRouteMap(process.env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON);
+  const exactRouteMapModels = Object.keys(routeMap).filter(function isExactRouteKey(modelId) {
+    return !modelId.endsWith('*');
+  });
   const defaultExposedModels =
-    Object.keys(routeMap).length > 0 ? Object.keys(routeMap) : DEFAULT_EXPOSED_MODELS;
+    exactRouteMapModels.length > 0 ? exactRouteMapModels : DEFAULT_EXPOSED_MODELS;
 
   return {
     host: process.env.ULTRATHINK_GATEWAY_HOST || '127.0.0.1',
@@ -199,6 +222,21 @@ export function loadGatewayConfig() {
       model: codexProfileValue('model', 'gpt-5.5'),
       reasoningEffort: codexProfileValue('reasoningEffort', 'low'),
       verbosity: codexProfileValue('verbosity', 'low'),
+    },
+    deepseek: {
+      apiKey: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY,
+        process.env.DEEPSEEK_API_KEY,
+        ''
+      ),
+      baseUrl: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL,
+        process.env.DEEPSEEK_BASE_URL,
+        'https://api.deepseek.com'
+      ),
+      model: deepSeekProfileValue('model', 'deepseek-v4-pro'),
+      reasoningEffort: deepSeekProfileValue('reasoningEffort', 'max'),
+      thinking: deepSeekThinking(),
     },
     anthropic: {
       apiKey: firstDefinedString(

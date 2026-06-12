@@ -157,7 +157,18 @@ function translateUserMessage(message) {
   return translated;
 }
 
-function translateAssistantMessage(message) {
+function toolCallReasoningContent(toolCalls, options) {
+  for (const toolCall of toolCalls) {
+    const reasoningContent = options.reasoningContentForToolCall?.(toolCall.id);
+    if (typeof reasoningContent === 'string' && reasoningContent !== '') {
+      return reasoningContent;
+    }
+  }
+
+  return '';
+}
+
+function translateAssistantMessage(message, options = {}) {
   const blocks = normalizedBlocks(message.content);
   const textParts = [];
   const toolCalls = [];
@@ -187,16 +198,18 @@ function translateAssistantMessage(message) {
     );
   }
 
+  const reasoningContent = toolCallReasoningContent(toolCalls, options);
   return [
     {
       role: 'assistant',
       content: textParts.length > 0 ? joinTextParts(textParts) : null,
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
     },
   ];
 }
 
-function translateSystemMessage(message) {
+function translateSystemMessage(message, options = {}) {
   const blocks = normalizedBlocks(message.content);
   const textParts = [];
 
@@ -213,13 +226,13 @@ function translateSystemMessage(message) {
 
   return [
     {
-      role: 'developer',
+      role: options.systemRole || 'developer',
       content: joinTextParts(textParts),
     },
   ];
 }
 
-function translateMessages(messages) {
+function translateMessages(messages, options = {}) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new GatewayError(
       400,
@@ -231,7 +244,7 @@ function translateMessages(messages) {
   const translated = [];
   for (const message of messages) {
     if (message?.role === 'system') {
-      translated.push(...translateSystemMessage(message));
+      translated.push(...translateSystemMessage(message, options));
       continue;
     }
     if (message?.role === 'user') {
@@ -239,7 +252,7 @@ function translateMessages(messages) {
       continue;
     }
     if (message?.role === 'assistant') {
-      translated.push(...translateAssistantMessage(message));
+      translated.push(...translateAssistantMessage(message, options));
       continue;
     }
     throw new GatewayError(
@@ -340,6 +353,14 @@ function translateToolChoice(toolChoice) {
   );
 }
 
+function shouldTranslateToolChoice(route) {
+  return !(route.provider === 'deepseek' && route.thinking?.type === 'enabled');
+}
+
+function shouldTranslateReasoningEffort(route) {
+  return !(route.provider === 'deepseek' && route.thinking?.type === 'disabled');
+}
+
 function parseToolArguments(toolCall) {
   const parsed = parseJsonObject(
     toolCall.function?.arguments || '{}',
@@ -384,17 +405,26 @@ function textBlocksFromMessageContent(content) {
 }
 
 export function translateAnthropicMessagesRequest(requestBody, route) {
+  return translateAnthropicMessagesRequestWithOptions(requestBody, route);
+}
+
+export function translateAnthropicMessagesRequestWithOptions(requestBody, route, options = {}) {
   const messages = [];
   const systemPrompt = translateSystemPrompt(requestBody.system);
+  const systemRole = route.systemRole || 'developer';
+  const translationOptions = {
+    ...options,
+    systemRole,
+  };
 
   if (systemPrompt) {
     messages.push({
-      role: 'developer',
+      role: systemRole,
       content: systemPrompt,
     });
   }
 
-  messages.push(...translateMessages(requestBody.messages));
+  messages.push(...translateMessages(requestBody.messages, translationOptions));
 
   const translated = {
     model: route.upstreamModel,
@@ -403,7 +433,8 @@ export function translateAnthropicMessagesRequest(requestBody, route) {
   };
 
   if (typeof requestBody.max_tokens === 'number') {
-    translated.max_completion_tokens = requestBody.max_tokens;
+    const maxTokensField = route.maxTokensField || 'max_completion_tokens';
+    translated[maxTokensField] = requestBody.max_tokens;
   }
   if (typeof requestBody.temperature === 'number') {
     translated.temperature = requestBody.temperature;
@@ -420,19 +451,24 @@ export function translateAnthropicMessagesRequest(requestBody, route) {
     translated.tools = tools;
   }
 
-  const toolChoice = translateToolChoice(requestBody.tool_choice);
-  if (toolChoice !== undefined) {
-    translated.tool_choice = toolChoice;
-  }
-  if (requestBody.tool_choice?.disable_parallel_tool_use === true) {
-    translated.parallel_tool_calls = false;
+  if (shouldTranslateToolChoice(route)) {
+    const toolChoice = translateToolChoice(requestBody.tool_choice);
+    if (toolChoice !== undefined) {
+      translated.tool_choice = toolChoice;
+    }
+    if (requestBody.tool_choice?.disable_parallel_tool_use === true) {
+      translated.parallel_tool_calls = false;
+    }
   }
 
-  if (route.reasoningEffort) {
+  if (route.reasoningEffort && shouldTranslateReasoningEffort(route)) {
     translated.reasoning_effort = route.reasoningEffort;
   }
   if (route.verbosity) {
     translated.verbosity = route.verbosity;
+  }
+  if (route.thinking) {
+    translated.thinking = route.thinking;
   }
   if (translated.stream) {
     translated.stream_options = { include_usage: true };
@@ -457,7 +493,8 @@ export function mapOpenAiFinishReason(finishReason) {
 export function translateOpenAiResponseToAnthropic(
   responseBody,
   requestedModel,
-  requestId
+  requestId,
+  options = {}
 ) {
   const choice = responseBody.choices?.[0];
   if (!choice?.message) {
@@ -468,9 +505,17 @@ export function translateOpenAiResponseToAnthropic(
     );
   }
 
+  const toolCalls = choice.message.tool_calls || [];
+  const reasoningContent = choice.message.reasoning_content || '';
+  if (reasoningContent) {
+    for (const toolCall of toolCalls) {
+      options.recordToolCallReasoning?.(toolCall.id, reasoningContent);
+    }
+  }
+
   const content = [
     ...textBlocksFromMessageContent(choice.message.content),
-    ...(choice.message.tool_calls || []).map(function toToolUse(toolCall) {
+    ...toolCalls.map(function toToolUse(toolCall) {
       return {
         type: 'tool_use',
         id: toolCall.id || randomId('toolu'),

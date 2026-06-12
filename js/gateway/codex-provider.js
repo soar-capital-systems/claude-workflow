@@ -8,6 +8,7 @@ const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_INPUT_MAX_TOKENS = 256_000;
 const DEFAULT_MAX_SESSIONS = 16;
+const SUPPORTS_PROCESS_GROUP_SIGNALS = process.platform !== 'win32';
 const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
 const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';
 const NON_RESERVING_SELECTION_REASONS = new Set([
@@ -26,6 +27,49 @@ const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 
 function noop() {}
+
+function signalChildProcessTree(child, signal) {
+  if (!child) {
+    return false;
+  }
+
+  let signaled = false;
+  if (SUPPORTS_PROCESS_GROUP_SIGNALS && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, signal);
+      signaled = true;
+    } catch {
+      // Fall back to the direct child for launchers that are not process-group leaders.
+    }
+  }
+
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return signaled;
+  }
+
+  try {
+    return child.kill(signal) || signaled;
+  } catch {
+    return signaled;
+  }
+}
+
+function childProcessTreeExists(child) {
+  if (!child) {
+    return false;
+  }
+
+  if (SUPPORTS_PROCESS_GROUP_SIGNALS && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code === 'EPERM';
+    }
+  }
+
+  return child.exitCode === null && child.signalCode === null;
+}
 
 function numberOrDefault(value, defaultValue) {
   if (value === null || value === undefined) {
@@ -785,6 +829,7 @@ class CodexAppServerConnection extends EventEmitter {
     super();
     this.config = config;
     this.child = null;
+    this.stopPromise = null;
     this.buffer = '';
     this.nextRequestId = 1;
     this.pendingRequests = new Map();
@@ -807,6 +852,7 @@ class CodexAppServerConnection extends EventEmitter {
   async start() {
     this.child = spawn(this.config.codex.command, ['app-server'], {
       cwd: this.config.codex.cwd,
+      detached: SUPPORTS_PROCESS_GROUP_SIGNALS,
       env: {
         ...process.env,
       },
@@ -1016,6 +1062,7 @@ class CodexAppServerConnection extends EventEmitter {
 
   async close(reason = null) {
     if (this.closed) {
+      await this.stopChild();
       return;
     }
 
@@ -1037,21 +1084,25 @@ class CodexAppServerConnection extends EventEmitter {
   }
 
   async stopChild() {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
+    if (!child) {
       return;
     }
 
-    await new Promise((resolve) => {
+    this.stopPromise = new Promise((resolve) => {
       let settled = false;
+      const childAlreadyExited = child.exitCode !== null || child.signalCode !== null;
       const killTimer = setTimeout(function killStubbornChild() {
-        try {
-          child.kill('SIGKILL');
-        } catch {
+        const killSignaled = signalChildProcessTree(child, 'SIGKILL');
+        const childExited = child.exitCode !== null || child.signalCode !== null;
+        if (childAlreadyExited || childExited || !killSignaled) {
           finish();
         }
       }, this.closeKillTimeoutMs);
-      killTimer.unref?.();
 
       function finish() {
         if (settled) {
@@ -1059,17 +1110,26 @@ class CodexAppServerConnection extends EventEmitter {
         }
         settled = true;
         clearTimeout(killTimer);
-        child.off('close', finish);
+        child.off('close', finishWhenProcessTreeExited);
         resolve();
       }
 
-      child.once('close', finish);
-      try {
-        child.kill('SIGTERM');
-      } catch {
+      function finishWhenProcessTreeExited() {
+        if (childProcessTreeExists(child)) {
+          return;
+        }
+        finish();
+      }
+
+      if (!childAlreadyExited) {
+        child.once('close', finishWhenProcessTreeExited);
+      }
+      if (!signalChildProcessTree(child, 'SIGTERM')) {
         finish();
       }
     });
+
+    return this.stopPromise;
   }
 }
 

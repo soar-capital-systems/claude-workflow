@@ -149,6 +149,31 @@ async function waitForFile(filePath, timeoutMs = 5_000) {
   throw new Error(`Timed out waiting for ${filePath}`);
 }
 
+function processExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) {
+      return;
+    }
+    await sleep(25);
+  }
+
+  throw new Error(`Timed out waiting for process ${String(pid)} to exit`);
+}
+
 function parseSsePayloads(text) {
   return text
     .split(/\r?\n\r?\n/u)
@@ -2620,13 +2645,31 @@ await runTest('Codex app-server clean exits reject active turns after turn/start
 await runTest('Codex app-server close force-kills SIGTERM-resistant children', async function testCodexCloseForceKillsStubbornChild() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-stubborn-close-'));
   const codexPath = path.join(tempDir, 'codex-stubborn-close');
+  const helperPidFile =
+    process.platform === 'win32' ? null : path.join(tempDir, 'codex-helper.pid');
+  const previousHelperPidFile = process.env.CODEX_HELPER_PID_FILE;
+  let helperPid = null;
 
   try {
+    if (helperPidFile) {
+      process.env.CODEX_HELPER_PID_FILE = helperPidFile;
+    }
+
     await makeExecutable(
       codexPath,
       '#!/usr/bin/env node\n' +
+        "import { spawn } from 'node:child_process';\n" +
+        "import fs from 'node:fs';\n" +
         "import readline from 'node:readline';\n" +
-        "process.on('SIGTERM', function ignoreSigterm() {});\n" +
+        "const helperPidFile = process.env.CODEX_HELPER_PID_FILE;\n" +
+        'if (helperPidFile) {\n' +
+        '  const helper = spawn(process.execPath, [\n' +
+        "    '-e',\n" +
+        "    \"process.on('SIGTERM', function ignoreSigterm() {}); setInterval(function keepAlive() {}, 1000);\",\n" +
+        "  ], { stdio: 'ignore' });\n" +
+        '  helper.unref();\n' +
+        '  fs.writeFileSync(helperPidFile, String(helper.pid));\n' +
+        '}\n' +
         'const rl = readline.createInterface({ input: process.stdin });\n' +
         'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
         "rl.on('line', function onLine(line) {\n" +
@@ -2658,11 +2701,33 @@ await runTest('Codex app-server close force-kills SIGTERM-resistant children', a
     );
     await session.connection.readyPromise;
 
+    if (helperPidFile) {
+      await waitForFile(helperPidFile);
+      helperPid = Number(await fs.readFile(helperPidFile, 'utf8'));
+      assert.equal(processExists(helperPid), true);
+    }
+
     const start = Date.now();
     await manager.close();
     assert.equal(Date.now() - start < 1_000, true);
+    if (helperPid !== null) {
+      await waitForProcessExit(helperPid);
+      assert.equal(processExists(helperPid), false);
+    }
     ok('SIGTERM-resistant app-server children do not hang gateway shutdown');
   } finally {
+    if (previousHelperPidFile === undefined) {
+      delete process.env.CODEX_HELPER_PID_FILE;
+    } else {
+      process.env.CODEX_HELPER_PID_FILE = previousHelperPidFile;
+    }
+    if (helperPid !== null && processExists(helperPid)) {
+      try {
+        process.kill(helperPid, 'SIGKILL');
+      } catch {
+        // Best-effort cleanup for a failed regression test.
+      }
+    }
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });

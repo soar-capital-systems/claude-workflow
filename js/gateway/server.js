@@ -256,6 +256,7 @@ function openAiCompatibleTranslationOptions(req, route, toolReasoningCache) {
   }
 
   return {
+    preserveAssistantThinking: true,
     reasoningContentForToolCall(toolCallId) {
       if (!toolCallId) {
         return '';

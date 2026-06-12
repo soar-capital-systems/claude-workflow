@@ -4081,6 +4081,12 @@ await runTest(
         'DeepSeek Main Route'
       );
       assert.equal(
+        deepSeekMainHealth.models.data.find(function isNormalizedFableModel(model) {
+          return model.id === 'claude-fable-5';
+        })?.display_name,
+        'DeepSeek Main Route'
+      );
+      assert.equal(
         collisionHealth.models.data.find(function isRawSubagentModel(model) {
           return model.id === 'claude-sonnet-4-7';
         })?.display_name,
@@ -5394,6 +5400,93 @@ await runTest('gateway omits DeepSeek reasoning effort when thinking is disabled
     await closeServer(deepSeekServer);
   }
 });
+
+await runTest(
+  'gateway translates replayed assistant thinking blocks for DeepSeek routes',
+  async function testDeepSeekAssistantThinkingReplay() {
+    const deepSeekPort = await freePort();
+    let capturedBody = null;
+
+    const deepSeekServer = http.createServer(async function handleDeepSeek(req, res) {
+      capturedBody = await readJsonBody(req);
+      res.writeHead(200, jsonHeaders());
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-deepseek-thinking-replay',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'Continued.',
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 30,
+            completion_tokens: 3,
+          },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      deepSeekServer.once('error', reject);
+      deepSeekServer.listen(deepSeekPort, '127.0.0.1', resolve);
+    });
+
+    const gatewayPort = await freePort();
+    const runtime = createGatewayServer(deepSeekFableGatewayConfig(gatewayPort, deepSeekPort));
+
+    await waitForListening(runtime.server);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          model: 'claude-fable-5[1m]',
+          max_tokens: 256,
+          messages: [
+            { role: 'user', content: 'Earlier question.' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'Need a concise answer.',
+                  signature: 'opaque-signature',
+                },
+                {
+                  type: 'redacted_thinking',
+                  data: 'opaque-redacted-thinking',
+                },
+                {
+                  type: 'text',
+                  text: 'Earlier answer.',
+                },
+              ],
+            },
+            { role: 'user', content: 'Continue.' },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200);
+      const payload = await response.json();
+
+      const assistantMessage = capturedBody.messages.find(function findAssistant(message) {
+        return message.role === 'assistant';
+      });
+      assert.equal(assistantMessage.content, 'Earlier answer.');
+      assert.equal(assistantMessage.reasoning_content, 'Need a concise answer.');
+      assert.equal(payload.content[0].text, 'Continued.');
+      ok('Claude replayed assistant thinking blocks no longer break DeepSeek-routed turns');
+    } finally {
+      await runtime.close();
+      await closeServer(deepSeekServer);
+    }
+  }
+);
 
 await runTest(
   'gateway preserves DeepSeek reasoning content across JSON tool-result turns',

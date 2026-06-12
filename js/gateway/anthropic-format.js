@@ -168,9 +168,22 @@ function toolCallReasoningContent(toolCalls, options) {
   return '';
 }
 
+function thinkingBlockText(block) {
+  if (typeof block?.thinking === 'string' && block.thinking !== '') {
+    return block.thinking;
+  }
+
+  if (typeof block?.text === 'string' && block.text !== '') {
+    return block.text;
+  }
+
+  return '';
+}
+
 function translateAssistantMessage(message, options = {}) {
   const blocks = normalizedBlocks(message.content);
   const textParts = [];
+  const reasoningParts = [];
   const toolCalls = [];
 
   for (const block of blocks) {
@@ -191,6 +204,18 @@ function translateAssistantMessage(message, options = {}) {
       continue;
     }
 
+    if (block?.type === 'thinking') {
+      const text = thinkingBlockText(block);
+      if (options.preserveAssistantThinking && text) {
+        reasoningParts.push(text);
+      }
+      continue;
+    }
+
+    if (block?.type === 'redacted_thinking') {
+      continue;
+    }
+
     throw new GatewayError(
       400,
       'invalid_request_error',
@@ -198,7 +223,14 @@ function translateAssistantMessage(message, options = {}) {
     );
   }
 
-  const reasoningContent = toolCallReasoningContent(toolCalls, options);
+  const reasoningContent =
+    reasoningParts.length > 0
+      ? joinTextParts(reasoningParts)
+      : toolCallReasoningContent(toolCalls, options);
+  if (textParts.length === 0 && toolCalls.length === 0 && !reasoningContent) {
+    return [];
+  }
+
   return [
     {
       role: 'assistant',

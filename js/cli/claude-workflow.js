@@ -89,6 +89,12 @@ function defaultAnthropicPassthroughPattern(mainModelId) {
   return `${mainModelId}*`;
 }
 
+function routeModelAliases(modelId) {
+  const normalized = typeof modelId === 'string' ? modelId.trim() : '';
+  const strippedBracketQualifiers = normalized.replace(/\[[^\]]+\]/gu, '');
+  return dedupeStrings([normalized, strippedBracketQualifiers]);
+}
+
 function shouldPrintStack() {
   return envFlag('CLAUDE_WORKFLOW_DEBUG', envFlag('ULTRATHINK_WORKFLOWS_DEBUG', false));
 }
@@ -405,10 +411,15 @@ function buildGatewayConfig() {
         )
       )
     : rawSubagentModelId;
+  const mainRouteMap = Object.fromEntries(
+    routeModelAliases(mainModelId).map(function mapMainRoute(modelId) {
+      return [modelId, defaultMainRoute];
+    })
+  );
   const routeMap = {
     [rawSubagentModelId]: defaultSubagentRoute,
     [subagentModelId]: subagentRoute,
-    [mainModelId]: defaultMainRoute,
+    ...mainRouteMap,
     ...baseRouteMap,
   };
   // Keep only the frontier main model family on Anthropic. Every other Claude id
@@ -437,7 +448,7 @@ function buildGatewayConfig() {
           : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
       },
       exposedModels: dedupeStrings([
-        mainModelId,
+        ...routeModelAliases(mainModelId),
         rawSubagentModelId,
         subagentModelId,
         ...(baseConfig.exposedModels || []),

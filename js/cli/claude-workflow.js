@@ -26,12 +26,23 @@ const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
 const CODEX_LOGIN_FAILURE_PATTERN =
   /not\s+logged\s+in|logged\s+out|not\s+authenticated|not\s+signed\s+in/u;
 const CODEX_LOGIN_SUCCESS_PATTERN = /logged in|authenticated|signed in/u;
+const CLAUDE_OPTIONAL_VALUE_FLAGS = new Set(['--resume', '-r', '--from-pr']);
+const CLAUDE_REQUIRED_VALUE_FLAGS = new Set(['--session-id']);
+const CLAUDE_SESSION_FLAGS = new Set([
+  '--continue',
+  '-c',
+  '--fork-session',
+  ...CLAUDE_OPTIONAL_VALUE_FLAGS,
+  ...CLAUDE_REQUIRED_VALUE_FLAGS,
+]);
 
 function usage() {
   return [
     'Usage:',
     '  claude-workflow',
     '  claude-workflow "Use a workflow to delegate a tiny subagent task."',
+    '  claude-workflow --resume <session-id>',
+    '  claude-workflow --continue',
     '',
     'Behavior:',
     '  - no arguments: starts normal interactive Claude Code on the configured main/frontier model through a local gateway',
@@ -40,6 +51,7 @@ function usage() {
     '  - routed subagent responses also report Codex/GPT metadata in Claude Code UI by default',
     '  - other non-frontier Claude model ids also route to Codex by default',
     '  - with prompt text: runs a one-shot "claude -p" prompt through the same gateway',
+    '  - --resume, -r, --continue, -c, --fork-session, --from-pr, and --session-id pass through to interactive Claude',
     '  - interactive and one-shot launches default to --dangerously-skip-permissions auto mode',
     '  - --yolo and --dangerously-skip-permissions keep auto mode explicit',
     '  - --no-yolo or CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false restores permission prompts',
@@ -229,6 +241,7 @@ function describeGatewayListenError(error, config) {
 }
 
 function parseCliArgs(rawArgs) {
+  const claudeArgs = [];
   const promptArgs = [];
   let skipPermissions = envFlag(
     'CLAUDE_WORKFLOW_SKIP_PERMISSIONS',
@@ -236,7 +249,8 @@ function parseCliArgs(rawArgs) {
   );
   let passthrough = false;
 
-  for (const arg of rawArgs) {
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const arg = rawArgs[index];
     if (passthrough) {
       promptArgs.push(arg);
       continue;
@@ -257,10 +271,29 @@ function parseCliArgs(rawArgs) {
       continue;
     }
 
+    const equalsIndex = arg.indexOf('=');
+    const flagName = equalsIndex > 0 ? arg.slice(0, equalsIndex) : arg;
+    if (CLAUDE_SESSION_FLAGS.has(flagName)) {
+      claudeArgs.push(arg);
+      if (
+        equalsIndex < 0 &&
+        (CLAUDE_REQUIRED_VALUE_FLAGS.has(flagName) ||
+          (CLAUDE_OPTIONAL_VALUE_FLAGS.has(flagName) && !rawArgs[index + 1]?.startsWith('-')))
+      ) {
+        const value = rawArgs[index + 1];
+        if (typeof value === 'string') {
+          claudeArgs.push(value);
+          index += 1;
+        }
+      }
+      continue;
+    }
+
     promptArgs.push(arg);
   }
 
   return {
+    claudeArgs,
     promptArgs,
     skipPermissions,
   };
@@ -410,20 +443,20 @@ function buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId) {
   return claudeEnv;
 }
 
-function buildClaudeArgs(mainModelId, promptArgs, skipPermissions) {
-  if (promptArgs.length === 0) {
-    const claudeArgs = ['--model', mainModelId];
+function buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions) {
+  if (claudeArgs.length > 0 || promptArgs.length === 0) {
+    const nextArgs = ['--model', mainModelId, ...claudeArgs, ...promptArgs];
     if (skipPermissions) {
-      claudeArgs.unshift('--dangerously-skip-permissions');
+      nextArgs.unshift('--dangerously-skip-permissions');
     }
-    return claudeArgs;
+    return nextArgs;
   }
 
-  const claudeArgs = ['-p', '--model', mainModelId, promptArgs.join(' ')];
+  const nextArgs = ['-p', '--model', mainModelId, promptArgs.join(' ')];
   if (skipPermissions) {
-    claudeArgs.splice(1, 0, '--dangerously-skip-permissions');
+    nextArgs.splice(1, 0, '--dangerously-skip-permissions');
   }
-  return claudeArgs;
+  return nextArgs;
 }
 
 function assertPreflight(config, mainRoute) {
@@ -502,7 +535,7 @@ async function closeGateway(runtime) {
 
 async function main() {
   const rawArgs = process.argv.slice(2);
-  const { promptArgs, skipPermissions } = parseCliArgs(rawArgs);
+  const { claudeArgs, promptArgs, skipPermissions } = parseCliArgs(rawArgs);
 
   if (isHelpRequest(rawArgs)) {
     process.stdout.write(`${usage()}\n`);
@@ -553,7 +586,7 @@ async function main() {
     }
 
     const exitCode = await runClaude(
-      buildClaudeArgs(mainModelId, promptArgs, skipPermissions),
+      buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions),
       buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId),
       function onChild(child) {
         claudeChild = child;

@@ -40,6 +40,13 @@ One-shot prompt mode:
 claude-workflow "Use a workflow to delegate a tiny subagent task, then summarize what happened."
 ```
 
+Resume an existing Claude Code conversation through a fresh local gateway:
+
+```bash
+claude-workflow --resume d3512e5e-c859-4109-aad1-f517c268d1e5
+claude-workflow --continue
+```
+
 Do not export `ANTHROPIC_BASE_URL` yourself when using the launcher. It starts the local gateway first, chooses a port, then sets `ANTHROPIC_BASE_URL` only for the child Claude process.
 
 ## Behavior
@@ -51,6 +58,7 @@ Do not export `ANTHROPIC_BASE_URL` yourself when using the launcher. It starts t
 - Shows routed model metadata by default, such as `codex-gpt-5.5-medium-via-claude-sonnet-4-7`.
 - Runs Codex app-server sessions with `workspace-write` and `approvalPolicy=never` unless overridden.
 - Launches Claude Code with `--dangerously-skip-permissions` by default.
+- Passes Claude Code session flags such as `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, `--from-pr`, and `--session-id` through to interactive Claude.
 
 Safe multi-folder behavior is the default. Leave `ULTRATHINK_GATEWAY_PORT` unset, or set it to `0`, so each `claude-workflow` process gets its own localhost port. If you force a fixed port such as `4318`, only one process can use it at a time.
 

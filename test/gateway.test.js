@@ -4133,6 +4133,24 @@ await runTest(
         ['--', 'Explain', '--help'],
         'claude-passthrough-help-args.json'
       );
+      const resumeSessionId = 'd3512e5e-c859-4109-aad1-f517c268d1e5';
+      const resumeArgs = await runWithArgs(
+        ['--resume', resumeSessionId],
+        'claude-resume-args.json'
+      );
+      const resumeWithPromptArgs = await runWithArgs(
+        ['-r', resumeSessionId, 'Continue with exactly CLI_OK.'],
+        'claude-resume-prompt-args.json'
+      );
+      const continueForkArgs = await runWithArgs(
+        ['--continue', '--fork-session'],
+        'claude-continue-fork-args.json'
+      );
+      const fromPrArgs = await runWithArgs(['--from-pr=42'], 'claude-from-pr-args.json');
+      const explicitSessionArgs = await runWithArgs(
+        ['--session-id', resumeSessionId],
+        'claude-session-id-args.json'
+      );
 
       assert.equal(interactiveArgs.includes('--dangerously-skip-permissions'), true);
       assert.equal(interactiveArgs.includes('-p'), false);
@@ -4150,9 +4168,29 @@ await runTest(
       assert.equal(optedOutArgs.at(-1), 'Reply with exactly CLI_OK.');
       assert.equal(envOptedOutArgs.includes('--dangerously-skip-permissions'), false);
       assert.equal(envOptedOutArgs.at(-1), 'Reply with exactly CLI_OK.');
+      for (const args of [
+        resumeArgs,
+        resumeWithPromptArgs,
+        continueForkArgs,
+        fromPrArgs,
+        explicitSessionArgs,
+      ]) {
+        assert.equal(args.includes('-p'), false);
+        assert.equal(args.includes('--model'), true);
+        assert.equal(args.includes('--dangerously-skip-permissions'), true);
+      }
+      assert.equal(resumeArgs.includes('--resume'), true);
+      assert.equal(resumeArgs.includes(resumeSessionId), true);
+      assert.equal(resumeWithPromptArgs.includes('-r'), true);
+      assert.equal(resumeWithPromptArgs.at(-1), 'Continue with exactly CLI_OK.');
+      assert.equal(continueForkArgs.includes('--continue'), true);
+      assert.equal(continueForkArgs.includes('--fork-session'), true);
+      assert.equal(fromPrArgs.includes('--from-pr=42'), true);
+      assert.equal(explicitSessionArgs.includes('--session-id'), true);
+      assert.equal(explicitSessionArgs.includes(resumeSessionId), true);
 
       ok(
-        'claude-workflow defaults to auto mode while preserving explicit yolo aliases and opt-out'
+        'claude-workflow defaults to auto mode while preserving explicit yolo aliases, opt-out, and Claude session flags'
       );
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });

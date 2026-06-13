@@ -95,6 +95,15 @@ function routeModelAliases(modelId) {
   return dedupeStrings([normalized, strippedBracketQualifiers]);
 }
 
+function routeModelPatterns(modelId) {
+  const aliases = routeModelAliases(modelId);
+  if (aliases.some(function isFableModel(alias) { return alias.startsWith('claude-fable-5'); })) {
+    return dedupeStrings([...aliases, DEFAULT_FABLE_PASSTHROUGH_PATTERN]);
+  }
+
+  return aliases;
+}
+
 function shouldPrintStack() {
   return envFlag('CLAUDE_WORKFLOW_DEBUG', envFlag('ULTRATHINK_WORKFLOWS_DEBUG', false));
 }
@@ -412,7 +421,7 @@ function buildGatewayConfig() {
       )
     : rawSubagentModelId;
   const mainRouteMap = Object.fromEntries(
-    routeModelAliases(mainModelId).map(function mapMainRoute(modelId) {
+    routeModelPatterns(mainModelId).map(function mapMainRoute(modelId) {
       return [modelId, defaultMainRoute];
     })
   );

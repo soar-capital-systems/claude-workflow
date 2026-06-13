@@ -230,11 +230,12 @@ function translateAssistantMessage(message, options = {}) {
   if (textParts.length === 0 && toolCalls.length === 0 && !reasoningContent) {
     return [];
   }
+  const content = textParts.length > 0 ? joinTextParts(textParts) : '';
 
   return [
     {
       role: 'assistant',
-      content: textParts.length > 0 ? joinTextParts(textParts) : null,
+      content: toolCalls.length > 0 && content === '' ? null : content,
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
       ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
     },

@@ -4020,6 +4020,7 @@ await runTest(
         ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: 'deepseek-key',
         ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: 'deepseek-v4-pro',
         ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'max',
+        ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-fable-5-20260601',
       });
       const collisionHealth = await runWithDisplayEnv('main-subagent-collision-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-sonnet-4-7',
@@ -4083,6 +4084,12 @@ await runTest(
       assert.equal(
         deepSeekMainHealth.models.data.find(function isNormalizedFableModel(model) {
           return model.id === 'claude-fable-5';
+        })?.display_name,
+        'DeepSeek Main Route'
+      );
+      assert.equal(
+        deepSeekMainHealth.models.data.find(function isDatedFableModel(model) {
+          return model.id === 'claude-fable-5-20260601';
         })?.display_name,
         'DeepSeek Main Route'
       );
@@ -5454,6 +5461,17 @@ await runTest(
               content: [
                 {
                   type: 'thinking',
+                  thinking: 'Invisible planning.',
+                  signature: 'opaque-thinking-only-signature',
+                },
+              ],
+            },
+            { role: 'user', content: 'Keep going.' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'thinking',
                   thinking: 'Need a concise answer.',
                   signature: 'opaque-signature',
                 },
@@ -5474,11 +5492,13 @@ await runTest(
       assert.equal(response.status, 200);
       const payload = await response.json();
 
-      const assistantMessage = capturedBody.messages.find(function findAssistant(message) {
+      const assistantMessages = capturedBody.messages.filter(function findAssistant(message) {
         return message.role === 'assistant';
       });
-      assert.equal(assistantMessage.content, 'Earlier answer.');
-      assert.equal(assistantMessage.reasoning_content, 'Need a concise answer.');
+      assert.equal(assistantMessages[0].content, '');
+      assert.equal(assistantMessages[0].reasoning_content, 'Invisible planning.');
+      assert.equal(assistantMessages[1].content, 'Earlier answer.');
+      assert.equal(assistantMessages[1].reasoning_content, 'Need a concise answer.');
       assert.equal(payload.content[0].text, 'Continued.');
       ok('Claude replayed assistant thinking blocks no longer break DeepSeek-routed turns');
     } finally {

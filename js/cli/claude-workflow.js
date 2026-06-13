@@ -9,6 +9,7 @@ import { envFlag, isGatewayLoopbackHost, loadGatewayConfig } from '../gateway/co
 import {
   ROUTE_ENTRY_REASONING_KEYS,
   ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
+  modelIdWithoutBracketQualifiers,
   resolveModelRoute,
   routeEntryValue,
 } from '../gateway/model-routing.js';
@@ -91,7 +92,7 @@ function defaultAnthropicPassthroughPattern(mainModelId) {
 
 function routeModelAliases(modelId) {
   const normalized = typeof modelId === 'string' ? modelId.trim() : '';
-  const strippedBracketQualifiers = normalized.replace(/\[[^\]]+\]/gu, '');
+  const strippedBracketQualifiers = modelIdWithoutBracketQualifiers(normalized);
   return dedupeStrings([normalized, strippedBracketQualifiers]);
 }
 
@@ -171,7 +172,7 @@ function normalizedRouteProvider(value, fallback = 'anthropic') {
 function mainRouteDefaultModel(provider, mainModelId, baseConfig) {
   switch (provider) {
     case 'anthropic':
-      return mainModelId;
+      return modelIdWithoutBracketQualifiers(mainModelId);
     case 'codex':
       return baseConfig.codex.model;
     case 'deepseek':

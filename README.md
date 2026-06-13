@@ -92,6 +92,15 @@ ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=medium
 ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY=high
 ```
 
+Client-visible `[1m]` suffixes are aliases only. Anthropic passthrough sends the plain API model id upstream, for example `claude-opus-4-8[1m]` -> `claude-opus-4-8`. For Opus 4.8 1M passthrough:
+
+```bash
+ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-opus-4-8[1m]
+ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-opus-4-8*
+# Optional explicit upstream override:
+# ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=claude-opus-4-8
+```
+
 Codex route:
 
 ```bash
@@ -121,6 +130,7 @@ ULTRATHINK_THINKING_LEVEL=HIGH
 ```
 
 DeepSeek thinking-mode routes omit `tool_choice` because the live API rejects that field while thinking is enabled. Tools are still advertised, and DeepSeek can choose tool calls normally.
+DeepSeek V4 uses a 1M context window by default, so `[1m]` Claude aliases can map directly to `deepseek-v4-pro` or `deepseek-v4-flash`.
 DeepSeek thinking is enabled by default and sends `reasoning_effort=max`.
 Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
 

@@ -899,6 +899,24 @@ await runTest('gateway keeps wildcard Anthropic passthrough defaults for standal
   ok('standalone gateway default still preserves Opus wildcard passthrough');
 });
 
+await runTest('gateway strips client-only [1m] qualifiers before Anthropic passthrough', async function testAnthropicPassthroughOneMillionAlias() {
+  const opusRoute = resolveModelRoute('claude-opus-4-8[1m]', gatewayConfig());
+  const fableRoute = resolveModelRoute(
+    'claude-fable-5[1m]',
+    gatewayConfig({
+      anthropicPassthroughModels: ['claude-fable-5*'],
+    })
+  );
+
+  assert.equal(opusRoute.provider, 'anthropic');
+  assert.equal(opusRoute.requestedModel, 'claude-opus-4-8[1m]');
+  assert.equal(opusRoute.upstreamModel, 'claude-opus-4-8');
+  assert.equal(fableRoute.provider, 'anthropic');
+  assert.equal(fableRoute.requestedModel, 'claude-fable-5[1m]');
+  assert.equal(fableRoute.upstreamModel, 'claude-fable-5');
+  ok('client-visible [1m] aliases use the plain Anthropic API model id upstream');
+});
+
 await runTest('gateway wildcard route-map entries override passthrough patterns', async function testWildcardRouteMapEntry() {
   const route = resolveModelRoute(
     'claude-fable-5[1m]',
@@ -3944,6 +3962,101 @@ await runTest(
 );
 
 await runTest(
+  'claude-workflow sends plain Anthropic API model ids for [1m] main aliases',
+  async function testWorkflowCliOneMillionAnthropicMainRoute() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-opus-1m-'));
+    const claudePath = path.join(tempDir, 'claude');
+    const codexPath = path.join(tempDir, 'codex-wrapper');
+    const responsePath = path.join(tempDir, 'claude-response.json');
+    const anthropicPort = await freePort();
+    const seenBodies = [];
+
+    const anthropicServer = http.createServer(async function handleAnthropic(req, res) {
+      if (req.method !== 'POST' || req.url !== '/v1/messages') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      const body = await readJsonBody(req);
+      seenBodies.push(body);
+      res.writeHead(200, jsonHeaders());
+      res.end(
+        JSON.stringify({
+          id: 'msg_opus_1m',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content: [{ type: 'text', text: 'OPUS_1M_OK' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 10, output_tokens: 3 },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      anthropicServer.once('error', reject);
+      anthropicServer.listen(anthropicPort, '127.0.0.1', resolve);
+    });
+
+    try {
+      await makeExecutable(
+        claudePath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          'async function main() {\n' +
+          '  const response = await fetch(`${process.env.ANTHROPIC_BASE_URL}/v1/messages`, {\n' +
+          "    method: 'POST',\n" +
+          "    headers: { 'content-type': 'application/json' },\n" +
+          '    body: JSON.stringify({\n' +
+          "      model: 'claude-opus-4-8[1m]',\n" +
+          "      messages: [{ role: 'user', content: 'Use the 1m alias.' }],\n" +
+          '    }),\n' +
+          '  });\n' +
+          '  const payload = await response.json();\n' +
+          "  fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_RESPONSE_PATH, JSON.stringify(payload), 'utf8');\n" +
+          '  if (!response.ok) process.exit(1);\n' +
+          '}\n' +
+          'main().catch(function onError(error) {\n' +
+          '  console.error(error.stack || error.message);\n' +
+          '  process.exit(1);\n' +
+          '});\n'
+      );
+      await makeCodexLoginStatusCommand(codexPath);
+
+      const result = await runProcess(
+        'node',
+        ['js/cli/claude-workflow.js', 'Trigger fake Claude request.'],
+        {
+          ...process.env,
+          ...CLEAN_WORKFLOW_ENV,
+          PATH: `${tempDir}:${process.env.PATH || ''}`,
+          ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
+          ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-4-8[1m]',
+          ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'anthropic',
+          ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-opus-4-8*',
+          ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'anthropic-key',
+          ULTRATHINK_GATEWAY_ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropicPort}`,
+          ULTRATHINK_TEST_CLAUDE_RESPONSE_PATH: responsePath,
+          ANTHROPIC_AUTH_TOKEN: '',
+          ANTHROPIC_API_KEY: '',
+        }
+      );
+
+      assert.equal(result.code, 0);
+      const payload = JSON.parse(await fs.readFile(responsePath, 'utf8'));
+      assert.equal(seenBodies.length, 1);
+      assert.equal(seenBodies[0].model, 'claude-opus-4-8');
+      assert.equal(payload.model, 'claude-opus-4-8');
+      ok('claude-workflow preserves the [1m] client alias while sending the plain Anthropic API id upstream');
+    } finally {
+      await closeServer(anthropicServer);
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
   'claude-workflow enables routed model display metadata by default',
   async function testWorkflowCliDisplayRoutedModelDefault() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-display-model-'));
@@ -6276,20 +6389,21 @@ await runTest(
 await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic', async function testAnthropicPassthrough() {
   const anthropicPort = await freePort();
   const seen = {
-    messages: null,
-    countTokens: null,
+    messages: [],
+    countTokens: [],
   };
 
   const anthropicServer = http.createServer(async function handleAnthropic(req, res) {
     if (req.method === 'POST' && req.url === '/v1/messages') {
-      seen.messages = await readJsonBody(req);
+      const body = await readJsonBody(req);
+      seen.messages.push(body);
       res.writeHead(200, jsonHeaders());
       res.end(
         JSON.stringify({
           id: 'msg_passthrough',
           type: 'message',
           role: 'assistant',
-          model: 'claude-opus-4-8',
+          model: body.model,
           content: [{ type: 'text', text: 'Direct from Anthropic.' }],
           stop_reason: 'end_turn',
           usage: { input_tokens: 10, output_tokens: 4 },
@@ -6299,7 +6413,7 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
     }
 
     if (req.method === 'POST' && req.url === '/v1/messages/count_tokens') {
-      seen.countTokens = await readJsonBody(req);
+      seen.countTokens.push(await readJsonBody(req));
       res.writeHead(200, jsonHeaders());
       res.end(JSON.stringify({ input_tokens: 77 }));
       return;
@@ -6317,7 +6431,7 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
   const gatewayPort = await freePort();
   const runtime = createGatewayServer(gatewayConfig({
     port: gatewayPort,
-    exposedModels: ['claude-opus-4-8'],
+    exposedModels: ['claude-opus-4-8', 'claude-opus-4-8[1m]'],
     openai: {
       apiKey: 'openai-key',
     },
@@ -6330,35 +6444,48 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
   await waitForListening(runtime.server);
 
   try {
-    const messageResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
-      method: 'POST',
-      headers: jsonHeaders(),
-      body: JSON.stringify({
-        model: 'claude-opus-4-8',
-        messages: [{ role: 'user', content: 'Stay on Anthropic.' }],
-      }),
-    });
-    assert.equal(messageResponse.status, 200);
-    const messagePayload = await messageResponse.json();
-    assert.equal(messagePayload.model, 'claude-opus-4-8');
-    assert.equal(seen.messages.model, 'claude-opus-4-8');
-
-    const tokenResponse = await fetch(
-      `http://127.0.0.1:${gatewayPort}/v1/messages/count_tokens`,
-      {
+    for (const modelId of ['claude-opus-4-8', 'claude-opus-4-8[1m]']) {
+      const messageResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
         method: 'POST',
         headers: jsonHeaders(),
         body: JSON.stringify({
-          model: 'claude-opus-4-8',
-          messages: [{ role: 'user', content: 'Count me.' }],
+          model: modelId,
+          messages: [{ role: 'user', content: 'Stay on Anthropic.' }],
         }),
-      }
+      });
+      assert.equal(messageResponse.status, 200);
+      const messagePayload = await messageResponse.json();
+      assert.equal(messagePayload.model, 'claude-opus-4-8');
+
+      const tokenResponse = await fetch(
+        `http://127.0.0.1:${gatewayPort}/v1/messages/count_tokens`,
+        {
+          method: 'POST',
+          headers: jsonHeaders(),
+          body: JSON.stringify({
+            model: modelId,
+            messages: [{ role: 'user', content: 'Count me.' }],
+          }),
+        }
+      );
+      assert.equal(tokenResponse.status, 200);
+      const tokenPayload = await tokenResponse.json();
+      assert.deepEqual(tokenPayload, { input_tokens: 77 });
+    }
+
+    assert.deepEqual(
+      seen.messages.map(function messageModel(body) {
+        return body.model;
+      }),
+      ['claude-opus-4-8', 'claude-opus-4-8']
     );
-    assert.equal(tokenResponse.status, 200);
-    const tokenPayload = await tokenResponse.json();
-    assert.deepEqual(tokenPayload, { input_tokens: 77 });
-    assert.equal(seen.countTokens.model, 'claude-opus-4-8');
-    ok('Opus 4.8 passthrough works for messages and count_tokens');
+    assert.deepEqual(
+      seen.countTokens.map(function tokenCountModel(body) {
+        return body.model;
+      }),
+      ['claude-opus-4-8', 'claude-opus-4-8']
+    );
+    ok('Opus 4.8 passthrough works for base and [1m] aliases in messages and count_tokens');
   } finally {
     await runtime.close();
     await closeServer(anthropicServer);

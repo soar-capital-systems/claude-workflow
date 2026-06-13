@@ -86,6 +86,14 @@ export function routeEntryValue(entry, keys, ...fallbacks) {
   return routeValue(...values, ...fallbacks);
 }
 
+export function modelIdWithoutBracketQualifiers(modelId) {
+  if (typeof modelId !== 'string') {
+    return '';
+  }
+
+  return modelId.trim().replace(/\[[^\]]+\]/gu, '');
+}
+
 function formatAllowedValues(values) {
   return values.map(function quoteValue(value) {
     return `"${value}"`;
@@ -154,7 +162,11 @@ function routeMapEntry(modelId, config) {
 }
 
 function buildAnthropicRoute(modelId, config, entry = null) {
-  const upstreamModel = routeEntryValue(entry, ROUTE_ENTRY_UPSTREAM_MODEL_KEYS, modelId);
+  const upstreamModel = routeEntryValue(
+    entry,
+    ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
+    modelIdWithoutBracketQualifiers(modelId)
+  );
 
   return {
     provider: ROUTE_PROVIDERS.ANTHROPIC,

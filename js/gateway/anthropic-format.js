@@ -189,8 +189,9 @@ function assistantReasoningContent(reasoningParts, toolCalls, options) {
 }
 
 function assistantMessageContent(textParts, toolCalls) {
-  if (textParts.length > 0) {
-    return joinTextParts(textParts);
+  const text = joinTextParts(textParts);
+  if (text !== '') {
+    return text;
   }
 
   if (toolCalls.length > 0) {

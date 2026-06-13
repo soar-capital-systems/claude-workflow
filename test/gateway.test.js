@@ -8,6 +8,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
+import { translateAnthropicMessagesRequestWithOptions } from '../js/gateway/anthropic-format.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 import { buildCodexDynamicToolRegistry, CodexSessionManager } from '../js/gateway/codex-provider.js';
 import { GatewayError, resolveModelRoute } from '../js/gateway/model-routing.js';
@@ -820,6 +821,23 @@ await runTest('gateway config reads an independent DeepSeek route profile', asyn
       assert.equal(config.deepseek.reasoningEffort, 'high');
       assert.equal(config.deepseek.thinking.type, 'disabled');
       ok('DeepSeek gateway routing has its own credentials, endpoint, model, and thinking profile');
+    }
+  );
+});
+
+await runTest('gateway defaults DeepSeek routes to enabled max reasoning', async function testDeepSeekGatewayDefaults() {
+  await withTemporaryEnv(
+    {
+      ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: '',
+      ULTRATHINK_DEEPSEEK_REASONING_EFFORT: '',
+      ULTRATHINK_THINKING_LEVEL: '',
+    },
+    async function assertDeepSeekGatewayDefaults() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.deepseek.reasoningEffort, 'max');
+      assert.equal(config.deepseek.thinking.type, 'enabled');
+      ok('DeepSeek gateway routes default to enabled max reasoning');
     }
   );
 });
@@ -4684,6 +4702,40 @@ await runTest(
     }
   }
 );
+
+await runTest('gateway translates empty-text assistant tool calls as tool-call-only messages', function testEmptyAssistantToolCallContent() {
+  const translated = translateAnthropicMessagesRequestWithOptions(
+    {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '' },
+            {
+              type: 'tool_use',
+              id: 'call_empty_text',
+              name: 'lookup_weather',
+              input: { city: 'San Francisco' },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      provider: 'deepseek',
+      upstreamModel: 'deepseek-v4-pro',
+      reasoningEffort: 'max',
+      thinking: { type: 'enabled' },
+    }
+  );
+
+  const assistantMessage = translated.messages[0];
+  assert.equal(assistantMessage.content, null);
+  assert.equal(assistantMessage.tool_calls[0].id, 'call_empty_text');
+  assert.equal(assistantMessage.tool_calls[0].function.name, 'lookup_weather');
+  assert.equal(assistantMessage.tool_calls[0].function.arguments, '{"city":"San Francisco"}');
+  ok('empty assistant text blocks do not turn tool-call-only replays into empty-string content');
+});
 
 await runTest('gateway translates Anthropic image blocks and disables parallel tool calls for OpenAI', async function testOpenAiImageAndToolParallelTranslation() {
   const openAiPort = await freePort();

@@ -116,10 +116,12 @@ ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]
 ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY=your_deepseek_api_key
 ULTRATHINK_GATEWAY_DEEPSEEK_MODEL=deepseek-v4-pro
 ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT=max
-# Optional: ULTRATHINK_THINKING_LEVEL=OFF
+ULTRATHINK_THINKING_LEVEL=HIGH
+# Optional opt-out: ULTRATHINK_THINKING_LEVEL=OFF
 ```
 
 DeepSeek thinking-mode routes omit `tool_choice` because the live API rejects that field while thinking is enabled. Tools are still advertised, and DeepSeek can choose tool calls normally.
+DeepSeek thinking is enabled by default and sends `reasoning_effort=max`.
 Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
 
 Standalone route-map entries can also use exact keys or wildcard keys. Exact keys win before wildcard keys:

@@ -95,9 +95,13 @@ function routeModelAliases(modelId) {
   return dedupeStrings([normalized, strippedBracketQualifiers]);
 }
 
+function isFableModelAlias(modelId) {
+  return modelId.startsWith('claude-fable-5');
+}
+
 function routeModelPatterns(modelId) {
   const aliases = routeModelAliases(modelId);
-  if (aliases.some(function isFableModel(alias) { return alias.startsWith('claude-fable-5'); })) {
+  if (aliases.some(isFableModelAlias)) {
     return dedupeStrings([...aliases, DEFAULT_FABLE_PASSTHROUGH_PATTERN]);
   }
 

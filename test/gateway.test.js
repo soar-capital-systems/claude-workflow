@@ -3964,6 +3964,12 @@ await runTest(
       return JSON.parse(await fs.readFile(healthPath, 'utf8'));
     }
 
+    function modelDisplayName(payload, modelId) {
+      return payload.models.data.find(function hasModelId(model) {
+        return model.id === modelId;
+      })?.display_name;
+    }
+
     try {
       await makeExecutable(
         claudePath,
@@ -4048,9 +4054,7 @@ await runTest(
       );
       assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.5');
       assert.match(
-        defaultHealth.models.data.find(function isOlderOpus(model) {
-          return model.id === 'claude-opus-4-8';
-        })?.display_name || '',
+        modelDisplayName(defaultHealth, 'claude-opus-4-8') || '',
         /Codex gpt-5\.5/u
       );
       assert.equal(optedOutHealth.health.display_routed_model, false);
@@ -4076,27 +4080,19 @@ await runTest(
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
       assert.equal(
-        deepSeekMainHealth.models.data.find(function isFableModel(model) {
-          return model.id === 'claude-fable-5[1m]';
-        })?.display_name,
+        modelDisplayName(deepSeekMainHealth, 'claude-fable-5[1m]'),
         'DeepSeek Main Route'
       );
       assert.equal(
-        deepSeekMainHealth.models.data.find(function isNormalizedFableModel(model) {
-          return model.id === 'claude-fable-5';
-        })?.display_name,
+        modelDisplayName(deepSeekMainHealth, 'claude-fable-5'),
         'DeepSeek Main Route'
       );
       assert.equal(
-        deepSeekMainHealth.models.data.find(function isDatedFableModel(model) {
-          return model.id === 'claude-fable-5-20260601';
-        })?.display_name,
+        modelDisplayName(deepSeekMainHealth, 'claude-fable-5-20260601'),
         'DeepSeek Main Route'
       );
       assert.equal(
-        collisionHealth.models.data.find(function isRawSubagentModel(model) {
-          return model.id === 'claude-sonnet-4-7';
-        })?.display_name,
+        modelDisplayName(collisionHealth, 'claude-sonnet-4-7'),
         'Claude Workflow Frontier Route'
       );
       assert.notEqual(invalidRoute.result.code, 0);

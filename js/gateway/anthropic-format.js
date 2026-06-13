@@ -180,6 +180,26 @@ function thinkingBlockText(block) {
   return '';
 }
 
+function assistantReasoningContent(reasoningParts, toolCalls, options) {
+  if (reasoningParts.length > 0) {
+    return joinTextParts(reasoningParts);
+  }
+
+  return toolCallReasoningContent(toolCalls, options);
+}
+
+function assistantMessageContent(textParts, toolCalls) {
+  if (textParts.length > 0) {
+    return joinTextParts(textParts);
+  }
+
+  if (toolCalls.length > 0) {
+    return null;
+  }
+
+  return '';
+}
+
 function translateAssistantMessage(message, options = {}) {
   const blocks = normalizedBlocks(message.content);
   const textParts = [];
@@ -223,19 +243,16 @@ function translateAssistantMessage(message, options = {}) {
     );
   }
 
-  const reasoningContent =
-    reasoningParts.length > 0
-      ? joinTextParts(reasoningParts)
-      : toolCallReasoningContent(toolCalls, options);
+  const reasoningContent = assistantReasoningContent(reasoningParts, toolCalls, options);
   if (textParts.length === 0 && toolCalls.length === 0 && !reasoningContent) {
     return [];
   }
-  const content = textParts.length > 0 ? joinTextParts(textParts) : '';
+  const content = assistantMessageContent(textParts, toolCalls);
 
   return [
     {
       role: 'assistant',
-      content: toolCalls.length > 0 && content === '' ? null : content,
+      content,
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
       ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
     },

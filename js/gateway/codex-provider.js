@@ -782,6 +782,20 @@ function buildForkSessionKey(baseKey, fingerprint) {
   return `${baseKey}:fork:${fingerprint}`;
 }
 
+function requestHeader(req, name) {
+  return String(req.get(name) || '').trim();
+}
+
+function isClaudeWorkflowAgentRequest(req) {
+  const agentId = requestHeader(req, 'x-claude-code-agent-id');
+  const parentAgentId = requestHeader(req, 'x-claude-code-parent-agent-id');
+  return Boolean(agentId || parentAgentId);
+}
+
+function codexThreadSourceForRequest(req) {
+  return isClaudeWorkflowAgentRequest(req) ? 'subagent' : 'user';
+}
+
 function traceLog(tracer, event, details = {}) {
   tracer?.log?.(event, details);
 }
@@ -1155,6 +1169,8 @@ class CodexGatewaySession {
     this.systemPrompt = renderSystemPrompt(requestBody);
     this.connection = new CodexAppServerConnection(config);
     this.bootstrapMode = options.bootstrapMode || '';
+    this.threadSource = codexThreadSourceForRequest(req);
+    this.ephemeralThread = this.threadSource === 'subagent';
     this.threadId = null;
     this.pendingToolCall = null;
     this.activeBoundary = null;
@@ -1166,6 +1182,8 @@ class CodexGatewaySession {
 
     traceLog(this.tracer, 'codex.session.created', {
       tool_count: this.effectiveTools.length,
+      thread_source: this.threadSource,
+      ephemeral_thread: this.ephemeralThread,
     });
   }
 
@@ -1284,6 +1302,8 @@ class CodexGatewaySession {
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
       serviceName: 'claude_workflow_gateway',
+      threadSource: this.threadSource,
+      ...(this.ephemeralThread ? { ephemeral: true } : {}),
     });
 
     this.threadId = result.thread?.id || null;
@@ -1293,6 +1313,8 @@ class CodexGatewaySession {
 
     traceLog(this.tracer, 'codex.thread.started', {
       thread_id: this.threadId,
+      thread_source: this.threadSource,
+      ephemeral_thread: this.ephemeralThread,
     });
   }
 

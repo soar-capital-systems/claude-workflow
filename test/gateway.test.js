@@ -2099,6 +2099,104 @@ await runTest('Codex session identity keys cannot collide through raw header sep
 });
 
 await runTest(
+  'Codex app-server marks Claude workflow agent threads as ephemeral subagents',
+  async function testCodexWorkflowAgentThreadStartMetadata() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-thread-source-'));
+    const codexPath = path.join(tempDir, 'codex-thread-source');
+    const recordsPath = path.join(tempDir, 'records.jsonl');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const recordsPath = process.env.ULTRATHINK_TEST_CODEX_THREAD_RECORDS;\n' +
+          'let threadCount = 0;\n' +
+          'let turnCount = 0;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          "  fs.appendFileSync(recordsPath, `${JSON.stringify({ method: message.method, params: message.params })}\\n`, 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          '    record(message);\n' +
+          '    threadCount += 1;\n' +
+          "    send({ id: message.id, result: { thread: { id: `thread-${threadCount}` } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    record(message);\n' +
+          '    turnCount += 1;\n' +
+          '    const turnId = `turn-${turnCount}`;\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          "    setTimeout(function completeTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } }); }, 5);\n" +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousRecordsPath = process.env.ULTRATHINK_TEST_CODEX_THREAD_RECORDS;
+      process.env.ULTRATHINK_TEST_CODEX_THREAD_RECORDS = recordsPath;
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          closeKillTimeoutMs: 50,
+        },
+      });
+      try {
+        await manager.processRequest(gatewayRequest(), codexUserRequest('Root chat'), codexRoute());
+        await manager.processRequest(
+          claudeSessionRequest('session-agent', {
+            'x-claude-code-agent-id': 'agent-1',
+            'x-claude-code-parent-agent-id': 'parent-1',
+          }),
+          codexUserRequest('Agent chat'),
+          codexRoute()
+        );
+      } finally {
+        await manager.close();
+        if (previousRecordsPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_THREAD_RECORDS;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_THREAD_RECORDS = previousRecordsPath;
+        }
+      }
+
+      const recordsText = await fs.readFile(recordsPath, 'utf8');
+      const records = recordsText
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(function parseRecord(line) {
+          return JSON.parse(line);
+        });
+      const threadStarts = records.filter(function isThreadStart(record) {
+        return record.method === 'thread/start';
+      });
+
+      assert.equal(threadStarts.length, 2);
+      assert.equal(threadStarts[0].params.threadSource, 'user');
+      assert.equal(threadStarts[0].params.ephemeral, undefined);
+      assert.equal(threadStarts[1].params.threadSource, 'subagent');
+      assert.equal(threadStarts[1].params.ephemeral, true);
+      ok('Claude workflow agent Codex threads are pathless/non-resumable app-server threads');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
   'Codex app-server parallel tool calls reject later calls without clobbering the pending call',
   async function testCodexParallelToolCallsDoNotClobberPendingCall() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-parallel-tool-'));

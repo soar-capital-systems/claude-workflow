@@ -259,11 +259,13 @@ function isExecutableCommand(commandName) {
 }
 
 function codexLoginReady(commandName) {
+  const isWin = process.platform === 'win32';
   const result = spawnSync(commandName, ['login', 'status'], {
     cwd: process.cwd(),
     env: process.env,
     encoding: 'utf8',
     timeout: CODEX_LOGIN_STATUS_TIMEOUT_MS,
+    shell: isWin,
   });
   const output = `${result.stdout || ''}${result.stderr || ''}`.toLowerCase();
 
@@ -584,6 +586,7 @@ function signalExitCode(signal) {
 
 function runClaude(args, extraEnv, onChild = null) {
   return new Promise(function run(resolve, reject) {
+    const isWin = process.platform === 'win32';
     const child = spawn('claude', args, {
       cwd: process.cwd(),
       env: {
@@ -591,6 +594,7 @@ function runClaude(args, extraEnv, onChild = null) {
         ...extraEnv,
       },
       stdio: 'inherit',
+      shell: isWin,
     });
 
     onChild?.(child);

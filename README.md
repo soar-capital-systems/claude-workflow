@@ -62,7 +62,24 @@ Do not export `ANTHROPIC_BASE_URL` yourself when using the launcher. It starts t
 
 Safe multi-folder behavior is the default. Leave `ULTRATHINK_GATEWAY_PORT` unset, or set it to `0`, so each `claude-workflow` process gets its own localhost port. If you force a fixed port such as `4318`, only one process can use it at a time.
 
-To keep long-running workflows from overflowing Codex's context window, the gateway bounds each single Codex input with `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` (default `256000`, set `0` to disable). Fresh canonical sessions still seed Codex with recent transcript context, but temporary fork sessions start from the current request instead of replaying the whole accumulated Claude history. If Codex still reports a context-window exhaustion before any stream output is forwarded, the gateway evicts the exhausted Codex thread and retries once on a clean thread with the current request.
+## Shared Gateway Daemon
+
+Sessions started outside the launcher, such as plain `claude`, `claude --resume`, or background workflow runs, have no private per-session gateway. If they request routed model ids directly from Anthropic, those ids can 404. The shared daemon runs the same workflow routing on a fixed local port and publishes shell exports for normal Claude Code sessions:
+
+```bash
+npm run daemon
+npm run daemon:status
+npm run daemon:stop
+npm run daemon:log
+
+# Install the shell hook. It writes to ~/.zshrc for zsh users and ~/.bashrc
+# otherwise; remove that block to disable.
+bash scripts/claude-workflow-daemon.sh install-shell
+```
+
+The daemon uses `ULTRATHINK_GATEWAY_DAEMON_PORT` (default `4318`), deliberately separate from the launcher's `ULTRATHINK_GATEWAY_PORT`. The `claude-workflow` launcher still overrides the daemon exports with its own private gateway.
+
+To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000` before a live window is learned; the standalone raw gateway default is `256000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of the window. If Codex still reports context exhaustion before stream output is forwarded, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
 
 Permission flags:
 
@@ -110,7 +127,7 @@ ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT=low
 ULTRATHINK_GATEWAY_CODEX_VERBOSITY=low
 ULTRATHINK_GATEWAY_CODEX_SANDBOX=workspace-write
 ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY=never
-ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=256000
+ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=180000
 ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS=30000
 ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
 ```
@@ -149,15 +166,15 @@ Corporate proxy environments are supported for gateway upstream HTTP requests th
 
 See [.env.example](.env.example) for the full option set.
 
-## Standalone Gateway
+## Standalone Raw Gateway
 
-The package also exposes the gateway for targeted debugging:
+The package also exposes the raw Anthropic-compatible gateway for targeted debugging:
 
 ```bash
 npm run start:gateway
-# or, after npm link:
-claude-workflow-gateway
 ```
+
+After `npm link`, `claude-workflow-gateway` starts the shared workflow daemon rather than this raw gateway.
 
 Endpoints:
 

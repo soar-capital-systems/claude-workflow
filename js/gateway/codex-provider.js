@@ -6,7 +6,14 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_INPUT_MAX_TOKENS = 256_000;
+// Cold-start bound only: once the Codex app-server reports the model's real
+// context window (thread/tokenUsage/updated), budgets adapt to it. Codex
+// gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
+// thread overhead, so keep the pre-learning default safely below that.
+const DEFAULT_INPUT_MAX_TOKENS = 192_000;
+// Fraction of the reported context window usable as input budget; the rest
+// is headroom for the model's reasoning and output.
+const CODEX_WINDOW_INPUT_FRACTION = 0.8;
 const DEFAULT_MAX_SESSIONS = 16;
 const SUPPORTS_PROCESS_GROUP_SIGNALS = process.platform !== 'win32';
 const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
@@ -16,11 +23,27 @@ const NON_RESERVING_SELECTION_REASONS = new Set([
   'boundary_replay',
   'routing_reservation_replay',
 ]);
+// Selection reasons under which a between-turns session may be recycled for
+// context pressure; replay-style selections must keep their session intact.
+const RECYCLE_ELIGIBLE_SELECTION_REASONS = new Set(['canonical', 'matching_tool_result']);
 const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
   /remote app server .*transport failed/iu,
   /WebSocket protocol error: Connection reset without closing handshake/iu,
 ];
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+// Recycle a live Codex session before its real context (as reported by the
+// app-server) can overflow the model window: long tool loops accumulate
+// history turn by turn, so per-payload budgets alone cannot bound the sum.
+// The threshold is a fraction of the model window itself; bootstrap replays
+// are capped strictly below it (see bootstrapInputMaxTokens) so a freshly
+// recycled session can never immediately re-trigger recycling.
+const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
+const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
+// Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
+// Undershooting chars-per-token overflows the upstream window (fatal);
+// overshooting only truncates earlier, so estimate conservatively everywhere
+// budgets and recycle projections are computed.
+const ESTIMATE_CHARS_PER_TOKEN = 3;
 const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
   /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
@@ -313,6 +336,50 @@ function usageNumber(usage, key) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function contextTokensFromUsage(usage) {
+  if (!usage) {
+    return 0;
+  }
+
+  // Prefer the app-server's own total for the turn; fall back to summing the
+  // components (input + cached input is the full context the model was fed,
+  // output approximates the thread context after the turn).
+  const total = usageNumber(usage, 'total_tokens');
+  if (total > 0) {
+    return total;
+  }
+
+  return (
+    usageNumber(usage, 'input_tokens') +
+    usageNumber(usage, 'cache_read_input_tokens') +
+    usageNumber(usage, 'output_tokens')
+  );
+}
+
+function estimateIncomingRequestTokens(requestBody) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  const latest = messages.at(-1);
+  if (!latest) {
+    return 0;
+  }
+
+  try {
+    return estimateTokensFromJson(latest.content ?? '');
+  } catch {
+    return 0;
+  }
+}
+
+function codexRecycleContextLimit(config, contextWindow) {
+  const window = Number(contextWindow || 0);
+  const base = window > 0 ? window : codexInputMaxTokens(config);
+  if (!Number.isFinite(base)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.floor(base * CODEX_SESSION_RECYCLE_FRACTION);
+}
+
 function usageDelta(current, baseline) {
   // Codex app-server totals are expected to be monotonic; clamp anyway so compaction
   // or replay quirks cannot surface negative Anthropic usage.
@@ -377,11 +444,11 @@ function addUsage(left, right) {
 }
 
 function estimateTokensFromJson(value) {
-  return Math.max(1, Math.ceil(JSON.stringify(value).length / 4));
+  return estimateTokensFromText(JSON.stringify(value));
 }
 
 function estimateTokensFromText(text) {
-  return Math.max(1, Math.ceil(String(text || '').length / 4));
+  return Math.max(1, Math.ceil(String(text || '').length / ESTIMATE_CHARS_PER_TOKEN));
 }
 
 function maxCharsForTokenBudget(maxTokens) {
@@ -389,7 +456,7 @@ function maxCharsForTokenBudget(maxTokens) {
     return Number.POSITIVE_INFINITY;
   }
 
-  return Math.max(1, Math.floor(maxTokens * 4));
+  return Math.max(1, Math.floor(maxTokens * ESTIMATE_CHARS_PER_TOKEN));
 }
 
 function limitTextByTokenBudget(text, maxTokens) {
@@ -417,6 +484,17 @@ function codexInputMaxTokens(config) {
   }
 
   return Math.max(1, Math.trunc(maxTokens));
+}
+
+function effectiveCodexInputMaxTokens(config, contextWindow) {
+  const configured = codexInputMaxTokens(config);
+  const window = Number(contextWindow || 0);
+  if (window <= 0) {
+    return configured;
+  }
+
+  const fromWindow = Math.max(1, Math.floor(window * CODEX_WINDOW_INPUT_FRACTION));
+  return Math.min(configured, fromWindow);
 }
 
 function populateEstimatedUsage(boundary, requestBody, outcome) {
@@ -881,8 +959,8 @@ class CodexAppServerConnection extends EventEmitter {
 
     const initializeResult = await this.rawRequest('initialize', {
       clientInfo: {
-        name: 'claude_workflow_gateway',
-        title: 'Claude Workflow Gateway',
+        name: 'ultrathink_gateway',
+        title: 'UltraThink Gateway',
         version: '1.0.0',
       },
       capabilities: {
@@ -1169,6 +1247,9 @@ class CodexGatewaySession {
     this.systemPrompt = renderSystemPrompt(requestBody);
     this.connection = new CodexAppServerConnection(config);
     this.bootstrapMode = options.bootstrapMode || '';
+    // Shared per-upstream-model context windows learned from app-server usage
+    // events, provided by the owning session manager.
+    this.contextWindows = options.contextWindows || null;
     this.threadSource = codexThreadSourceForRequest(req);
     this.ephemeralThread = this.threadSource === 'subagent';
     this.threadId = null;
@@ -1230,8 +1311,31 @@ class CodexGatewaySession {
     return this.sessionKey !== this.baseSessionKey;
   }
 
+  knownModelContextWindow() {
+    const own = Number(this.modelContextWindow || 0);
+    if (own > 0) {
+      return own;
+    }
+
+    const shared = Number(this.contextWindows?.get(this.route.upstreamModel) || 0);
+    return shared > 0 ? shared : 0;
+  }
+
   inputMaxTokens() {
-    return codexInputMaxTokens(this.config);
+    return effectiveCodexInputMaxTokens(this.config, this.knownModelContextWindow());
+  }
+
+  bootstrapInputMaxTokens() {
+    const budget = this.inputMaxTokens();
+    const recycleLimit = codexRecycleContextLimit(this.config, this.knownModelContextWindow());
+    if (!Number.isFinite(recycleLimit)) {
+      return budget;
+    }
+
+    // Keep bootstrap transcript replays strictly below the recycle threshold
+    // so a freshly recycled session cannot land above it and thrash into
+    // recycling again on its next turn.
+    return Math.min(budget, Math.max(1, Math.floor(recycleLimit * CODEX_BOOTSTRAP_RECYCLE_HEADROOM)));
   }
 
   initialInputMode() {
@@ -1247,7 +1351,7 @@ class CodexGatewaySession {
   }
 
   initialTurnInput(requestBody) {
-    const maxTokens = this.inputMaxTokens();
+    const maxTokens = this.bootstrapInputMaxTokens();
     if (this.initialInputMode() === 'latest') {
       return renderLatestUserTranscriptInput(requestBody, maxTokens);
     }
@@ -1301,7 +1405,7 @@ class CodexGatewaySession {
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
-      serviceName: 'claude_workflow_gateway',
+      serviceName: 'ultrathink_gateway',
       threadSource: this.threadSource,
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
     });
@@ -1613,6 +1717,18 @@ class CodexGatewaySession {
           boundary.usage = tokenUsage.last || emptyUsage();
           this.latestTotalUsage = addUsage(boundary.usageBaseline, boundary.usage);
         }
+        if (tokenUsage.model_context_window) {
+          this.modelContextWindow = tokenUsage.model_context_window;
+          this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
+        }
+        // Prefer the per-turn snapshot (tracks shrinkage after app-server
+        // compaction); fall back to the cumulative total, which overestimates
+        // live context — the safe direction for recycle pressure.
+        this.latestContextTokens =
+          contextTokensFromUsage(tokenUsage.last) ||
+          contextTokensFromUsage(tokenUsage.total) ||
+          this.latestContextTokens ||
+          0;
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,
           usage: boundary.usage,
@@ -1794,6 +1910,7 @@ export class CodexSessionManager {
     this.config = config;
     this.sessions = new Map();
     this.tracer = options.tracer || null;
+    this.learnedContextWindows = new Map();
     this.createSession =
       typeof options.createSession === 'function'
         ? options.createSession
@@ -1808,7 +1925,10 @@ export class CodexSessionManager {
                 requested_model: route.requestedModel,
                 upstream_model: route.upstreamModel,
               }) || null,
-              sessionOptions
+              {
+                contextWindows: this.learnedContextWindows,
+                ...sessionOptions,
+              }
             );
   }
 
@@ -1961,6 +2081,27 @@ export class CodexSessionManager {
       request_fingerprint: selection.requestFingerprint,
     });
 
+    const pressure = session
+      ? this.contextPressureDecision(session, selection.selectionReason, requestBody)
+      : null;
+    if (pressure) {
+      traceLog(requestTracer || this.tracer, 'codex.session.recycled', {
+        session_key: selection.sessionKey,
+        selection_reason: selection.selectionReason,
+        context_tokens: pressure.contextTokens,
+        incoming_tokens: pressure.incomingTokens,
+        recycle_limit: pressure.limit,
+        model_context_window: session.knownModelContextWindow?.() || null,
+      });
+      this.sessions.delete(selection.sessionKey);
+      void session.close(new Error('recycled before Codex context window overflow'));
+      session = null;
+      // The replacement must replay the bounded transcript even under a fork
+      // session key, whose default bootstrap mode ('latest') would silently
+      // drop all prior context.
+      options = { ...options, bootstrapMode: 'transcript' };
+    }
+
     if (!session) {
       session = this.createSession(
         route,
@@ -2031,26 +2172,82 @@ export class CodexSessionManager {
   }
 
   async runRecoverableSessionRequest(options) {
+    // Shared across retry attempts (spread copies keep the same reference) so
+    // overflow diagnostics always describe the most recently prepared session.
+    options.attemptState = options.attemptState || {};
+    let lastError = null;
     try {
       return await this.runPreparedSessionRequest(options);
     } catch (error) {
       if (!this.canRecoverFromContextOverflow(error, options)) {
         this.traceContextRecoverySkipped(error, options);
-        throw error;
+        throw this.describeContextOverflowError(error, options);
       }
-
-      traceLog(options.requestTracer || this.tracer, 'codex.session.context_recovery_retry', {
-        error_message: error?.message || String(error),
-      });
-
-      return this.runPreparedSessionRequest({
-        ...options,
-        sessionOptions: {
-          ...(options.sessionOptions || {}),
-          bootstrapMode: 'latest',
-        },
-      });
+      lastError = error;
     }
+
+    // Recover on a fresh thread: first with the bounded full-transcript replay
+    // (keeps context; fits the adaptive budget), then with latest-only input.
+    // When the failed attempt was itself a fresh transcript bootstrap, a
+    // transcript retry would re-send byte-identical input and deterministically
+    // fail again, so skip straight to latest-only.
+    const failedSession = options.attemptState.lastPreparedSession || null;
+    const failedFreshTranscriptBootstrap =
+      failedSession &&
+      Number(failedSession.latestContextTokens || 0) === 0 &&
+      failedSession.initialInputMode?.() === 'transcript';
+    const recoveryModes = failedFreshTranscriptBootstrap
+      ? ['latest']
+      : ['transcript', 'latest'];
+
+    for (const bootstrapMode of recoveryModes) {
+      traceLog(options.requestTracer || this.tracer, 'codex.session.context_recovery_retry', {
+        bootstrap_mode: bootstrapMode,
+        error_message: lastError?.message || String(lastError),
+      });
+
+      try {
+        return await this.runPreparedSessionRequest({
+          ...options,
+          sessionOptions: {
+            ...(options.sessionOptions || {}),
+            bootstrapMode,
+          },
+        });
+      } catch (error) {
+        if (!this.canRecoverFromContextOverflow(error, options)) {
+          this.traceContextRecoverySkipped(error, options);
+          throw this.describeContextOverflowError(error, options);
+        }
+        lastError = error;
+      }
+    }
+
+    throw this.describeContextOverflowError(lastError, options);
+  }
+
+  describeContextOverflowError(error, options) {
+    if (!isCodexContextWindowError(error)) {
+      return error;
+    }
+
+    const session = options.attemptState?.lastPreparedSession || null;
+    const contextTokens = Number(session?.latestContextTokens || 0);
+    const window = Number(session?.knownModelContextWindow?.() || 0);
+    const budget = session ? session.inputMaxTokens() : codexInputMaxTokens(this.config);
+    const details = [
+      contextTokens > 0 ? `session context ~${contextTokens} tokens` : null,
+      window > 0 ? `model window ${window} tokens` : null,
+      Number.isFinite(budget) ? `gateway input budget ${budget} tokens` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+
+    return new GatewayError(
+      400,
+      'invalid_request_error',
+      `Codex context window exceeded${details ? ` (${details})` : ''}: ${error?.message || String(error)}`
+    );
   }
 
   traceContextRecoverySkipped(error, options) {
@@ -2070,6 +2267,42 @@ export class CodexSessionManager {
         gateway_error_type: error.type,
       });
     }
+  }
+
+  recycleContextTokenLimit(session) {
+    return codexRecycleContextLimit(this.config, session?.knownModelContextWindow?.() || 0);
+  }
+
+  contextPressureDecision(session, selectionReason, requestBody = null) {
+    // Only recycle when the session is between turns: a fresh replacement is
+    // bootstrapped from the bounded transcript replay, the same path used
+    // when an idle-expired session receives a follow-up tool result.
+    if (!RECYCLE_ELIGIBLE_SELECTION_REASONS.has(selectionReason)) {
+      return null;
+    }
+
+    if (session.routingReservation) {
+      return null;
+    }
+
+    if (session.activeBoundary && !session.activeBoundary.finished) {
+      return null;
+    }
+
+    const contextTokens = Number(session.latestContextTokens || 0);
+    if (contextTokens <= 0) {
+      return null;
+    }
+
+    // Project the incoming payload on top of the live context so a single
+    // oversized tool result cannot leap past the window in one turn.
+    const limit = this.recycleContextTokenLimit(session);
+    const incomingTokens = estimateIncomingRequestTokens(requestBody);
+    if (contextTokens + incomingTokens < limit) {
+      return null;
+    }
+
+    return { contextTokens, incomingTokens, limit };
   }
 
   canRecoverFromContextOverflow(error, options) {
@@ -2097,6 +2330,10 @@ export class CodexSessionManager {
       requestTracer,
       sessionOptions
     );
+    if (!options.attemptState) {
+      options.attemptState = {};
+    }
+    options.attemptState.lastPreparedSession = session;
 
     return this.runSessionRequest(
       session,

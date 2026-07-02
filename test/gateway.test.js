@@ -1012,16 +1012,16 @@ await runTest('gateway config expands home-relative Codex and trace paths', asyn
   };
 
   try {
-    process.env.ULTRATHINK_GATEWAY_TRACE_DIR = '~/claude-workflow-gateway-trace';
-    process.env.ULTRATHINK_GATEWAY_CODEX_CWD = '~/claude-workflow-codex-cwd';
+    process.env.ULTRATHINK_GATEWAY_TRACE_DIR = '~/ultrathink-gateway-trace';
+    process.env.ULTRATHINK_GATEWAY_CODEX_CWD = '~/ultrathink-codex-cwd';
     const config = loadGatewayConfig();
     assert.equal(
       config.traceDir,
-      path.resolve(path.join(os.homedir(), 'claude-workflow-gateway-trace'))
+      path.resolve(path.join(os.homedir(), 'ultrathink-gateway-trace'))
     );
     assert.equal(
       config.codex.cwd,
-      path.resolve(path.join(os.homedir(), 'claude-workflow-codex-cwd'))
+      path.resolve(path.join(os.homedir(), 'ultrathink-codex-cwd'))
     );
     ok('gateway config expands home-relative trace and Codex cwd paths');
   } finally {
@@ -2101,7 +2101,7 @@ await runTest('Codex session identity keys cannot collide through raw header sep
 await runTest(
   'Codex app-server marks Claude workflow agent threads as ephemeral subagents',
   async function testCodexWorkflowAgentThreadStartMetadata() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-thread-source-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-thread-source-'));
     const codexPath = path.join(tempDir, 'codex-thread-source');
     const recordsPath = path.join(tempDir, 'records.jsonl');
 
@@ -2199,7 +2199,7 @@ await runTest(
 await runTest(
   'Codex app-server parallel tool calls reject later calls without clobbering the pending call',
   async function testCodexParallelToolCallsDoNotClobberPendingCall() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-parallel-tool-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-parallel-tool-'));
     const codexPath = path.join(tempDir, 'codex-parallel-tool');
     const responsesPath = path.join(tempDir, 'tool-responses.json');
 
@@ -2363,7 +2363,7 @@ await runTest(
 await runTest(
   'Codex app-server usage reports per-boundary input cache and reasoning deltas',
   async function testCodexUsageDeltas() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-usage-delta-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-delta-'));
     const codexPath = path.join(tempDir, 'codex-usage-delta');
 
     try {
@@ -2452,7 +2452,7 @@ await runTest(
 await runTest(
   'Codex app-server last-only usage snapshots do not double count session totals',
   async function testCodexLastUsageSnapshotsDoNotDoubleCountTotals() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-last-usage-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-last-usage-'));
     const codexPath = path.join(tempDir, 'codex-last-usage');
 
     try {
@@ -2533,7 +2533,7 @@ await runTest(
 );
 
 await runTest('Codex app-server invalid JSON rejects startup without crashing the gateway', async function testCodexInvalidJsonRejectsStartup() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-invalid-json-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-invalid-json-'));
   const codexPath = path.join(tempDir, 'codex-invalid-json');
 
   try {
@@ -2573,7 +2573,7 @@ await runTest('Codex app-server invalid JSON rejects startup without crashing th
 });
 
 await runTest('Codex app-server control socket resets fail and evict the session immediately', async function testCodexControlSocketResetEvictsSession() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-control-reset-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-control-reset-'));
   const codexPath = path.join(tempDir, 'codex-control-reset');
 
   try {
@@ -2627,7 +2627,7 @@ await runTest('Codex app-server control socket resets fail and evict the session
 });
 
 await runTest('Codex app-server signal exits reject pending startup requests', async function testCodexSignalExitRejectsStartup() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-signal-exit-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-signal-exit-'));
   const codexPath = path.join(tempDir, 'codex-signal-exit');
 
   try {
@@ -2666,7 +2666,7 @@ await runTest('Codex app-server signal exits reject pending startup requests', a
 });
 
 await runTest('Codex app-server clean exits reject pending requests instead of timing out', async function testCodexCleanExitRejectsPendingRequest() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-clean-exit-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-clean-exit-'));
   const codexPath = path.join(tempDir, 'codex-clean-exit');
 
   try {
@@ -2721,7 +2721,7 @@ await runTest('Codex app-server clean exits reject pending requests instead of t
 });
 
 await runTest('Codex app-server clean exits reject active turns after turn/start resolves', async function testCodexCleanExitRejectsActiveTurn() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-clean-midturn-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-clean-midturn-'));
   const codexPath = path.join(tempDir, 'codex-clean-midturn');
 
   try {
@@ -2777,7 +2777,7 @@ await runTest('Codex app-server clean exits reject active turns after turn/start
 });
 
 await runTest('Codex app-server close force-kills SIGTERM-resistant children', async function testCodexCloseForceKillsStubbornChild() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-stubborn-close-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-stubborn-close-'));
   const codexPath = path.join(tempDir, 'codex-stubborn-close');
   const helperPidFile =
     process.platform === 'win32' ? null : path.join(tempDir, 'codex-helper.pid');
@@ -3032,7 +3032,7 @@ await runTest('Codex tool_result routing survives missing follow-up tool_choice'
 });
 
 await runTest('fresh Codex sessions seed the app-server turn with the supplied transcript', async function testCodexFreshSessionIncludesTranscript() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-transcript-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-transcript-'));
   const codexPath = path.join(tempDir, 'codex-transcript');
   const turnParamsPath = path.join(tempDir, 'turn-params.json');
 
@@ -3107,11 +3107,222 @@ await runTest('fresh Codex sessions seed the app-server turn with the supplied t
   }
 });
 
+await runTest('Codex sessions recycle before the reported context can overflow the window', async function testCodexSessionContextPressureRecycle() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-recycle-'));
+  const codexPath = path.join(tempDir, 'codex-recycle');
+  const turnLogPath = path.join(tempDir, 'turn-log.json');
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        'let threadCount = 0;\n' +
+        'let turnCount = 0;\n' +
+        'function appendTurn(entry) {\n' +
+        '  const logPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+        '  let turns = [];\n' +
+        '  try { turns = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch {}\n' +
+        '  turns.push(entry);\n' +
+        '  fs.writeFileSync(logPath, JSON.stringify(turns), "utf8");\n' +
+        '}\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        '    threadCount += 1;\n' +
+        '    send({ id: message.id, result: { thread: { id: `thread-${threadCount}` } } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    turnCount += 1;\n' +
+        '    const turnId = `turn-${turnCount}`;\n' +
+        '    appendTurn({ pid: process.pid, input: message.params.input[0].text });\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        '    setTimeout(function reportUsage() {\n' +
+        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 90, outputTokens: 10 }, modelContextWindow: 120 } } });\n" +
+        "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+        '    }, 10);\n' +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          inputMaxTokens: 100,
+        },
+      });
+
+      // First turn reports 100 context tokens against a 100-token budget and a
+      // 120-token window, exceeding the 75% recycle threshold.
+      await manager.processRequest(
+        gatewayRequest(),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      await manager.processRequest(
+        gatewayRequest(),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+            { role: 'user', content: 'again' },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+      assert.equal(turns.length, 2);
+      assert.notEqual(turns[0].pid, turns[1].pid);
+      assert.equal(turns[1].input.includes('again'), true);
+      assert.equal(turns[1].input.includes('hi'), true);
+      await manager.close();
+      ok('context-pressured Codex sessions are replaced by a fresh transcript-replay thread');
+    } finally {
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('Codex learned context windows bound budgets for later sessions', async function testCodexLearnedWindowBudgets() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-learned-window-'));
+  const codexPath = path.join(tempDir, 'codex-learned-window');
+  const turnLogPath = path.join(tempDir, 'turn-log.json');
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        'let turnCount = 0;\n' +
+        'function appendTurn(entry) {\n' +
+        '  const logPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+        '  let turns = [];\n' +
+        '  try { turns = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch {}\n' +
+        '  turns.push(entry);\n' +
+        '  fs.writeFileSync(logPath, JSON.stringify(turns), "utf8");\n' +
+        '}\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    turnCount += 1;\n' +
+        '    const turnId = `turn-${turnCount}`;\n' +
+        '    appendTurn({ input: message.params.input[0].text });\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        '    setTimeout(function reportUsage() {\n' +
+        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 }, modelContextWindow: 40 } } });\n" +
+        "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+        '    }, 10);\n' +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          inputMaxTokens: 10_000,
+        },
+      });
+
+      // First session teaches the manager the model's 40-token window.
+      await manager.processRequest(
+        claudeSessionRequest('learned-window-a'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      // A brand-new session must render its bootstrap transcript inside the
+      // learned window (40 tokens * 0.8 = 32 tokens = 96 chars), truncating
+      // the long history while keeping the newest message.
+      await manager.processRequest(
+        claudeSessionRequest('learned-window-b'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Ancient history. '.repeat(30) },
+            { role: 'assistant', content: [{ type: 'text', text: 'Long prior answer. '.repeat(30) }] },
+            { role: 'user', content: 'KEEP' },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      );
+
+      const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+      assert.equal(turns.length, 2);
+      assert.equal(turns[1].input.length <= 32 * 3, true);
+      assert.equal(turns[1].input.includes('KEEP'), true);
+      assert.equal(turns[1].input.includes('Ancient history'), false);
+      await manager.close();
+      ok('later sessions inherit the learned context window and bound their bootstrap render');
+    } finally {
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 await runTest('Codex transcript budget includes omission notices and separators', async function testCodexTranscriptBudgetIncludesNotices() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-budget-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-budget-'));
   const codexPath = path.join(tempDir, 'codex-budget');
   const turnParamsPath = path.join(tempDir, 'turn-params.json');
-  const inputMaxTokens = 24;
+  // Small enough to force truncation of the old messages, but large enough
+  // (at the conservative 3 chars/token budget) to fit the omission notice
+  // plus the newest request.
+  const inputMaxTokens = 60;
 
   try {
     await makeExecutable(
@@ -3168,7 +3379,7 @@ await runTest('Codex transcript budget includes omission notices and separators'
 
       const turnParams = JSON.parse(await fs.readFile(turnParamsPath, 'utf8'));
       const inputText = turnParams.input[0].text;
-      assert.equal(inputText.length <= inputMaxTokens * 4, true);
+      assert.equal(inputText.length <= inputMaxTokens * 3, true);
       assert.equal(inputText.includes('survive the budget.'), true);
       await manager.close();
       ok('final Codex transcript bootstrap stays inside the configured input budget');
@@ -3185,7 +3396,7 @@ await runTest('Codex transcript budget includes omission notices and separators'
 });
 
 await runTest('fresh Codex fork sessions start from the current request only', async function testCodexForkSessionSkipsOldTranscript() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-fork-input-'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-fork-input-'));
   const codexPath = path.join(tempDir, 'codex-fork-input');
   const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
 
@@ -3318,8 +3529,8 @@ await runTest('Codex context-ish 502s that miss recovery matching are traced', a
   ok('context-like Codex 502 wording drift is traceable even when recovery does not engage');
 });
 
-await runTest('Codex context-window failures retry once on a fresh latest-request thread', async function testCodexContextWindowRecovery() {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-codex-context-retry-'));
+await runTest('Codex first-turn transcript overflow recovers straight to latest-only input', async function testCodexContextWindowRecovery() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-context-retry-'));
   const codexPath = path.join(tempDir, 'codex-context-retry');
   const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
   const failureMarkerPath = path.join(tempDir, 'failed-once');
@@ -3346,8 +3557,10 @@ await runTest('Codex context-window failures retry once on a fresh latest-reques
         '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, `${JSON.stringify(message.params)}\\n`, "utf8");\n' +
         '    const turnId = `turn-${message.id}`;\n' +
         '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
-        '    if (!fs.existsSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER)) {\n' +
-        '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, "1", "utf8");\n' +
+        '    let failCount = 0;\n' +
+        '    try { failCount = Number(fs.readFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, "utf8")); } catch {}\n' +
+        '    if (failCount < 1) {\n' +
+        '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, String(failCount + 1), "utf8");\n' +
         "      setTimeout(function failTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'failed', error: { message: \"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.\" } } } }); }, 10);\n" +
         '      return;\n' +
         '    }\n' +
@@ -3397,15 +3610,251 @@ await runTest('Codex context-window failures retry once on a fresh latest-reques
           return JSON.parse(line);
         });
       assert.equal(outcome.text, 'RECOVERED');
+      // A first-turn transcript bootstrap that overflowed would fail again
+      // byte-identically on a transcript retry, so recovery must skip
+      // straight to latest-only input: exactly two turns.
       assert.equal(turnParams.length, 2);
       assert.equal(turnParams[0].input[0].text.includes('Very old context'), true);
       assert.equal(turnParams[1].input[0].text.includes('Current request after context overflow.'), true);
       assert.equal(turnParams[1].input[0].text.includes('Very old context'), false);
       await manager.close();
-      ok('context-window exhaustion is recovered by starting a clean Codex thread once');
+      ok('first-turn transcript overflow skips the doomed transcript retry and recovers latest-only');
     } finally {
       restoreEnv(previous);
     }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('Codex live-session overflow retries with transcript replay before latest-only', async function testCodexLiveSessionOverflowRecovery() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-live-retry-'));
+  const codexPath = path.join(tempDir, 'codex-live-retry');
+  const turnLogPath = path.join(tempDir, 'turn-log.jsonl');
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        'let turnCount = 0;\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        "    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n" +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    turnCount += 1;\n' +
+        '    const turnId = `turn-${turnCount}`;\n' +
+        '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_LOG, `${JSON.stringify({ pid: process.pid, turn: turnCount, input: message.params.input[0].text })}\\n`, "utf8");\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        '    if (turnCount === 2) {\n' +
+        '      // Overflow only on the live session follow-up turn.\n' +
+        "      setTimeout(function failTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'failed', error: { message: \"Codex ran out of room in the model's context window.\" } } } }); }, 10);\n" +
+        '      return;\n' +
+        '    }\n' +
+        '    setTimeout(function completeTurn() {\n' +
+        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 } } } });\n" +
+        "      send({ method: 'item/completed', params: { turnId, item: { id: `msg-${turnCount}`, type: 'agentMessage', text: 'OK' } } });\n" +
+        "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+        '    }, 10);\n' +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+    try {
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+        },
+      });
+
+      const first = await manager.processRequest(
+        claudeSessionRequest('live-retry'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Original question about the code.' }],
+          tools: [],
+        },
+        codexRoute()
+      );
+      assert.equal(first.text, 'OK');
+
+      const second = await manager.processRequest(
+        claudeSessionRequest('live-retry'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Original question about the code.' },
+            { role: 'assistant', content: [{ type: 'text', text: 'OK' }] },
+            { role: 'user', content: 'Follow-up request that overflows.' },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      );
+      assert.equal(second.text, 'OK');
+
+      const turns = (await fs.readFile(turnLogPath, 'utf8'))
+        .trim()
+        .split(/\n/u)
+        .map(function parseLine(line) {
+          return JSON.parse(line);
+        });
+      assert.equal(turns.length, 3);
+      // A live session with recorded usage recovers via transcript replay:
+      // the retry keeps the prior conversation.
+      assert.equal(turns[2].pid === turns[0].pid, false);
+      assert.equal(turns[2].input.includes('Original question about the code.'), true);
+      assert.equal(turns[2].input.includes('Follow-up request that overflows.'), true);
+      await manager.close();
+      ok('live-session overflow recovers on a transcript-replay thread with context preserved');
+    } finally {
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('claude-workflow-gateway daemon publishes env exports and serves healthz', async function testWorkflowGatewayDaemon() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-daemon-'));
+  const envFile = path.join(tempDir, 'gateway.env');
+  const daemonPath = new URL('../js/cli/claude-workflow-daemon.js', import.meta.url).pathname;
+
+  const child = spawn(process.execPath, [daemonPath], {
+    env: {
+      ...process.env,
+      ULTRATHINK_GATEWAY_DAEMON_PORT: '0',
+      CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', function onStderr(chunk) {
+    stderr += chunk.toString();
+  });
+
+  try {
+    let envText = '';
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        envText = await fs.readFile(envFile, 'utf8');
+        break;
+      } catch {
+        await new Promise(function wait(resolve) {
+          setTimeout(resolve, 250);
+        });
+      }
+    }
+    assert.notEqual(envText, '', `daemon never wrote env file; stderr: ${stderr}`);
+    const baseUrlMatch = envText.match(/^export ANTHROPIC_BASE_URL="([^"]+)"$/mu);
+    assert.notEqual(baseUrlMatch, null);
+    assert.match(envText, /^export CLAUDE_CODE_SUBAGENT_MODEL="[^"]+"$/mu);
+    assert.match(envText, /^export ANTHROPIC_DEFAULT_SONNET_MODEL="[^"]+"$/mu);
+
+    const health = await fetch(`${baseUrlMatch[1]}/healthz`);
+    assert.equal(health.ok, true);
+    ok('daemon starts on an OS-assigned port, serves healthz, and publishes shell exports');
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise(function waitExit(resolve) {
+      child.on('close', resolve);
+      setTimeout(resolve, 3_000);
+    });
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('claude-workflow daemon script starts and stops the recorded daemon pid', async function testWorkflowGatewayDaemonScriptLifecycle() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-daemon-script-'));
+  const daemonScript = path.resolve('scripts/claude-workflow-daemon.sh');
+  const envFile = path.join(tempDir, 'gateway.env');
+  const pidFile = path.join(tempDir, 'claude-workflow-gateway.pid');
+  const port = await freePort();
+  let daemonPid = 0;
+
+  const env = {
+    ...process.env,
+    ...CLEAN_WORKFLOW_ENV,
+    CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: tempDir,
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
+  };
+
+  try {
+    const start = await runProcess('bash', [daemonScript, 'start'], env);
+    assert.equal(start.code, 0, start.stderr || start.stdout);
+    await waitForFile(envFile);
+
+    daemonPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+    assert.equal(processExists(daemonPid), true);
+
+    const status = await runProcess('bash', [daemonScript, 'status'], env);
+    assert.equal(status.code, 0, status.stderr || status.stdout);
+
+    const stop = await runProcess('bash', [daemonScript, 'stop'], env);
+    assert.equal(stop.code, 0, stop.stderr || stop.stdout);
+    await waitForProcessExit(daemonPid);
+    daemonPid = 0;
+    ok('daemon script lifecycle manages the recorded pid on Linux and macOS shells');
+  } finally {
+    if (daemonPid > 0 && processExists(daemonPid)) {
+      try {
+        process.kill(daemonPid, 'SIGTERM');
+        await waitForProcessExit(daemonPid);
+      } catch {
+        try {
+          process.kill(daemonPid, 'SIGKILL');
+        } catch {
+          // Best-effort cleanup only.
+        }
+      }
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+await runTest('claude-workflow daemon script installs shell hooks for the active shell', async function testWorkflowGatewayDaemonInstallShell() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-shell-hook-'));
+  const daemonScript = path.resolve('scripts/claude-workflow-daemon.sh');
+
+  try {
+    const zshInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(zshInstall.code, 0, zshInstall.stderr || zshInstall.stdout);
+    const zshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    assert.match(zshrc, /claude-workflow-gateway\.bashrc/u);
+
+    const bashInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/bash',
+    });
+    assert.equal(bashInstall.code, 0, bashInstall.stderr || bashInstall.stdout);
+    const bashrc = await fs.readFile(path.join(tempDir, '.bashrc'), 'utf8');
+    assert.match(bashrc, /claude-workflow-gateway\.bashrc/u);
+    ok('install-shell writes the hook to zshrc for zsh users and bashrc for bash users');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -3898,7 +4347,7 @@ await runTest(
 await runTest(
   'claude-workflow requires a gateway-side Anthropic key when a shared secret protects an Anthropic main route',
   async function testWorkflowCliSharedSecretRequiresAnthropicKey() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-shared-secret-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-shared-secret-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -3937,7 +4386,7 @@ await runTest(
 await runTest(
   'claude-workflow reports missing command and Codex login preflight failures',
   async function testWorkflowCliCommandAndLoginPreflightFailures() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-preflight-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-preflight-'));
     const claudePath = path.join(tempDir, 'claude');
     const loggedInCodexPath = path.join(tempDir, 'codex-logged-in');
     const loggedOutCodexPath = path.join(tempDir, 'codex-logged-out');
@@ -4001,7 +4450,7 @@ await runTest(
 await runTest(
   'claude-workflow injects the gateway shared secret into the child Claude process',
   async function testWorkflowCliInjectsGatewaySecret() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-launch-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-launch-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const capturedEnvPath = path.join(tempDir, 'claude-env.json');
@@ -4062,7 +4511,7 @@ await runTest(
 await runTest(
   'claude-workflow sends plain Anthropic API model ids for [1m] main aliases',
   async function testWorkflowCliOneMillionAnthropicMainRoute() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-opus-1m-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-opus-1m-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const responsePath = path.join(tempDir, 'claude-response.json');
@@ -4157,7 +4606,7 @@ await runTest(
 await runTest(
   'claude-workflow enables routed model display metadata by default',
   async function testWorkflowCliDisplayRoutedModelDefault() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-display-model-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-display-model-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -4339,7 +4788,7 @@ await runTest(
 await runTest(
   'claude-workflow launches concurrent folders on distinct dynamic ports',
   async function testWorkflowCliConcurrentDynamicPorts() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-dynamic-ports-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-dynamic-ports-'));
     const projectA = path.join(tempDir, 'project-a');
     const projectB = path.join(tempDir, 'project-b');
     const claudePath = path.join(tempDir, 'claude');
@@ -4420,7 +4869,7 @@ await runTest(
 await runTest(
   'claude-workflow reports fixed gateway port collisions clearly',
   async function testWorkflowCliFixedPortCollision() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-port-collision-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-port-collision-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const gatewayPort = await freePort();
@@ -4465,7 +4914,7 @@ await runTest(
 await runTest(
   'claude-workflow rejects unauthenticated non-loopback gateway binds',
   async function testWorkflowCliRejectsUnauthenticatedExternalBind() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-nonloopback-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-nonloopback-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -4522,7 +4971,7 @@ await runTest(
 await runTest(
   'claude-workflow defaults to auto mode and keeps yolo flags out of prompts',
   async function testWorkflowCliYoloPermissionFlags() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-yolo-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-yolo-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
 
@@ -4655,7 +5104,7 @@ await runTest(
 await runTest(
   'claude-workflow forwards SIGTERM to Claude and exits conventionally',
   async function testWorkflowCliSignalHandling() {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-cli-signal-'));
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-signal-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const startedPath = path.join(tempDir, 'claude-started');

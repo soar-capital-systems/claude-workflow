@@ -286,6 +286,7 @@ function gatewayConfig(overrides = {}) {
       approvalPolicy: 'never',
       reasoningEffort: 'medium',
       verbosity: 'high',
+      toolResultMaxBytes: 10_000,
       idleTimeoutMs: 60_000,
       forkIdleTimeoutMs: 30_000,
       maxSessions: 16,
@@ -964,6 +965,17 @@ await runTest('gateway config exposes the Codex input budget', async function te
       const config = loadGatewayConfig();
       assert.equal(config.codex.inputMaxTokens, 4096);
       ok('Codex app-server input budget is configurable through the gateway config');
+    }
+  );
+});
+
+await runTest('gateway config exposes the Codex tool-result byte budget', async function testCodexToolResultBudgetConfig() {
+  await withTemporaryEnv(
+    { ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES: '2048' },
+    async function assertToolResultBudgetConfig() {
+      const config = loadGatewayConfig();
+      assert.equal(config.codex.toolResultMaxBytes, 2048);
+      ok('Codex app-server tool-result byte budget is configurable through the gateway config');
     }
   );
 });
@@ -2346,6 +2358,155 @@ await runTest(
           },
         ]);
         ok('parallel Codex tool calls reject later calls while preserving the first pending tool_result path');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server tool_result payloads are truncated before continuing dynamic tools',
+  async function testCodexToolResultsAreTruncatedBeforeContinue() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-budget-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-budget');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-large-result";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_large', method: 'item/tool/call', params: { turnId, callId: 'call_large', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_large') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+            toolResultMaxBytes: 40,
+          },
+        });
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Call the lookup tool.' }],
+          tools: [
+            {
+              name: 'lookup',
+              input_schema: {
+                type: 'object',
+                properties: {},
+              },
+            },
+          ],
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_large',
+          name: 'lookup',
+          input: {},
+        });
+
+        const rawResult = `${'A'.repeat(80)}MIDDLE_SHOULD_BE_REMOVED${'B'.repeat(80)}`;
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Call the lookup tool.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_large',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_large',
+                    content: rawResult,
+                  },
+                ],
+              },
+            ],
+            tools: initialRequest.tools,
+          },
+          codexRoute()
+        );
+        const finalResponses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = finalResponses.find(function findLargeResponse(message) {
+          return message.id === 'tool_req_large';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(continuedCall.result.success, true);
+        assert.match(continuedText, /^Warning: truncated output/u);
+        assert.match(continuedText, /chars truncated/u);
+        assert.equal(continuedText.includes('MIDDLE_SHOULD_BE_REMOVED'), false);
+        assert.equal(continuedText.includes('AAAAAAAAAAAAAAAAAAAA'), true);
+        assert.equal(continuedText.includes('BBBBBBBBBBBBBBBBBBBB'), true);
+        assert.equal(continuedText.length < rawResult.length, true);
+        ok('large Claude tool_result payloads are bounded before they enter Codex app-server history');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {

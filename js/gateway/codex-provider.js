@@ -6,6 +6,7 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
 // Cold-start bound only: once the Codex app-server reports the model's real
 // context window (thread/tokenUsage/updated), budgets adapt to it. Codex
 // gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
@@ -475,6 +476,129 @@ function limitTextByTokenBudget(text, maxTokens) {
   const headChars = Math.ceil(remainingChars / 2);
   const tailChars = Math.floor(remainingChars / 2);
   return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
+}
+
+function codexToolResultMaxBytes(config) {
+  const maxBytes = numberOrDefault(
+    config?.codex?.toolResultMaxBytes,
+    DEFAULT_TOOL_RESULT_MAX_BYTES
+  );
+  if (maxBytes <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxBytes));
+}
+
+function approxCodexOutputTokenCount(text) {
+  return Math.max(1, Math.ceil(Buffer.byteLength(String(text || ''), 'utf8') / 4));
+}
+
+function countOutputLines(text) {
+  const value = String(text || '');
+  if (!value) {
+    return 0;
+  }
+
+  const normalized = value.replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
+  const lines = normalized.split('\n');
+  if (lines.at(-1) === '') {
+    lines.pop();
+  }
+
+  return lines.length;
+}
+
+function utf8PrefixByByteBudget(text, maxBytes) {
+  if (maxBytes <= 0) {
+    return '';
+  }
+
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > maxBytes) {
+      break;
+    }
+
+    bytes += charBytes;
+    end += char.length;
+  }
+
+  return text.slice(0, end);
+}
+
+function utf8SuffixByByteBudget(text, maxBytes) {
+  if (maxBytes <= 0) {
+    return '';
+  }
+
+  let bytes = 0;
+  let start = text.length;
+  for (let index = text.length; index > 0;) {
+    let charStart = index - 1;
+    const code = text.charCodeAt(charStart);
+    if (code >= 0xdc00 && code <= 0xdfff && charStart > 0) {
+      charStart -= 1;
+    }
+
+    const char = text.slice(charStart, index);
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > maxBytes) {
+      break;
+    }
+
+    bytes += charBytes;
+    start = charStart;
+    index = charStart;
+  }
+
+  return text.slice(start);
+}
+
+function truncateMiddleByByteBudget(text, maxBytes) {
+  const value = String(text || '');
+  const originalBytes = Buffer.byteLength(value, 'utf8');
+  if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
+    return {
+      text: value,
+      truncated: false,
+      originalBytes,
+      originalTokenCount: approxCodexOutputTokenCount(value),
+      totalLines: countOutputLines(value),
+    };
+  }
+
+  const budget = Math.max(0, Math.trunc(maxBytes));
+  const leftBudget = Math.floor(budget / 2);
+  const rightBudget = budget - leftBudget;
+  const prefix = utf8PrefixByByteBudget(value, leftBudget);
+  const suffix = utf8SuffixByByteBudget(value, rightBudget);
+  const removedChars = Math.max(0, value.length - prefix.length - suffix.length);
+
+  return {
+    text: `${prefix}...${removedChars} chars truncated...${suffix}`,
+    truncated: true,
+    originalBytes,
+    originalTokenCount: approxCodexOutputTokenCount(value),
+    totalLines: countOutputLines(value),
+  };
+}
+
+function limitCodexToolResultText(text, maxBytes) {
+  const result = truncateMiddleByByteBudget(text, maxBytes);
+  if (!result.truncated) {
+    return result;
+  }
+
+  return {
+    ...result,
+    text:
+      `Warning: truncated output (original token count: ${result.originalTokenCount})\n` +
+      `Total output lines: ${result.totalLines}\n\n` +
+      result.text,
+  };
 }
 
 function codexInputMaxTokens(config) {
@@ -1453,15 +1577,20 @@ class CodexGatewaySession {
     }
 
     const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const toolResultMaxBytes = codexToolResultMaxBytes(this.config);
+    const limitedToolResult = limitCodexToolResultText(rawToolResult.text, toolResultMaxBytes);
     const toolResult = {
       ...rawToolResult,
-      text: limitTextByTokenBudget(rawToolResult.text, this.inputMaxTokens()),
+      text: limitTextByTokenBudget(limitedToolResult.text, this.inputMaxTokens()),
     };
     const tracer = this.scopedTracer(requestTracer);
     traceLog(tracer, 'codex.tool_result.continued', {
       call_id: this.pendingToolCall.callId,
       tool_name: this.pendingToolCall.tool,
+      raw_result_bytes: limitedToolResult.originalBytes,
       result_length: toolResult.text.length,
+      tool_result_truncated: limitedToolResult.truncated,
+      tool_result_max_bytes: Number.isFinite(toolResultMaxBytes) ? toolResultMaxBytes : null,
       is_error: toolResult.isError,
     });
     this.connection.send({

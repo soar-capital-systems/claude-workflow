@@ -79,7 +79,7 @@ bash scripts/claude-workflow-daemon.sh install-shell
 
 The daemon uses `ULTRATHINK_GATEWAY_DAEMON_PORT` (default `4318`), deliberately separate from the launcher's `ULTRATHINK_GATEWAY_PORT`. The `claude-workflow` launcher still overrides the daemon exports with its own private gateway.
 
-To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000` before a live window is learned; the standalone raw gateway default is `256000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of the window. If Codex still reports context exhaustion before stream output is forwarded, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
+To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000` before a live window is learned; the standalone raw gateway default is `256000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of the window. Claude tool results sent back to Codex dynamic tools are separately capped by `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES` (default `10000`, set `0` to disable), matching Codex's native tool-output truncation behavior so very large reads keep useful head/tail context without filling the thread. If Codex still reports context exhaustion before stream output is forwarded, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
 
 Permission flags:
 
@@ -128,6 +128,7 @@ ULTRATHINK_GATEWAY_CODEX_VERBOSITY=low
 ULTRATHINK_GATEWAY_CODEX_SANDBOX=workspace-write
 ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY=never
 ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=180000
+ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES=10000
 ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS=30000
 ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
 ```

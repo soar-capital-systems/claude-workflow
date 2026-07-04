@@ -186,6 +186,11 @@ export function loadGatewayConfig() {
         256_000,
         { min: 0, max: 1_000_000 }
       ),
+      toolResultMaxBytes: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES,
+        10_000,
+        { min: 0, max: 10_000_000 }
+      ),
       idleTimeoutMs: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS,
         10 * 60_000,

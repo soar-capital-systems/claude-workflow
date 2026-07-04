@@ -47,7 +47,7 @@ function usage() {
     '  - Workflow subagents default to a Codex/GPT-labeled model id mapped to a Codex route',
     '  - routed subagent responses also report Codex/GPT metadata in Claude Code UI by default',
     '  - sonnet/haiku/opus alias slots remap to the routed subagent model id, so alias-pinned agents display and use the Codex-backed id (override with ANTHROPIC_DEFAULT_SONNET_MODEL etc.)',
-    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), and live sessions recycle before the window can overflow',
+    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), tool results are byte-capped by ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES, and live sessions recycle before the window can overflow',
     '  - workflows launched or resumed outside claude-workflow need the shared gateway daemon (claude-workflow-gateway) or routed model ids will 404 at Anthropic',
     '  - other non-frontier Claude model ids also route to Codex by default',
     '  - with prompt text: runs a one-shot "claude -p" prompt through the same gateway',

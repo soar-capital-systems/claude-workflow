@@ -14,8 +14,10 @@ const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*'])
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
+const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 const DISABLED_FLAG_VALUES = new Set(['0', 'false', 'no', 'off']);
 const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]']);
+const CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES = new Set(['total', 'body_after_prefix']);
 
 const CODEX_PROFILE_ENV = Object.freeze({
   model: ['ULTRATHINK_GATEWAY_CODEX_MODEL', 'ULTRATHINK_GATEWAY_OPENAI_MODEL'],
@@ -105,6 +107,20 @@ function optionalResolvedPath(value) {
   return path.resolve(expandHomePath(configured));
 }
 
+function codexAutoCompactTokenLimitScope(value) {
+  const normalized = firstDefinedString(
+    value,
+    DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE
+  ).toLowerCase();
+  if (!CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES.has(normalized)) {
+    throw new Error(
+      'ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE must be total or body_after_prefix'
+    );
+  }
+
+  return normalized;
+}
+
 function codexProfileValue(key, fallback) {
   return firstEnvString(CODEX_PROFILE_ENV[key], fallback);
 }
@@ -190,6 +206,19 @@ export function loadGatewayConfig() {
         process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES,
         10_000,
         { min: 0, max: 10_000_000 }
+      ),
+      toolResultWindowMaxBytes: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES,
+        64_000,
+        { min: 0, max: 100_000_000 }
+      ),
+      autoCompactTokenLimit: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+        0,
+        { min: 0, max: 1_000_000 }
+      ),
+      autoCompactTokenLimitScope: codexAutoCompactTokenLimitScope(
+        process.env.ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE
       ),
       idleTimeoutMs: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS,

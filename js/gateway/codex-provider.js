@@ -7,6 +7,8 @@ import { GatewayError } from './model-routing.js';
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
+const DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES = 64_000;
+const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 // Cold-start bound only: once the Codex app-server reports the model's real
 // context window (thread/tokenUsage/updated), budgets adapt to it. Codex
 // gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
@@ -40,13 +42,16 @@ const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xh
 // recycled session can never immediately re-trigger recycling.
 const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
 const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
+const CODEX_CONTEXT_DROP_RESET_FRACTION = 0.8;
 // Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
 // Undershooting chars-per-token overflows the upstream window (fatal);
 // overshooting only truncates earlier, so estimate conservatively everywhere
 // budgets and recycle projections are computed.
 const ESTIMATE_CHARS_PER_TOKEN = 3;
+const CODEX_AUTOCOMPACT_THRASH_PATTERN =
+  /autocompact is thrashing|context refilled to the limit|within 3 turns of the previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
-  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
+  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history|autocompact is thrashing|context refilled to the limit|previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 
@@ -490,6 +495,22 @@ function codexToolResultMaxBytes(config) {
   return Math.max(1, Math.trunc(maxBytes));
 }
 
+function codexToolResultWindowMaxBytes(config) {
+  const maxBytes = numberOrDefault(
+    config?.codex?.toolResultWindowMaxBytes,
+    DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES
+  );
+  if (maxBytes <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxBytes));
+}
+
+function byteLength(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8');
+}
+
 function approxCodexOutputTokenCount(text) {
   return Math.max(1, Math.ceil(Buffer.byteLength(String(text || ''), 'utf8') / 4));
 }
@@ -599,6 +620,22 @@ function limitCodexToolResultText(text, maxBytes) {
       `Total output lines: ${result.totalLines}\n\n` +
       result.text,
   };
+}
+
+function codexThreadConfigOverrides(config) {
+  const overrides = {};
+  const autoCompactTokenLimit = numberOrDefault(config?.codex?.autoCompactTokenLimit, 0);
+  const autoCompactTokenLimitScope =
+    config?.codex?.autoCompactTokenLimitScope || DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE;
+
+  if (autoCompactTokenLimit > 0) {
+    overrides.model_auto_compact_token_limit = Math.trunc(autoCompactTokenLimit);
+  }
+  if (typeof autoCompactTokenLimitScope === 'string' && autoCompactTokenLimitScope.trim() !== '') {
+    overrides.model_auto_compact_token_limit_scope = autoCompactTokenLimitScope.trim();
+  }
+
+  return overrides;
 }
 
 function codexInputMaxTokens(config) {
@@ -900,6 +937,10 @@ function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY
 
 function isCodexContextWindowError(error) {
   return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
+}
+
+function isCodexAutocompactThrashText(text) {
+  return CODEX_AUTOCOMPACT_THRASH_PATTERN.test(String(text || ''));
 }
 
 function isPossibleCodexContextWindowError(error) {
@@ -1380,7 +1421,9 @@ class CodexGatewaySession {
     this.pendingToolCall = null;
     this.activeBoundary = null;
     this.routingReservation = null;
+    this.toolResultWindowBytes = 0;
     this.latestTotalUsage = emptyUsage();
+    this.latestContextTokens = 0;
     this.idleTimer = null;
     this.lastUsedAt = Date.now();
     this.disposed = false;
@@ -1462,6 +1505,18 @@ class CodexGatewaySession {
     return Math.min(budget, Math.max(1, Math.floor(recycleLimit * CODEX_BOOTSTRAP_RECYCLE_HEADROOM)));
   }
 
+  resetToolResultWindow(reason, tracer = null) {
+    if (this.toolResultWindowBytes <= 0) {
+      return;
+    }
+
+    traceLog(tracer || this.tracer, 'codex.tool_result_window.reset', {
+      reason,
+      previous_tool_result_window_bytes: this.toolResultWindowBytes,
+    });
+    this.toolResultWindowBytes = 0;
+  }
+
   initialInputMode() {
     if (this.bootstrapMode) {
       return this.bootstrapMode;
@@ -1522,6 +1577,7 @@ class CodexGatewaySession {
       return;
     }
 
+    const threadConfig = codexThreadConfigOverrides(this.config);
     const result = await this.connection.request('thread/start', {
       model: this.route.upstreamModel,
       cwd: this.config.codex.cwd,
@@ -1531,6 +1587,7 @@ class CodexGatewaySession {
       dynamicTools: this.toolRegistry.dynamicTools,
       serviceName: 'ultrathink_gateway',
       threadSource: this.threadSource,
+      ...(Object.keys(threadConfig).length > 0 ? { config: threadConfig } : {}),
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
     });
 
@@ -1543,6 +1600,7 @@ class CodexGatewaySession {
       thread_id: this.threadId,
       thread_source: this.threadSource,
       ephemeral_thread: this.ephemeralThread,
+      thread_config: threadConfig,
     });
   }
 
@@ -1578,19 +1636,43 @@ class CodexGatewaySession {
 
     const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
     const toolResultMaxBytes = codexToolResultMaxBytes(this.config);
-    const limitedToolResult = limitCodexToolResultText(rawToolResult.text, toolResultMaxBytes);
+    const toolResultWindowMaxBytes = codexToolResultWindowMaxBytes(this.config);
+    const toolResultWindowRemainingBytes = Number.isFinite(toolResultWindowMaxBytes)
+      ? Math.max(0, toolResultWindowMaxBytes - this.toolResultWindowBytes)
+      : Number.POSITIVE_INFINITY;
+    const effectiveToolResultMaxBytes = Math.min(
+      toolResultMaxBytes,
+      toolResultWindowRemainingBytes
+    );
+    const limitedToolResult = limitCodexToolResultText(
+      rawToolResult.text,
+      effectiveToolResultMaxBytes
+    );
     const toolResult = {
       ...rawToolResult,
       text: limitTextByTokenBudget(limitedToolResult.text, this.inputMaxTokens()),
     };
+    const resultBytes = byteLength(toolResult.text);
+    this.toolResultWindowBytes += resultBytes;
     const tracer = this.scopedTracer(requestTracer);
     traceLog(tracer, 'codex.tool_result.continued', {
       call_id: this.pendingToolCall.callId,
       tool_name: this.pendingToolCall.tool,
       raw_result_bytes: limitedToolResult.originalBytes,
+      result_bytes: resultBytes,
       result_length: toolResult.text.length,
       tool_result_truncated: limitedToolResult.truncated,
       tool_result_max_bytes: Number.isFinite(toolResultMaxBytes) ? toolResultMaxBytes : null,
+      tool_result_window_bytes: this.toolResultWindowBytes,
+      tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
+        ? toolResultWindowMaxBytes
+        : null,
+      tool_result_window_remaining_bytes: Number.isFinite(toolResultWindowRemainingBytes)
+        ? toolResultWindowRemainingBytes
+        : null,
+      effective_tool_result_max_bytes: Number.isFinite(effectiveToolResultMaxBytes)
+        ? effectiveToolResultMaxBytes
+        : null,
       is_error: toolResult.isError,
     });
     this.connection.send({
@@ -1766,6 +1848,15 @@ class CodexGatewaySession {
         return;
       }
 
+      if (outcome.type === 'final' && isCodexAutocompactThrashText(outcome.text)) {
+        traceLog(tracer, 'codex.boundary.autocompact_thrash_detected', {
+          turn_id: turnId,
+          output_chars: outcome.text.length,
+        });
+        failBoundary(new GatewayError(502, 'api_error', outcome.text));
+        return;
+      }
+
       cleanup();
       boundary.finished = true;
       populateEstimatedUsage(boundary, requestBody, outcome);
@@ -1853,17 +1944,28 @@ class CodexGatewaySession {
         // Prefer the per-turn snapshot (tracks shrinkage after app-server
         // compaction); fall back to the cumulative total, which overestimates
         // live context — the safe direction for recycle pressure.
-        this.latestContextTokens =
+        const previousContextTokens = this.latestContextTokens || 0;
+        const latestContextTokens =
           contextTokensFromUsage(tokenUsage.last) ||
           contextTokensFromUsage(tokenUsage.total) ||
-          this.latestContextTokens ||
+          previousContextTokens ||
           0;
+        this.latestContextTokens = latestContextTokens;
+        if (
+          previousContextTokens > 0 &&
+          latestContextTokens > 0 &&
+          latestContextTokens < Math.floor(previousContextTokens * CODEX_CONTEXT_DROP_RESET_FRACTION)
+        ) {
+          this.resetToolResultWindow('context_usage_drop', tracer);
+        }
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,
           usage: boundary.usage,
           total_usage: tokenUsage.total,
           last_usage: tokenUsage.last,
           model_context_window: tokenUsage.model_context_window,
+          previous_context_tokens: previousContextTokens,
+          latest_context_tokens: latestContextTokens,
         });
         boundary.emit({
           type: 'usage',

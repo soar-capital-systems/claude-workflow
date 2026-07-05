@@ -287,6 +287,9 @@ function gatewayConfig(overrides = {}) {
       reasoningEffort: 'medium',
       verbosity: 'high',
       toolResultMaxBytes: 10_000,
+      toolResultWindowMaxBytes: 64_000,
+      autoCompactTokenLimit: 0,
+      autoCompactTokenLimitScope: 'body_after_prefix',
       idleTimeoutMs: 60_000,
       forkIdleTimeoutMs: 30_000,
       maxSessions: 16,
@@ -979,6 +982,42 @@ await runTest('gateway config exposes the Codex tool-result byte budget', async 
     }
   );
 });
+
+await runTest(
+  'gateway config exposes Codex context-compaction guardrails',
+  async function testCodexCompactionGuardrailConfig() {
+    await withTemporaryEnv(
+      {
+        ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES: '8192',
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '123456',
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: 'total',
+      },
+      async function assertCompactionGuardrailConfig() {
+        const config = loadGatewayConfig();
+        assert.equal(config.codex.toolResultWindowMaxBytes, 8192);
+        assert.equal(config.codex.autoCompactTokenLimit, 123456);
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'total');
+        ok('Codex aggregate tool-result and auto-compaction guardrails are configurable');
+      }
+    );
+  }
+);
+
+await runTest(
+  'gateway config defaults Codex auto-compaction to body-after-prefix scope',
+  async function testCodexAutoCompactScopeDefault() {
+    await withTemporaryEnv(
+      {
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: undefined,
+      },
+      async function assertAutoCompactScopeDefault() {
+        const config = loadGatewayConfig();
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
+        ok('Codex gateway threads avoid total-context autocompact thrash by default');
+      }
+    );
+  }
+);
 
 await runTest('gateway config exposes the Codex session pool cap', async function testCodexMaxSessionsConfig() {
   await withTemporaryEnv(
@@ -2199,8 +2238,16 @@ await runTest(
       assert.equal(threadStarts.length, 2);
       assert.equal(threadStarts[0].params.threadSource, 'user');
       assert.equal(threadStarts[0].params.ephemeral, undefined);
+      assert.equal(
+        threadStarts[0].params.config.model_auto_compact_token_limit_scope,
+        'body_after_prefix'
+      );
       assert.equal(threadStarts[1].params.threadSource, 'subagent');
       assert.equal(threadStarts[1].params.ephemeral, true);
+      assert.equal(
+        threadStarts[1].params.config.model_auto_compact_token_limit_scope,
+        'body_after_prefix'
+      );
       ok('Claude workflow agent Codex threads are pathless/non-resumable app-server threads');
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -2507,6 +2554,177 @@ await runTest(
         assert.equal(continuedText.includes('BBBBBBBBBBBBBBBBBBBB'), true);
         assert.equal(continuedText.length < rawResult.length, true);
         ok('large Claude tool_result payloads are bounded before they enter Codex app-server history');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server dynamic tool_result payloads share a session byte budget',
+  async function testCodexToolResultsShareSessionBudget() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-window-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-window');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-tool-window";\n' +
+          'let nextCall = 1;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'function sendToolCall() {\n' +
+          '  const index = nextCall;\n' +
+          '  nextCall += 1;\n' +
+          "  send({ id: `tool_req_${index}`, method: 'item/tool/call', params: { turnId, callId: `call_${index}`, tool: 'ext_tool_001', arguments: { index } } });\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(sendToolCall, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id && message.id.startsWith('tool_req_')) {\n" +
+          '    record(message);\n' +
+          '    if (responses.length < 3) {\n' +
+          '      setTimeout(sendToolCall, 5);\n' +
+          '    } else {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+            toolResultMaxBytes: 100,
+            toolResultWindowMaxBytes: 70,
+          },
+        });
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Call the lookup tool repeatedly.' }],
+          tools,
+        };
+        function toolResultRequest(callId, text) {
+          return {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Call the lookup tool repeatedly.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: callId,
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: callId,
+                    content: text,
+                  },
+                ],
+              },
+            ],
+            tools,
+          };
+        }
+
+        const firstToolUse = await manager.processRequest(
+          gatewayRequest(),
+          initialRequest,
+          codexRoute()
+        );
+        assert.equal(firstToolUse.toolCall.id, 'call_1');
+
+        const secondToolUse = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_1', 'A'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(secondToolUse.toolCall.id, 'call_2');
+
+        const thirdToolUse = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_2', 'B'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(thirdToolUse.toolCall.id, 'call_3');
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_3', 'C'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(finalOutcome.type, 'final');
+
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedTexts = responses.map(function responseText(message) {
+          return message.result.contentItems[0].text;
+        });
+
+        assert.equal(continuedTexts[0], 'A'.repeat(40));
+        assert.match(continuedTexts[1], /^Warning: truncated output/u);
+        assert.match(continuedTexts[1], /chars truncated/u);
+        assert.match(continuedTexts[2], /^Warning: truncated output/u);
+        assert.match(continuedTexts[2], /40 chars truncated/u);
+        assert.equal(continuedTexts[2].includes('CCCC'), false);
+        ok('aggregate dynamic-tool output is bounded across a Codex session');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -3689,6 +3907,114 @@ await runTest('Codex context-ish 502s that miss recovery matching are traced', a
   );
   ok('context-like Codex 502 wording drift is traceable even when recovery does not engage');
 });
+
+await runTest(
+  'Codex autocompact-thrash final text recovers as context overflow',
+  async function testCodexAutocompactThrashTextRecovery() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-thrash-retry-'));
+    const codexPath = path.join(tempDir, 'codex-thrash-retry');
+    const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
+    const failureMarkerPath = path.join(tempDir, 'failed-once');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: `thread-${message.id}` } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const turnId = `turn-${message.id}`;\n' +
+          '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, `${JSON.stringify(message.params)}\\n`, "utf8");\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    if (!fs.existsSync(process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER)) {\n' +
+          '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER, "1", "utf8");\n' +
+          '      setTimeout(function emitThrashOutcome() {\n' +
+          "        send({ method: 'item/completed', params: { turnId, item: { id: 'agent-thrash', type: 'agentMessage', text: 'Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window.' } } });\n" +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 10);\n' +
+          '    } else {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'item/completed', params: { turnId, item: { id: 'agent-ok', type: 'agentMessage', text: 'recovered after compact thrash' } } });\n" +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 10);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnParams = process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+      const previousFailMarker = process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = turnParamsPath;
+      process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER = failureMarkerPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+          },
+        });
+
+        const outcome = await manager.processRequest(
+          claudeSessionRequest('session-thrash-retry'),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Old context that should be omitted after thrash.' },
+              { role: 'assistant', content: 'Old answer that should be omitted after thrash.' },
+              { role: 'user', content: 'Current request after autocompact thrash.' },
+            ],
+            tools: [],
+          },
+          codexRoute()
+        );
+
+        assert.equal(outcome.type, 'final');
+        assert.equal(outcome.text, 'recovered after compact thrash');
+
+        const turnParams = (await fs.readFile(turnParamsPath, 'utf8'))
+          .trim()
+          .split(/\n/u)
+          .map(function parseLine(line) {
+            return JSON.parse(line);
+          });
+        assert.equal(turnParams.length, 2);
+        assert.equal(turnParams[1].input[0].text.includes('Current request after autocompact thrash.'), true);
+        assert.equal(turnParams[1].input[0].text.includes('Old context'), false);
+        ok('autocompact-thrash assistant outcomes recover through the context-overflow path');
+      } finally {
+        await manager?.close();
+        if (previousTurnParams === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = previousTurnParams;
+        }
+        if (previousFailMarker === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER = previousFailMarker;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
 
 await runTest('Codex first-turn transcript overflow recovers straight to latest-only input', async function testCodexContextWindowRecovery() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-context-retry-'));

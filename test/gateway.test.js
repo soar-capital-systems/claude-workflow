@@ -11,6 +11,7 @@ import path from 'node:path';
 import { translateAnthropicMessagesRequestWithOptions } from '../js/gateway/anthropic-format.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 import { buildCodexDynamicToolRegistry, CodexSessionManager } from '../js/gateway/codex-provider.js';
+import { buildWorkflowGatewayConfig } from '../js/gateway/workflow-config.js';
 import { GatewayError, resolveModelRoute } from '../js/gateway/model-routing.js';
 import {
   noProxyMatchesUrl,
@@ -227,6 +228,9 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   DEEPSEEK_BASE_URL: '',
   DEEPSEEK_DEFAULT_MODEL_ID: '',
   ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: '',
+  ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '',
+  ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: '',
+  ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: '',
@@ -1014,6 +1018,22 @@ await runTest(
         const config = loadGatewayConfig();
         assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
         ok('Codex gateway threads avoid total-context autocompact thrash by default');
+      }
+    );
+  }
+);
+
+await runTest(
+  'claude-workflow defaults Codex auto-compaction below its recycle budget',
+  async function testWorkflowCodexAutoCompactDefault() {
+    await withTemporaryEnv(
+      CLEAN_WORKFLOW_ENV,
+      async function assertWorkflowCodexAutoCompactDefault() {
+        const { config } = buildWorkflowGatewayConfig();
+        assert.equal(config.codex.inputMaxTokens, 180_000);
+        assert.equal(config.codex.autoCompactTokenLimit, 126_000);
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
+        ok('workflow Codex sessions compact before they reach the gateway recycle threshold');
       }
     );
   }
@@ -2829,6 +2849,79 @@ await runTest(
 );
 
 await runTest(
+  'Codex app-server usage prefers last snapshot when total is also present',
+  async function testCodexUsagePrefersLastSnapshot() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-last-total-'));
+    const codexPath = path.join(tempDir, 'codex-usage-last-total');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const readline = require('node:readline');\n" +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-usage-last-total' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          "    const turnId = 'turn-1';\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function completeTurn() {\n' +
+          "      send({ method: 'item/agentMessage/delta', params: { turnId, itemId: 'message-1', delta: 'done' } });\n" +
+          '      const tokenUsage = {\n' +
+          '        total: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1250 },\n' +
+          '        last: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9, reasoningOutputTokens: 3, totalTokens: 132 },\n' +
+          '      };\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+        },
+      });
+
+      try {
+        const outcome = await manager.processRequest(
+          claudeSessionRequest('codex-usage-last-total'),
+          codexUserRequest('Mixed total and last usage turn.'),
+          codexRoute()
+        );
+
+        assert.deepEqual(outcome.usage, {
+          input_tokens: 80,
+          output_tokens: 12,
+          cache_read_input_tokens: 40,
+          reasoning_output_tokens: 3,
+          total_tokens: 132,
+        });
+        ok('Codex last usage snapshots drive per-response Anthropic usage when available');
+      } finally {
+        await manager.close();
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
   'Codex app-server last-only usage snapshots do not double count session totals',
   async function testCodexLastUsageSnapshotsDoNotDoubleCountTotals() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-last-usage-'));
@@ -3590,6 +3683,451 @@ await runTest('Codex sessions recycle before the reported context can overflow t
   }
 });
 
+await runTest(
+  'Codex sessions recycle against configured budget when the model window is larger',
+  async function testCodexSessionRecycleUsesConfiguredBudget() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-budget-recycle-'));
+    const codexPath = path.join(tempDir, 'codex-budget-recycle');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendTurn(entry) {\n' +
+          '  const logPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          '  let turns = [];\n' +
+          '  try { turns = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch {}\n' +
+          '  turns.push(entry);\n' +
+          '  fs.writeFileSync(logPath, JSON.stringify(turns), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          "    const turnId = `turn-${message.id}`;\n" +
+          '    appendTurn({ pid: process.pid, input: message.params.input[0].text });\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function reportUsage() {\n' +
+          '      const tokenUsage = {\n' +
+          '        last: { inputTokens: 140, outputTokens: 10, totalTokens: 150 },\n' +
+          '        modelContextWindow: 1000000,\n' +
+          '      };\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '    }, 10);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      try {
+        const manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 180,
+          },
+        });
+        const req = claudeSessionRequest('budget-recycle');
+
+        await manager.processRequest(
+          req,
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [],
+          },
+          codexRoute()
+        );
+        await manager.processRequest(
+          req,
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'hi' },
+              { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+              { role: 'user', content: 'again' },
+            ],
+            tools: [],
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes('again'), true);
+        assert.equal(turns[1].input.includes('hi'), true);
+        await manager.close();
+        ok('Codex session pressure honors the configured input budget before the learned window');
+      } finally {
+        if (previousTarget === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex matching tool_result requests recycle when replay pressure exceeds stale usage estimates',
+  async function testCodexToolResultReplayPressureRecycle() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-replay');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+    const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
+    const replayMarker = 'RESULT_MARKER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
+
+    try {
+      await fs.writeFile(toolResponsesPath, '[]', 'utf8');
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'const turnLogPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          'const toolResponsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendJson(pathname, entry) {\n' +
+          '  let items = [];\n' +
+          '  try { items = JSON.parse(fs.readFileSync(pathname, "utf8")); } catch {}\n' +
+          '  items.push(entry);\n' +
+          '  fs.writeFileSync(pathname, JSON.stringify(items), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          '    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const input = message.params.input[0].text;\n' +
+          '    appendJson(turnLogPath, { pid: process.pid, input });\n' +
+          "    const turnId = `turn-${process.pid}`;\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          `    if (input.includes(${JSON.stringify(replayMarker)})) {\n` +
+          '      setTimeout(function completeReplayTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '      return;\n' +
+          '    }\n' +
+          '    setTimeout(function emitUsageAndToolCall() {\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 1 }, modelContextWindow: 120 } } });\n" +
+          "      send({ id: 'tool_req_replay', method: 'item/tool/call', params: { turnId, callId: 'call_replay', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_replay') {\n" +
+          '    appendJson(toolResponsesPath, { pid: process.pid, message });\n' +
+          '    setTimeout(function completeContinuedTurn() {\n' +
+          "      send({ method: 'turn/completed', params: { turn: { id: `turn-${process.pid}`, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnLog = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      const previousToolResponses = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = toolResponsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 100,
+          },
+        });
+
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const openingMessages = [
+          { role: 'user', content: 'Background context. '.repeat(8) },
+          { role: 'assistant', content: [{ type: 'text', text: 'Prior analysis. '.repeat(4) }] },
+          { role: 'user', content: 'Call the lookup tool and wait for the result.' },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: openingMessages,
+          tools,
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_replay',
+          name: 'lookup',
+          input: {},
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              ...openingMessages,
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_replay',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_replay',
+                    content: replayMarker,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes(replayMarker), true);
+        assert.deepEqual(toolResponses, []);
+        ok(
+          'matching tool_result requests recycle to a fresh transcript replay when replay pressure exceeds stale usage'
+        );
+      } finally {
+        await manager?.close();
+        if (previousTurnLog === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTurnLog;
+        }
+        if (previousToolResponses === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousToolResponses;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex matching tool_result requests recycle when replay pressure exceeds missing usage estimates',
+  async function testCodexToolResultReplayPressureRecycleWithoutUsage() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-nou-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-replay-no-usage');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+    const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
+    const replayMarker = 'RESULT_MARKER_WITHOUT_USAGE_QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
+
+    try {
+      await fs.writeFile(toolResponsesPath, '[]', 'utf8');
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'const turnLogPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          'const toolResponsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendJson(pathname, entry) {\n' +
+          '  let items = [];\n' +
+          '  try { items = JSON.parse(fs.readFileSync(pathname, "utf8")); } catch {}\n' +
+          '  items.push(entry);\n' +
+          '  fs.writeFileSync(pathname, JSON.stringify(items), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          '    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const input = message.params.input[0].text;\n' +
+          '    appendJson(turnLogPath, { pid: process.pid, input });\n' +
+          "    const turnId = `turn-${process.pid}`;\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          `    if (input.includes(${JSON.stringify(replayMarker)})) {\n` +
+          '      setTimeout(function completeReplayTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '      return;\n' +
+          '    }\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_replay_no_usage', method: 'item/tool/call', params: { turnId, callId: 'call_replay_no_usage', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_replay_no_usage') {\n" +
+          '    appendJson(toolResponsesPath, { pid: process.pid, message });\n' +
+          '    setTimeout(function completeContinuedTurn() {\n' +
+          "      send({ method: 'turn/completed', params: { turn: { id: `turn-${process.pid}`, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnLog = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      const previousToolResponses = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = toolResponsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 100,
+          },
+        });
+
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const openingMessages = [
+          { role: 'user', content: 'Background context. '.repeat(8) },
+          { role: 'assistant', content: [{ type: 'text', text: 'Prior analysis. '.repeat(4) }] },
+          { role: 'user', content: 'Call the lookup tool and wait for the result.' },
+        ];
+
+        const toolUse = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: openingMessages,
+            tools,
+          },
+          codexRoute()
+        );
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_replay_no_usage',
+          name: 'lookup',
+          input: {},
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              ...openingMessages,
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_replay_no_usage',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_replay_no_usage',
+                    content: replayMarker,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes(replayMarker), true);
+        assert.deepEqual(toolResponses, []);
+        ok(
+          'matching tool_result requests recycle to a fresh transcript replay even before the app-server reports usage'
+        );
+      } finally {
+        await manager?.close();
+        if (previousTurnLog === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTurnLog;
+        }
+        if (previousToolResponses === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousToolResponses;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
 await runTest('Codex learned context windows bound budgets for later sessions', async function testCodexLearnedWindowBudgets() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-learned-window-'));
   const codexPath = path.join(tempDir, 'codex-learned-window');
@@ -3627,7 +4165,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
         '    appendTurn({ input: message.params.input[0].text });\n' +
         '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
         '    setTimeout(function reportUsage() {\n' +
-        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 }, modelContextWindow: 40 } } });\n" +
+        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 }, modelContextWindow: 80 } } });\n" +
         "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
         '    }, 10);\n' +
         '  }\n' +
@@ -3647,7 +4185,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
         },
       });
 
-      // First session teaches the manager the model's 40-token window.
+      // First session teaches the manager the model's 80-token window.
       await manager.processRequest(
         claudeSessionRequest('learned-window-a'),
         {
@@ -3659,8 +4197,8 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
       );
 
       // A brand-new session must render its bootstrap transcript inside the
-      // learned window (40 tokens * 0.8 = 32 tokens = 96 chars), truncating
-      // the long history while keeping the newest message.
+      // learned window and below the recycle threshold:
+      // floor(floor(80 * 0.8) * 0.75 * 0.9) = 43 tokens = 129 chars.
       await manager.processRequest(
         claudeSessionRequest('learned-window-b'),
         {
@@ -3677,7 +4215,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
 
       const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
       assert.equal(turns.length, 2);
-      assert.equal(turns[1].input.length <= 32 * 3, true);
+      assert.equal(turns[1].input.length <= 43 * 3, true);
       assert.equal(turns[1].input.includes('KEEP'), true);
       assert.equal(turns[1].input.includes('Ancient history'), false);
       await manager.close();
@@ -4048,7 +4586,10 @@ await runTest('Codex first-turn transcript overflow recovers straight to latest-
         '    try { failCount = Number(fs.readFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, "utf8")); } catch {}\n' +
         '    if (failCount < 1) {\n' +
         '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, String(failCount + 1), "utf8");\n' +
-        "      setTimeout(function failTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'failed', error: { message: \"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.\" } } } }); }, 10);\n" +
+        '      const error = { message: "prompt is too long: 1017300 tokens > 1000000 maximum" };\n' +
+        '      setTimeout(function failTurn() {\n' +
+        '        send({ method: "turn/completed", params: { turn: { id: turnId, status: "failed", error } } });\n' +
+        '      }, 10);\n' +
         '      return;\n' +
         '    }\n' +
         "    setTimeout(function completeTurn() {\n" +

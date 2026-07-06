@@ -35,11 +35,11 @@ const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
 ];
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 // Recycle a live Codex session before its real context (as reported by the
-// app-server) can overflow the model window: long tool loops accumulate
-// history turn by turn, so per-payload budgets alone cannot bound the sum.
-// The threshold is a fraction of the model window itself; bootstrap replays
-// are capped strictly below it (see bootstrapInputMaxTokens) so a freshly
-// recycled session can never immediately re-trigger recycling.
+// app-server) can overflow the gateway's effective input budget. Long tool
+// loops accumulate history turn by turn, so per-payload budgets alone cannot
+// bound the sum. Bootstrap replays are capped strictly below this threshold
+// (see bootstrapInputMaxTokens) so a freshly recycled session can never
+// immediately re-trigger recycling.
 const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
 const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
 const CODEX_CONTEXT_DROP_RESET_FRACTION = 0.8;
@@ -51,7 +51,7 @@ const ESTIMATE_CHARS_PER_TOKEN = 3;
 const CODEX_AUTOCOMPACT_THRASH_PATTERN =
   /autocompact is thrashing|context refilled to the limit|within 3 turns of the previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
-  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history|autocompact is thrashing|context refilled to the limit|previous compact|tool output is likely too large/iu;
+  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history|prompt is too long|tokens?\s*>\s*\d+\s+maximum|autocompact is thrashing|context refilled to the limit|previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 
@@ -376,9 +376,16 @@ function estimateIncomingRequestTokens(requestBody) {
   }
 }
 
+function estimateReplayTranscriptTokens(requestBody) {
+  try {
+    return estimateTokensFromText(renderTranscriptInput(requestBody));
+  } catch {
+    return 0;
+  }
+}
+
 function codexRecycleContextLimit(config, contextWindow) {
-  const window = Number(contextWindow || 0);
-  const base = window > 0 ? window : codexInputMaxTokens(config);
+  const base = effectiveCodexInputMaxTokens(config, contextWindow);
   if (!Number.isFinite(base)) {
     return Number.POSITIVE_INFINITY;
   }
@@ -1930,13 +1937,8 @@ class CodexGatewaySession {
         (message.params?.tokenUsage?.total || message.params?.tokenUsage?.last)
       ) {
         const tokenUsage = normalizeCodexTokenUsage(message.params.tokenUsage);
-        if (tokenUsage.total) {
-          boundary.usage = usageDelta(tokenUsage.total, boundary.usageBaseline);
-          this.latestTotalUsage = tokenUsage.total;
-        } else {
-          boundary.usage = tokenUsage.last || emptyUsage();
-          this.latestTotalUsage = addUsage(boundary.usageBaseline, boundary.usage);
-        }
+        boundary.usage = tokenUsage.last || usageDelta(tokenUsage.total, boundary.usageBaseline);
+        this.latestTotalUsage = tokenUsage.total || addUsage(boundary.usageBaseline, boundary.usage);
         if (tokenUsage.model_context_window) {
           this.modelContextWindow = tokenUsage.model_context_window;
           this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
@@ -2321,6 +2323,9 @@ export class CodexSessionManager {
         selection_reason: selection.selectionReason,
         context_tokens: pressure.contextTokens,
         incoming_tokens: pressure.incomingTokens,
+        projected_live_tokens: pressure.projectedLiveTokens,
+        replay_transcript_tokens: pressure.replayTranscriptTokens || null,
+        projected_tokens: pressure.projectedTokens,
         recycle_limit: pressure.limit,
         model_context_window: session.knownModelContextWindow?.() || null,
       });
@@ -2521,19 +2526,37 @@ export class CodexSessionManager {
     }
 
     const contextTokens = Number(session.latestContextTokens || 0);
-    if (contextTokens <= 0) {
-      return null;
-    }
 
     // Project the incoming payload on top of the live context so a single
     // oversized tool result cannot leap past the window in one turn.
     const limit = this.recycleContextTokenLimit(session);
     const incomingTokens = estimateIncomingRequestTokens(requestBody);
-    if (contextTokens + incomingTokens < limit) {
+    const projectedLiveTokens = contextTokens > 0 ? contextTokens + incomingTokens : 0;
+    // Matching tool_result follow-ups can arrive with stale or partial
+    // app-server usage snapshots. Compare against the full Claude replay too:
+    // if replaying the same request would already exceed the recycle
+    // threshold, prefer a fresh transcript-bounded session over continuing
+    // the old paused tool call.
+    const replayTranscriptTokens =
+      selectionReason === 'matching_tool_result'
+        ? estimateReplayTranscriptTokens(requestBody)
+        : 0;
+    if (projectedLiveTokens <= 0 && replayTranscriptTokens <= 0) {
+      return null;
+    }
+    const projectedTokens = Math.max(projectedLiveTokens, replayTranscriptTokens);
+    if (projectedTokens < limit) {
       return null;
     }
 
-    return { contextTokens, incomingTokens, limit };
+    return {
+      contextTokens,
+      incomingTokens,
+      projectedLiveTokens,
+      replayTranscriptTokens,
+      projectedTokens,
+      limit,
+    };
   }
 
   canRecoverFromContextOverflow(error, options) {

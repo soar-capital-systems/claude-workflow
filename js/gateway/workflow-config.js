@@ -18,13 +18,11 @@ import {
 import { proxyExclusionEnvForHost } from './proxy.js';
 
 const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
-// Workflow-profile ceiling for the Codex input budget. The codex provider
-// learns the live window from app-server usage events (gpt-5.5 reports
-// 258,400 tokens) and derives the effective budget as
-// min(this ceiling, window * 0.8) — see DEFAULT_INPUT_MAX_TOKENS in
-// codex-provider.js for the bare-gateway cold-start default. This constant
-// only guards the cold-start request before the window is learned.
+// Workflow-profile ceiling for the Codex input budget. The codex provider also
+// caps this against the live app-server window when one is reported.
 const WORKFLOW_CODEX_INPUT_MAX_TOKENS = 180_000;
+const WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR = 7;
+const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
 const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
 const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
 
@@ -43,6 +41,17 @@ function displayRoutedModel() {
   }
 
   return envFlag('ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL', true);
+}
+
+function workflowAutoCompactTokenLimit(inputMaxTokens) {
+  const tokens = Number(inputMaxTokens);
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return 0;
+  }
+
+  const scaledTokens =
+    (tokens * WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR) / WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR;
+  return Math.max(1, Math.floor(scaledTokens));
 }
 
 function defaultAnthropicPassthroughPattern(mainModelId) {
@@ -245,6 +254,14 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
   const baseRouteMap = baseConfig.routeMap || {};
   const subagentRoute = baseRouteMap[rawSubagentModelId] || defaultSubagentRoute;
   const displayModels = displayRoutedModel();
+  const codexInputMaxTokens = envString('ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS')
+    ? baseConfig.codex.inputMaxTokens
+    : WORKFLOW_CODEX_INPUT_MAX_TOKENS;
+  const codexAutoCompactTokenLimit = envString(
+    'ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT'
+  )
+    ? baseConfig.codex.autoCompactTokenLimit
+    : workflowAutoCompactTokenLimit(codexInputMaxTokens);
   const subagentModelId = displayModels
     ? envString(
         'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID',
@@ -291,9 +308,8 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
         idleTimeoutMs: envString('ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS')
           ? baseConfig.codex.idleTimeoutMs
           : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
-        inputMaxTokens: envString('ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS')
-          ? baseConfig.codex.inputMaxTokens
-          : WORKFLOW_CODEX_INPUT_MAX_TOKENS,
+        inputMaxTokens: codexInputMaxTokens,
+        autoCompactTokenLimit: codexAutoCompactTokenLimit,
       },
       exposedModels: dedupeStrings([
         ...routeModelAliases(mainModelId),

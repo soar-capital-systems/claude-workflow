@@ -222,11 +222,19 @@ const CLEAN_PROXY_ENV = Object.freeze({
   no_proxy: '',
 });
 const CLEAN_WORKFLOW_ENV = Object.freeze({
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '',
   CLAUDE_WORKFLOW_MAIN_PROVIDER: '',
   CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID: '',
   DEEPSEEK_API_KEY: '',
   DEEPSEEK_BASE_URL: '',
   DEEPSEEK_DEFAULT_MODEL_ID: '',
+  GLM_API_KEY: '',
+  GLM_BASE_URL: '',
+  GLM_DEFAULT_MODEL_ID: '',
+  ZAI_API_KEY: '',
+  ZAI_BASE_URL: '',
+  ZAI_DEFAULT_MODEL_ID: '',
+  ZAI_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: '',
   ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '',
   ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: '',
@@ -235,6 +243,10 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_GLM_API_KEY: '',
+  ULTRATHINK_GATEWAY_GLM_BASE_URL: '',
+  ULTRATHINK_GATEWAY_GLM_MODEL: '',
+  ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_MAIN_MODEL_ID: '',
   ULTRATHINK_GATEWAY_MAIN_PROVIDER: '',
   ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT: '',
@@ -244,6 +256,7 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: '',
   ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY: '',
   ULTRATHINK_DEEPSEEK_REASONING_EFFORT: '',
+  ULTRATHINK_GLM_REASONING_EFFORT: '',
   ULTRATHINK_THINKING_LEVEL: '',
 });
 
@@ -312,6 +325,16 @@ function gatewayConfig(overrides = {}) {
       reasoningEffort: 'max',
       thinking: { type: 'enabled' },
     },
+    glm: {
+      apiKey: '',
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'glm-5.2',
+      reasoningEffort: 'max',
+      thinking: {
+        type: 'enabled',
+        clear_thinking: false,
+      },
+    },
     anthropic: {
       apiKey: '',
       baseUrl: 'http://127.0.0.1:1',
@@ -333,6 +356,10 @@ function gatewayConfig(overrides = {}) {
     deepseek: {
       ...baseConfig.deepseek,
       ...overrides.deepseek,
+    },
+    glm: {
+      ...baseConfig.glm,
+      ...overrides.glm,
     },
     anthropic: {
       ...baseConfig.anthropic,
@@ -384,14 +411,45 @@ function deepSeekFableGatewayConfig(gatewayPort, deepSeekPort, overrides = {}) {
   });
 }
 
-function deepSeekReasoningHeaders(sessionId) {
+function glmGatewayConfig(gatewayPort, glmPort, overrides = {}) {
+  const configOverrides = overrides.config || {};
+  const glmOverrides = overrides.glm || {};
+  const routeOverrides = overrides.route || {};
+
+  return gatewayConfig({
+    ...configOverrides,
+    port: gatewayPort,
+    exposedModels: ['glm-5.2[1m]'],
+    routeMap: {
+      'glm-5.2[1m]': {
+        provider: 'glm',
+        model: 'glm-5.2[1m]',
+        reasoningEffort: 'max',
+        ...routeOverrides,
+      },
+    },
+    glm: {
+      apiKey: 'glm-key',
+      baseUrl: `http://127.0.0.1:${glmPort}`,
+      model: 'glm-5.2',
+      reasoningEffort: 'max',
+      thinking: {
+        type: 'enabled',
+        clear_thinking: false,
+      },
+      ...glmOverrides,
+    },
+  });
+}
+
+function reasoningReplayHeaders(sessionId) {
   return jsonHeaders({
     'x-claude-code-session-id': sessionId,
     'x-claude-code-agent-id': 'agent-weather',
   });
 }
 
-function assertDeepSeekReasoningReplay(capturedBodies) {
+function assertToolCallReasoningReplay(capturedBodies) {
   const assistantMessage = capturedBodies[1].messages.find(function findAssistant(message) {
     return message.role === 'assistant';
   });
@@ -850,6 +908,65 @@ await runTest('gateway defaults DeepSeek routes to enabled max reasoning', async
   );
 });
 
+await runTest('gateway config reads an independent GLM route profile', async function testGlmGatewayProfile() {
+  await withTemporaryEnv(
+    {
+      ULTRATHINK_GATEWAY_GLM_API_KEY: 'gateway-glm-key',
+      ZAI_API_KEY: 'ambient-zai-key',
+      GLM_API_KEY: 'ambient-glm-key',
+      ULTRATHINK_GATEWAY_GLM_BASE_URL: 'http://127.0.0.1:9877',
+      ZAI_BASE_URL: 'http://should-not-win',
+      GLM_BASE_URL: 'http://also-should-not-win',
+      ULTRATHINK_GATEWAY_GLM_MODEL: 'glm-5.2',
+      GLM_DEFAULT_MODEL_ID: 'glm-other',
+      ZAI_DEFAULT_MODEL_ID: 'zai-other',
+      ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: 'high',
+      ULTRATHINK_GLM_REASONING_EFFORT: 'max',
+      ZAI_REASONING_EFFORT: 'low',
+      ULTRATHINK_THINKING_LEVEL: 'OFF',
+    },
+    async function assertGlmGatewayProfile() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.glm.apiKey, 'gateway-glm-key');
+      assert.equal(config.glm.baseUrl, 'http://127.0.0.1:9877');
+      assert.equal(config.glm.model, 'glm-5.2');
+      assert.equal(config.glm.reasoningEffort, 'high');
+      assert.deepEqual(config.glm.thinking, { type: 'disabled' });
+      ok('GLM gateway routing has its own credentials, endpoint, model, and thinking profile');
+    }
+  );
+});
+
+await runTest('gateway defaults GLM routes to max preserved thinking', async function testGlmGatewayDefaults() {
+  await withTemporaryEnv(
+    {
+      GLM_BASE_URL: '',
+      GLM_DEFAULT_MODEL_ID: '',
+      ZAI_BASE_URL: '',
+      ZAI_DEFAULT_MODEL_ID: '',
+      ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: '',
+      ULTRATHINK_GATEWAY_GLM_BASE_URL: '',
+      ULTRATHINK_GATEWAY_GLM_MODEL: '',
+      ULTRATHINK_GLM_REASONING_EFFORT: '',
+      ZAI_REASONING_EFFORT: '',
+      ULTRATHINK_THINKING_LEVEL: '',
+    },
+    async function assertGlmGatewayDefaults() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.glm.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+      assert.equal(config.glm.model, 'glm-5.2');
+      assert.equal(config.glm.reasoningEffort, 'max');
+      assert.deepEqual(config.glm.thinking, {
+        type: 'enabled',
+        clear_thinking: false,
+      });
+      ok('GLM gateway routes default to Z.ai coding endpoint with max preserved thinking');
+    }
+  );
+});
+
 await runTest('gateway defaults Codex-backed routes to writable never-approval sessions', async function testCodexSessionDefaults() {
   const previous = {
     ULTRATHINK_GATEWAY_CODEX_ENABLED: process.env.ULTRATHINK_GATEWAY_CODEX_ENABLED,
@@ -952,6 +1069,41 @@ await runTest('gateway wildcard route-map entries override passthrough patterns'
   assert.equal(route.reasoningEffort, 'max');
   assert.deepEqual(route.thinking, { type: 'enabled' });
   ok('wildcard route-map entries are applied before the Anthropic passthrough fallback');
+});
+
+await runTest('gateway strips client-only [1m] qualifiers before GLM upstream calls', async function testGlmOneMillionAlias() {
+  const route = resolveModelRoute(
+    'glm-5.2[1m]',
+    gatewayConfig({
+      routeMap: {
+        'glm-5.2[1m]': {
+          provider: 'glm',
+          model: 'glm-5.2[1m]',
+          reasoningEffort: 'max',
+        },
+      },
+      glm: {
+        apiKey: 'glm-key',
+        baseUrl: 'http://127.0.0.1:1',
+        model: 'glm-5.2',
+        reasoningEffort: 'high',
+        thinking: {
+          type: 'enabled',
+          clear_thinking: false,
+        },
+      },
+    })
+  );
+
+  assert.equal(route.provider, 'glm');
+  assert.equal(route.requestedModel, 'glm-5.2[1m]');
+  assert.equal(route.upstreamModel, 'glm-5.2');
+  assert.equal(route.reasoningEffort, 'max');
+  assert.deepEqual(route.thinking, {
+    type: 'enabled',
+    clear_thinking: false,
+  });
+  ok('GLM routes expose the Claude Code 1m alias while sending the bare Z.ai model id');
 });
 
 await runTest('gateway config exposes the Codex close kill timeout knob', async function testCodexCloseKillTimeoutConfig() {
@@ -5690,6 +5842,7 @@ await runTest(
           '    health,\n' +
           '    models,\n' +
           "    subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL || '',\n" +
+          "    autoCompactWindow: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '',\n" +
           '  };\n' +
           "  fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_HEALTH_PATH, JSON.stringify(payload), 'utf8');\n" +
           "  process.stdout.write('CLI_OK\\n');\n" +
@@ -5734,6 +5887,13 @@ await runTest(
         ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'max',
         ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-fable-5-20260601',
       });
+      const glmMainHealth = await runWithDisplayEnv('glm-main-health.json', {
+        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'glm-5.2[1m]',
+        ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'glm',
+        ULTRATHINK_GATEWAY_GLM_API_KEY: 'glm-key',
+        ULTRATHINK_GATEWAY_GLM_MODEL: 'glm-5.2',
+        ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: 'max',
+      });
       const collisionHealth = await runWithDisplayEnv('main-subagent-collision-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-sonnet-4-7',
         ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID: 'claude-sonnet-4-7',
@@ -5748,6 +5908,7 @@ await runTest(
 
       assert.equal(defaultHealth.health.display_routed_model, true);
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
+      assert.equal(defaultHealth.autoCompactWindow, '');
       // The launcher now defaults the frontier main model to Fable 5 1m and keeps
       // the Fable 5 family on Anthropic; lower-tier Claude ids route to Codex gpt-5.5.
       assert.deepEqual(
@@ -5785,6 +5946,7 @@ await runTest(
       );
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
+      assert.equal(deepSeekMainHealth.autoCompactWindow, '');
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-fable-5[1m]'),
         'DeepSeek Main Route'
@@ -5796,6 +5958,18 @@ await runTest(
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-fable-5-20260601'),
         'DeepSeek Main Route'
+      );
+      assert.equal(glmMainHealth.health.glm_model, 'glm-5.2');
+      assert.equal(glmMainHealth.health.glm_reasoning_effort, 'max');
+      assert.equal(glmMainHealth.health.glm_thinking, 'enabled');
+      assert.equal(glmMainHealth.autoCompactWindow, '1000000');
+      assert.equal(
+        modelDisplayName(glmMainHealth, 'glm-5.2[1m]'),
+        'GLM Main Route'
+      );
+      assert.equal(
+        modelDisplayName(glmMainHealth, 'glm-5.2'),
+        'GLM Main Route'
       );
       assert.equal(
         modelDisplayName(collisionHealth, 'claude-sonnet-4-7'),
@@ -7144,6 +7318,198 @@ await runTest('gateway omits DeepSeek reasoning effort when thinking is disabled
   }
 });
 
+await runTest('gateway routes configured models to GLM-compatible chat completions', async function testGlmGatewayRouting() {
+  const glmPort = await freePort();
+  let capturedBody = null;
+  let capturedUrl = null;
+  let capturedAuthorization = '';
+
+  const glmServer = http.createServer(async function handleGlm(req, res) {
+    capturedUrl = req.url;
+    capturedAuthorization = req.headers.authorization || '';
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-glm-route',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'GLM route ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 21,
+          prompt_tokens_details: {
+            cached_tokens: 7,
+          },
+          completion_tokens: 5,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    glmServer.once('error', reject);
+    glmServer.listen(glmPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort, {
+    config: {
+      displayRoutedModel: true,
+      openai: {
+        apiKey: 'openai-key-should-not-be-used',
+        baseUrl: 'http://127.0.0.1:1',
+      },
+    },
+    route: {
+      reasoningEffort: 'max',
+      displayName: 'GLM 5.2 Route',
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'glm-5.2[1m]',
+        system: 'You are terse.',
+        max_tokens: 128,
+        messages: [
+          {
+            role: 'user',
+            content: 'Use GLM.',
+          },
+        ],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'tool',
+          name: 'lookup_weather',
+          disable_parallel_tool_use: true,
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+
+    assert.equal(capturedUrl, '/chat/completions');
+    assert.equal(capturedAuthorization, 'Bearer glm-key');
+    assert.equal(capturedBody.model, 'glm-5.2');
+    assert.equal(capturedBody.reasoning_effort, 'max');
+    assert.equal(capturedBody.max_tokens, 128);
+    assert.equal(capturedBody.max_completion_tokens, undefined);
+    assert.deepEqual(capturedBody.thinking, {
+      type: 'enabled',
+      clear_thinking: false,
+    });
+    assert.equal(capturedBody.tools[0].function.name, 'lookup_weather');
+    assert.deepEqual(capturedBody.tool_choice, {
+      type: 'function',
+      function: {
+        name: 'lookup_weather',
+      },
+    });
+    assert.equal(capturedBody.parallel_tool_calls, false);
+    assert.deepEqual(
+      capturedBody.messages.map(function roles(message) {
+        return message.role;
+      }),
+      ['system', 'user']
+    );
+    assert.equal(
+      payload.model,
+      routedResponseModel({
+        provider: 'glm',
+        upstreamModel: 'glm-5.2',
+        reasoningEffort: 'max',
+        requestedModel: 'glm-5.2[1m]',
+      })
+    );
+    assert.equal(payload.usage.input_tokens, 21);
+    assert.equal(payload.usage.output_tokens, 5);
+    assert.equal(payload.usage.cache_read_input_tokens, 7);
+    assert.equal(payload.content[0].text, 'GLM route ok.');
+    ok('GLM routes use their own credentials, endpoint, request shape, and response metadata');
+  } finally {
+    await runtime.close();
+    await closeServer(glmServer);
+  }
+});
+
+await runTest('gateway omits GLM reasoning effort when thinking is disabled', async function testGlmDisabledThinkingRouting() {
+  const glmPort = await freePort();
+  let capturedBody = null;
+
+  const glmServer = http.createServer(async function handleGlm(req, res) {
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-glm-disabled-thinking',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'GLM no thinking ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    glmServer.once('error', reject);
+    glmServer.listen(glmPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort, {
+    glm: {
+      thinking: { type: 'disabled' },
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'glm-5.2[1m]',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Use GLM without thinking.' }],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'auto',
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+
+    assert.equal(capturedBody.reasoning_effort, undefined);
+    assert.deepEqual(capturedBody.thinking, { type: 'disabled' });
+    assert.equal(capturedBody.tool_choice, 'auto');
+    ok('GLM disabled-thinking requests omit reasoning_effort while keeping normal tool_choice translation');
+  } finally {
+    await runtime.close();
+    await closeServer(glmServer);
+  }
+});
+
 await runTest(
   'gateway translates replayed assistant thinking blocks for DeepSeek routes',
   async function testDeepSeekAssistantThinkingReplay() {
@@ -7317,7 +7683,7 @@ await runTest(
 
     await waitForListening(runtime.server);
 
-    const headers = deepSeekReasoningHeaders('session-deepseek-json-reasoning');
+    const headers = reasoningReplayHeaders('session-deepseek-json-reasoning');
 
     try {
       const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
@@ -7364,11 +7730,140 @@ await runTest(
       });
       assert.equal(secondResponse.status, 200);
 
-      assertDeepSeekReasoningReplay(capturedBodies);
+      assertToolCallReasoningReplay(capturedBodies);
       ok('DeepSeek JSON tool loops replay reasoning_content on the assistant tool-call message');
     } finally {
       await runtime.close();
       await closeServer(deepSeekServer);
+    }
+  }
+);
+
+await runTest(
+  'gateway preserves GLM reasoning content across JSON tool-result turns',
+  async function testGlmReasoningToolLoopJson() {
+    const glmPort = await freePort();
+    const capturedBodies = [];
+
+    const glmServer = http.createServer(async function handleGlm(req, res) {
+      capturedBodies.push(await readJsonBody(req));
+      res.writeHead(200, jsonHeaders());
+
+      if (capturedBodies.length === 1) {
+        res.end(
+          JSON.stringify({
+            id: 'chatcmpl-glm-tool',
+            choices: [
+              {
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: null,
+                  reasoning_content: 'Need weather.',
+                  tool_calls: [
+                    {
+                      id: 'call_weather',
+                      type: 'function',
+                      function: {
+                        name: 'lookup_weather',
+                        arguments: JSON.stringify({ city: 'SF' }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+            usage: {
+              prompt_tokens: 20,
+              completion_tokens: 6,
+            },
+          })
+        );
+        return;
+      }
+
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-glm-final',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'Weather checked.',
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 35,
+            completion_tokens: 4,
+          },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      glmServer.once('error', reject);
+      glmServer.listen(glmPort, '127.0.0.1', resolve);
+    });
+
+    const gatewayPort = await freePort();
+    const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort));
+
+    await waitForListening(runtime.server);
+
+    const headers = reasoningReplayHeaders('session-glm-json-reasoning');
+
+    try {
+      const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'glm-5.2[1m]',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'Check weather.' }],
+          tools: [lookupWeatherTool()],
+        }),
+      });
+      assert.equal(firstResponse.status, 200);
+      const firstPayload = await firstResponse.json();
+      const toolUse = firstPayload.content.find(function findToolUse(block) {
+        return block.type === 'tool_use';
+      });
+      assert.equal(toolUse.id, 'call_weather');
+
+      const secondResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'glm-5.2[1m]',
+          max_tokens: 256,
+          messages: [
+            { role: 'user', content: 'Check weather.' },
+            {
+              role: 'assistant',
+              content: [toolUse],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_weather',
+                  content: '72F',
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(secondResponse.status, 200);
+
+      assertToolCallReasoningReplay(capturedBodies);
+      ok('GLM JSON tool loops replay reasoning_content on the assistant tool-call message');
+    } finally {
+      await runtime.close();
+      await closeServer(glmServer);
     }
   }
 );
@@ -7463,10 +7958,10 @@ await runTest('gateway streams OpenAI chunks as Anthropic SSE events', async fun
     assert.match(text, /"type":"text_delta","text":"Hel"/u);
     assert.match(text, /"type":"text_delta","text":"lo"/u);
     assert.match(text, /"stop_reason":"end_turn"/u);
-    assert.equal(terminalDelta.payload.usage.input_tokens, 0);
+    assert.equal(terminalDelta.payload.usage.input_tokens, 10);
     assert.equal(terminalDelta.payload.usage.output_tokens, 5);
     assert.match(text, /event: message_stop/u);
-    ok('streaming path emits Anthropic-style SSE events with output-only usage');
+    ok('streaming path emits Anthropic-style SSE events with upstream input and output usage');
   } finally {
     await runtime.close();
     await closeServer(openAiServer);
@@ -7750,7 +8245,7 @@ await runTest(
 
     await waitForListening(runtime.server);
 
-    const headers = deepSeekReasoningHeaders('session-deepseek-stream-reasoning');
+    const headers = reasoningReplayHeaders('session-deepseek-stream-reasoning');
 
     try {
       const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
@@ -7807,7 +8302,7 @@ await runTest(
       });
       assert.equal(secondResponse.status, 200);
 
-      assertDeepSeekReasoningReplay(capturedBodies);
+      assertToolCallReasoningReplay(capturedBodies);
       ok('DeepSeek streaming tool loops replay reasoning_content on the assistant tool-call message');
     } finally {
       await runtime.close();

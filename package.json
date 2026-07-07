@@ -15,8 +15,9 @@
     "daemon:status": "bash scripts/claude-workflow-daemon.sh status",
     "daemon:stop": "bash scripts/claude-workflow-daemon.sh stop",
     "daemon:log": "bash scripts/claude-workflow-daemon.sh log",
-    "check": "node --check js/cli/claude-workflow.js js/cli/claude-workflow-daemon.js js/anthropic-gateway-index.js js/gateway/anthropic-format.js js/gateway/codex-provider.js js/gateway/config.js js/gateway/model-routing.js js/gateway/proxy.js js/gateway/server.js js/gateway/trace.js js/gateway/workflow-config.js js/utils/env-loader.js js/utils/safe-path.js test/gateway.test.js test/lifecycle/_helpers.js",
-    "test": "node test/gateway.test.js"
+    "check": "node --check js/cli/claude-workflow.js js/cli/claude-workflow-daemon.js js/anthropic-gateway-index.js js/gateway/anthropic-format.js js/gateway/codex-provider.js js/gateway/config.js js/gateway/model-routing.js js/gateway/proxy.js js/gateway/server.js js/gateway/trace.js js/gateway/workflow-config.js js/utils/env-loader.js js/utils/safe-path.js test/gateway.test.js test/glm/live-glm-gateway.js test/lifecycle/_helpers.js",
+    "test": "node test/gateway.test.js",
+    "test:live:glm": "node test/glm/live-glm-gateway.js"
   },
   "keywords": [
     "claude-code",

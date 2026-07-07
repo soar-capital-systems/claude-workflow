@@ -34,6 +34,14 @@ const DEEPSEEK_PROFILE_ENV = Object.freeze({
     'ULTRATHINK_DEEPSEEK_REASONING_EFFORT',
   ],
 });
+const GLM_PROFILE_ENV = Object.freeze({
+  model: ['ULTRATHINK_GATEWAY_GLM_MODEL', 'GLM_DEFAULT_MODEL_ID', 'ZAI_DEFAULT_MODEL_ID'],
+  reasoningEffort: [
+    'ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT',
+    'ULTRATHINK_GLM_REASONING_EFFORT',
+    'ZAI_REASONING_EFFORT',
+  ],
+});
 
 function firstDefinedString(...values) {
   for (const value of values) {
@@ -129,10 +137,21 @@ function deepSeekProfileValue(key, fallback) {
   return firstEnvString(DEEPSEEK_PROFILE_ENV[key], fallback);
 }
 
-function deepSeekThinking() {
+function glmProfileValue(key, fallback) {
+  return firstEnvString(GLM_PROFILE_ENV[key], fallback);
+}
+
+function thinkingForProvider(provider) {
   const thinkingLevel = firstEnvString(['ULTRATHINK_THINKING_LEVEL']).toUpperCase();
   if (thinkingLevel === 'OFF') {
     return { type: 'disabled' };
+  }
+
+  if (provider === 'glm') {
+    return {
+      type: 'enabled',
+      clear_thinking: false,
+    };
   }
 
   return { type: 'enabled' };
@@ -270,7 +289,24 @@ export function loadGatewayConfig() {
       ),
       model: deepSeekProfileValue('model', 'deepseek-v4-pro'),
       reasoningEffort: deepSeekProfileValue('reasoningEffort', 'max'),
-      thinking: deepSeekThinking(),
+      thinking: thinkingForProvider('deepseek'),
+    },
+    glm: {
+      apiKey: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_GLM_API_KEY,
+        process.env.ZAI_API_KEY,
+        process.env.GLM_API_KEY,
+        ''
+      ),
+      baseUrl: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_GLM_BASE_URL,
+        process.env.ZAI_BASE_URL,
+        process.env.GLM_BASE_URL,
+        'https://api.z.ai/api/coding/paas/v4'
+      ),
+      model: glmProfileValue('model', 'glm-5.2'),
+      reasoningEffort: glmProfileValue('reasoningEffort', 'max'),
+      thinking: thinkingForProvider('glm'),
     },
     anthropic: {
       apiKey: firstDefinedString(

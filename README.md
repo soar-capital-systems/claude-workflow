@@ -155,11 +155,35 @@ DeepSeek V4 uses a 1M context window by default, so `[1m]` Claude aliases can ma
 DeepSeek thinking is enabled by default and sends `reasoning_effort=max`.
 Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
 
+GLM main route:
+
+```bash
+ULTRATHINK_GATEWAY_MAIN_PROVIDER=glm
+ULTRATHINK_GATEWAY_MAIN_MODEL_ID=glm-5.2[1m]
+ULTRATHINK_GATEWAY_GLM_API_KEY=your_zai_api_key
+ULTRATHINK_GATEWAY_GLM_MODEL=glm-5.2
+ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT=max
+# Optional explicit default endpoint:
+# ULTRATHINK_GATEWAY_GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
+# Optional opt-out: ULTRATHINK_THINKING_LEVEL=OFF
+```
+
+GLM routes use Z.ai's OpenAI-compatible Coding Plan endpoint. `ZAI_API_KEY` and `GLM_API_KEY` are also accepted for local configuration.
+GLM 5.2 uses `glm-5.2` upstream. Client-visible aliases such as `glm-5.2[1m]` are exposed to Claude Code but stripped before the Z.ai API call.
+GLM thinking is enabled by default with `thinking.type=enabled`, `clear_thinking=false`, and `reasoning_effort=max`. GLM routes preserve `reasoning_content` across tool-result turns.
+
 Standalone route-map entries can also use exact keys or wildcard keys. Exact keys win before wildcard keys:
 
 ```bash
 ULTRATHINK_GATEWAY_EXPOSED_MODELS=claude-fable-5[1m]
 ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"claude-fable-5*":{"provider":"deepseek","model":"deepseek-v4-pro","reasoningEffort":"max","displayName":"Fable 5 via DeepSeek V4 Pro"}}'
+```
+
+GLM route-map entries use the same shape:
+
+```bash
+ULTRATHINK_GATEWAY_EXPOSED_MODELS=glm-5.2[1m]
+ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"glm-5.2[1m]":{"provider":"glm","model":"glm-5.2","reasoningEffort":"max","displayName":"GLM 5.2"}}'
 ```
 
 Wildcard route-map keys match requests, but they are not concrete model ids. Set `ULTRATHINK_GATEWAY_EXPOSED_MODELS` when a standalone client depends on `/v1/models` discovery.
@@ -193,6 +217,7 @@ Endpoints:
 npm install
 npm run check
 npm test
+npm run test:live:glm
 ```
 
-The gateway test suite uses fake Claude/Codex app-server processes for offline coverage of routing, streaming, tool calls, session reuse, startup reservations, proxy behavior, and launcher preflight handling.
+The gateway test suite uses fake Claude/Codex app-server processes for offline coverage of routing, streaming, tool calls, session reuse, startup reservations, proxy behavior, and launcher preflight handling. `npm run test:live:glm` spends live Z.ai quota only when `ULTRATHINK_GATEWAY_GLM_API_KEY`, `ZAI_API_KEY`, or `GLM_API_KEY` is set.

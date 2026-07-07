@@ -5,6 +5,7 @@ import {
   estimateAnthropicInputTokens,
   formatAnthropicError,
   mapOpenAiFinishReason,
+  openAiUsageToAnthropicUsage,
   translateAnthropicMessagesRequestWithOptions,
   translateOpenAiResponseToAnthropic,
 } from './anthropic-format.js';
@@ -202,6 +203,9 @@ function openAiCompatibleConfig(config, route) {
   if (route.provider === 'deepseek') {
     return config.deepseek;
   }
+  if (route.provider === 'glm') {
+    return config.glm;
+  }
 
   return config.openai;
 }
@@ -217,8 +221,15 @@ function openAiCompatibleProviderLabel(route) {
   if (route.provider === 'deepseek') {
     return 'DeepSeek';
   }
+  if (route.provider === 'glm') {
+    return 'GLM';
+  }
 
   return 'OpenAI-compatible';
+}
+
+function preservesOpenAiReasoningContent(route) {
+  return route.provider === 'deepseek' || route.provider === 'glm';
 }
 
 function toolReasoningCacheNamespace(req) {
@@ -246,7 +257,7 @@ function rememberToolCallReasoning(cache, key, reasoningContent) {
 }
 
 function openAiCompatibleTranslationOptions(req, route, toolReasoningCache) {
-  if (route.provider !== 'deepseek') {
+  if (!preservesOpenAiReasoningContent(route)) {
     return {};
   }
 
@@ -775,9 +786,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
             state.messageId = payload.id;
           }
           if (payload.usage) {
-            state.usage = outputOnlyUsage({
-              output_tokens: payload.usage.completion_tokens || 0,
-            });
+            state.usage = openAiUsageToAnthropicUsage(payload.usage);
           }
 
           const choice = payload.choices?.[0];
@@ -892,13 +901,6 @@ function sameUsage(left, right) {
     usageValue(left, 'cache_read_input_tokens') ===
       usageValue(right, 'cache_read_input_tokens')
   );
-}
-
-function outputOnlyUsage(usage) {
-  return {
-    input_tokens: 0,
-    output_tokens: usage?.output_tokens || 0,
-  };
 }
 
 function codexOutcomeToAnthropic(outcome, requestedModel) {
@@ -1216,6 +1218,7 @@ async function handleCountTokens(req, res, config, signal) {
     }
     case 'codex':
     case 'deepseek':
+    case 'glm':
     case 'openai':
       res.json({
         input_tokens: estimateAnthropicInputTokens(req.body),
@@ -1260,6 +1263,7 @@ async function handleMessages(
       await handleCodexJson(req, res, config, codexSessions, route, requestTracer);
       return route;
     case 'deepseek':
+    case 'glm':
     case 'openai':
       if (req.body?.stream === true) {
         await streamOpenAiAsAnthropic(req, res, config, route, signal, toolReasoningCache);
@@ -1292,6 +1296,9 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       deepseek_model: config.deepseek?.model || null,
       deepseek_reasoning_effort: config.deepseek?.reasoningEffort || null,
       deepseek_thinking: config.deepseek?.thinking?.type || null,
+      glm_model: config.glm?.model || null,
+      glm_reasoning_effort: config.glm?.reasoningEffort || null,
+      glm_thinking: config.glm?.thinking?.type || null,
       anthropic_passthrough_enabled: true,
       anthropic_passthrough_models: config.anthropicPassthroughModels || [],
       exposed_models: config.exposedModels || [],

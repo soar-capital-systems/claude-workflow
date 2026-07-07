@@ -408,8 +408,12 @@ function shouldTranslateToolChoice(route) {
   return !(route.provider === 'deepseek' && route.thinking?.type === 'enabled');
 }
 
+function supportsThinkingControls(route) {
+  return route.provider === 'deepseek' || route.provider === 'glm';
+}
+
 function shouldTranslateReasoningEffort(route) {
-  return !(route.provider === 'deepseek' && route.thinking?.type === 'disabled');
+  return !(supportsThinkingControls(route) && route.thinking?.type === 'disabled');
 }
 
 function parseToolArguments(toolCall) {
@@ -541,6 +545,19 @@ export function mapOpenAiFinishReason(finishReason) {
   return 'end_turn';
 }
 
+export function openAiUsageToAnthropicUsage(usage) {
+  const normalized = {
+    input_tokens: usage?.prompt_tokens || 0,
+    output_tokens: usage?.completion_tokens || 0,
+  };
+  const cachedTokens = Number(usage?.prompt_tokens_details?.cached_tokens || 0);
+  if (cachedTokens > 0) {
+    normalized.cache_read_input_tokens = cachedTokens;
+  }
+
+  return normalized;
+}
+
 export function translateOpenAiResponseToAnthropic(
   responseBody,
   requestedModel,
@@ -584,10 +601,7 @@ export function translateOpenAiResponseToAnthropic(
     content,
     stop_reason: mapOpenAiFinishReason(choice.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: responseBody.usage?.prompt_tokens || 0,
-      output_tokens: responseBody.usage?.completion_tokens || 0,
-    },
+    usage: openAiUsageToAnthropicUsage(responseBody.usage),
   };
 }
 

@@ -23,6 +23,7 @@ const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
 const WORKFLOW_CODEX_INPUT_MAX_TOKENS = 180_000;
 const WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR = 7;
 const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
+const GLM_AUTO_COMPACT_WINDOW = '1000000';
 const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
 const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
 
@@ -141,6 +142,8 @@ function mainRouteDefaultModel(provider, mainModelId, baseConfig) {
       return baseConfig.codex.model;
     case 'deepseek':
       return baseConfig.deepseek.model;
+    case 'glm':
+      return baseConfig.glm.model;
     case 'openai':
       return baseConfig.openai.model;
     default:
@@ -154,6 +157,8 @@ function mainRouteDefaultReasoningEffort(provider, baseConfig) {
       return baseConfig.codex.reasoningEffort;
     case 'deepseek':
       return baseConfig.deepseek.reasoningEffort;
+    case 'glm':
+      return baseConfig.glm.reasoningEffort;
     case 'openai':
       return baseConfig.openai.reasoningEffort;
     default:
@@ -169,6 +174,8 @@ function mainRouteDisplayName(provider) {
       return 'Codex Main Route';
     case 'deepseek':
       return 'DeepSeek Main Route';
+    case 'glm':
+      return 'GLM Main Route';
     case 'openai':
       return 'OpenAI-Compatible Main Route';
     default:
@@ -331,12 +338,22 @@ export function buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId) 
     ...buildWorkflowClaudeEnv(gatewayBaseUrl, subagentModelId),
   };
 
+  if (routeMapUsesProvider(config, 'glm') && !envString('CLAUDE_CODE_AUTO_COMPACT_WINDOW')) {
+    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = GLM_AUTO_COMPACT_WINDOW;
+  }
+
   if (config.sharedSecret) {
     clientEnv.ANTHROPIC_AUTH_TOKEN = config.sharedSecret;
     clientEnv.ANTHROPIC_API_KEY = config.sharedSecret;
   }
 
   return clientEnv;
+}
+
+function routeMapUsesProvider(config, provider) {
+  return Object.values(config.routeMap || {}).some(function hasProvider(route) {
+    return routeProvider(route, '') === provider;
+  });
 }
 
 export function buildWorkflowClaudeEnv(gatewayBaseUrl, subagentModelId) {

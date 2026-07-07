@@ -26,6 +26,7 @@ export class GatewayError extends Error {
 const ROUTE_PROVIDERS = Object.freeze({
   ANTHROPIC: 'anthropic',
   DEEPSEEK: 'deepseek',
+  GLM: 'glm',
   OPENAI: 'openai',
   CODEX: 'codex',
 });
@@ -33,6 +34,7 @@ const ROUTE_PROVIDERS = Object.freeze({
 const ROUTE_PROVIDER_BUILDERS = Object.freeze({
   [ROUTE_PROVIDERS.ANTHROPIC]: buildAnthropicRoute,
   [ROUTE_PROVIDERS.DEEPSEEK]: buildDeepSeekRoute,
+  [ROUTE_PROVIDERS.GLM]: buildGlmRoute,
   [ROUTE_PROVIDERS.OPENAI]: buildOpenAiRoute,
   [ROUTE_PROVIDERS.CODEX]: buildCodexRoute,
 });
@@ -186,11 +188,14 @@ function buildOpenAiCompatibleRoute(modelId, config, entry, options) {
     );
   }
 
-  const upstreamModel = routeEntryValue(
+  const configuredUpstreamModel = routeEntryValue(
     entry,
     ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
     providerConfig.model
   );
+  const upstreamModel = options.stripModelBracketQualifiers
+    ? modelIdWithoutBracketQualifiers(configuredUpstreamModel)
+    : configuredUpstreamModel;
   const reasoningEffort = routeEntryValue(
     entry,
     ROUTE_ENTRY_REASONING_KEYS,
@@ -237,6 +242,19 @@ function buildDeepSeekRoute(modelId, config, entry = null) {
     systemRole: 'system',
     missingKeyMessage:
       'DeepSeek routing is configured but ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY is missing',
+  });
+}
+
+function buildGlmRoute(modelId, config, entry = null) {
+  return buildOpenAiCompatibleRoute(modelId, config, entry, {
+    provider: ROUTE_PROVIDERS.GLM,
+    configKey: 'glm',
+    displayProvider: 'GLM',
+    maxTokensField: 'max_tokens',
+    systemRole: 'system',
+    stripModelBracketQualifiers: true,
+    missingKeyMessage:
+      'GLM routing is configured but ULTRATHINK_GATEWAY_GLM_API_KEY, ZAI_API_KEY, or GLM_API_KEY is missing',
   });
 }
 
@@ -303,7 +321,7 @@ function configuredProvider(entry, modelId) {
   throw new GatewayError(
     500,
     'api_error',
-    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "openai", or "anthropic"`
+    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "glm", "openai", or "anthropic"`
   );
 }
 

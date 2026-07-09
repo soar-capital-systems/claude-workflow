@@ -1645,6 +1645,39 @@ await runTest('Codex dynamic tool registry aliases reserved Claude tool names', 
   ok('reserved Claude tool names are remapped before reaching Codex app-server');
 });
 
+await runTest('Codex dynamic Read tool metadata teaches safe offsets', async function testCodexReadToolGuidance() {
+  const readSchema = {
+    type: 'object',
+    properties: {
+      file_path: { type: 'string' },
+      offset: { type: 'integer', description: 'Old offset docs.' },
+      limit: { type: 'integer', description: 'Old limit docs.' },
+      pages: { type: 'string' },
+    },
+    required: ['file_path'],
+    additionalProperties: false,
+  };
+  const registry = buildCodexDynamicToolRegistry([
+    {
+      name: 'Read',
+      description: 'Reads a file.',
+      input_schema: readSchema,
+    },
+  ]);
+  const tool = registry.dynamicTools[0];
+
+  assert.equal(tool.name, 'ext_tool_001');
+  assert.equal(registry.byInternalName.get('ext_tool_001')?.originalName, 'Read');
+  assert.match(tool.description, /Codex Read guidance/u);
+  assert.match(tool.description, /zero-based continuation index/u);
+  assert.match(tool.inputSchema.properties.offset.description, /Old offset docs/u);
+  assert.match(tool.inputSchema.properties.offset.description, /Displayed line numbers/u);
+  assert.match(tool.inputSchema.properties.limit.description, /Old limit docs/u);
+  assert.match(tool.inputSchema.properties.limit.description, /continuing a large file/u);
+  assert.equal(readSchema.properties.offset.description, 'Old offset docs.');
+  ok('Read tools receive Codex-specific offset guidance without mutating Claude tool schemas');
+});
+
 await runTest('Codex session manager reuses the pending session when a matching tool_result arrives', async function testToolResultSessionReuse() {
   const createdSessions = [];
   const manager = stubCodexSessionManager(function recordSession(sessionKey, session) {
@@ -2577,6 +2610,356 @@ await runTest(
           },
         ]);
         ok('parallel Codex tool calls reject later calls while preserving the first pending tool_result path');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server sanitizes unsafe Read arguments and returns offset feedback',
+  async function testCodexReadArgumentsAndFeedback() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-feedback-'));
+    const codexPath = path.join(tempDir, 'codex-read-feedback');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-read-feedback";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_read', method: 'item/tool/call', params: { turnId, callId: 'call_read', tool: 'ext_tool_001', arguments: { file_path: '/tmp/example.txt', offset: 1300000, limit: '20', pages: '' } } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_read') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        const { entries, tracer } = captureTracer();
+        manager = new CodexSessionManager(
+          {
+            requestTimeoutMs: 5_000,
+            codex: {
+              command: codexPath,
+              cwd: tempDir,
+              idleTimeoutMs: 0,
+              inputMaxTokens: 10_000,
+              toolResultMaxBytes: 10_000,
+            },
+          },
+          { tracer }
+        );
+        const tools = [
+          {
+            name: 'Read',
+            description: 'Reads a file.',
+            input_schema: {
+              type: 'object',
+              properties: {
+                file_path: { type: 'string' },
+                offset: { type: 'integer' },
+                limit: { type: 'integer' },
+                pages: { type: 'string' },
+              },
+              required: ['file_path'],
+              additionalProperties: false,
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Read the file carefully.' }],
+          tools,
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_read',
+          name: 'Read',
+          input: {
+            file_path: '/tmp/example.txt',
+            limit: 20,
+          },
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Read the file carefully.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_read',
+                    name: 'Read',
+                    input: toolUse.toolCall.input,
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_read',
+                    content: 'File has 331 lines, but offset 1300000 was requested.',
+                    is_error: true,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = responses.find(function findReadResponse(message) {
+          return message.id === 'tool_req_read';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+        const sanitizeTrace = entries.find(function findSanitizeTrace(entry) {
+          return entry.event === 'codex.read_tool.arguments_sanitized';
+        });
+        const inputTrace = entries.find(function findInputTrace(entry) {
+          return entry.event === 'codex.turn.input_prepared';
+        });
+        const resultTrace = entries.find(function findResultTrace(entry) {
+          return entry.event === 'codex.tool_result.continued';
+        });
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(continuedCall.result.success, false);
+        assert.match(continuedText, /Proxy Read offset note:/u);
+        assert.match(continuedText, /exceeds the gateway rewrite threshold/u);
+        assert.match(continuedText, /Codex Read guidance:/u);
+        assert.match(continuedText, /zero-based continuation index/u);
+        assert.deepEqual(sanitizeTrace.details.sanitization.reasons, [
+          'empty_pages_removed',
+          'offset_exceeds_rewrite_threshold',
+          'limit_normalized',
+        ]);
+        assert.equal(sanitizeTrace.details.sanitization.sanitized_limit, 20);
+        assert.equal(sanitizeTrace.details.sanitization.empty_pages_removed, true);
+        assert.equal(inputTrace.details.summary.message_count, 1);
+        assert.equal(inputTrace.details.summary.text_bytes > 0, true);
+        assert.equal(resultTrace.details.read_result_feedback.rewriteNoteAppended, true);
+        assert.equal(resultTrace.details.read_result_feedback.guidanceAppended, true);
+        assert.equal(resultTrace.details.read_sanitization.offset_removed, true);
+        ok('unsafe Read offset requests are rewritten before Claude runs the tool and explained afterward');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server truncates large Read results with continuation metadata',
+  async function testCodexReadResultTruncation() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-truncate-'));
+    const codexPath = path.join(tempDir, 'codex-read-truncate');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-read-truncate";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_read_truncate', method: 'item/tool/call', params: { turnId, callId: 'call_read_truncate', tool: 'ext_tool_001', arguments: { file_path: '/tmp/big.txt' } } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_read_truncate') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        const { entries, tracer } = captureTracer();
+        manager = new CodexSessionManager(
+          {
+            requestTimeoutMs: 5_000,
+            codex: {
+              command: codexPath,
+              cwd: tempDir,
+              idleTimeoutMs: 0,
+              inputMaxTokens: 10_000,
+              toolResultMaxBytes: 900,
+            },
+          },
+          { tracer }
+        );
+        const tools = [
+          {
+            name: 'Read',
+            input_schema: {
+              type: 'object',
+              properties: {
+                file_path: { type: 'string' },
+                offset: { type: 'integer' },
+                limit: { type: 'integer' },
+              },
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Read a large file.' }],
+          tools,
+        };
+        const rawResult = Array.from({ length: 120 }, function line(_, index) {
+          return `line-${String(index + 1).padStart(3, '0')} ${'x'.repeat(24)}`;
+        }).join('\n');
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_read_truncate',
+          name: 'Read',
+          input: {
+            file_path: '/tmp/big.txt',
+          },
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Read a large file.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_read_truncate',
+                    name: 'Read',
+                    input: toolUse.toolCall.input,
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_read_truncate',
+                    content: rawResult,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = responses.find(function findReadResponse(message) {
+          return message.id === 'tool_req_read_truncate';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+        const resultTrace = entries.find(function findResultTrace(entry) {
+          return entry.event === 'codex.tool_result.continued';
+        });
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.match(continuedText, /^Warning: truncated Read output/u);
+        assert.match(continuedText, /Total output lines: 120/u);
+        assert.match(continuedText, /Read output omitted to fit Codex context budget/u);
+        assert.match(continuedText, /For continuation reads/u);
+        assert.equal(continuedText.includes('line-001'), true);
+        assert.equal(continuedText.includes('line-060'), false);
+        assert.equal(continuedText.includes('line-120'), true);
+        assert.equal(resultTrace.details.read_tool_result, true);
+        assert.equal(resultTrace.details.tool_result_truncated, true);
+        assert.equal(resultTrace.details.raw_result_bytes > resultTrace.details.result_bytes, true);
+        ok('large Read results preserve boundaries and continuation instructions when shortened');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -4597,6 +4980,84 @@ await runTest('Codex context-ish 502s that miss recovery matching are traced', a
   );
   ok('context-like Codex 502 wording drift is traceable even when recovery does not engage');
 });
+
+await runTest(
+  'Codex Read diagnostics cannot mask context-like provider failures',
+  async function testCodexReadDiagnosticsDoNotThrow() {
+    const { entries, tracer } = captureTracer();
+    const manager = new CodexSessionManager(
+      {
+        codex: {
+          idleTimeoutMs: 0,
+          forkIdleTimeoutMs: 0,
+          maxSessions: 16,
+        },
+      },
+      {
+        tracer,
+        createSession(route, req, requestBody, sessionKey) {
+          return stubCodexSession(sessionKey, {
+            pendingToolCall: {
+              callId: 'call_read_bad_result',
+              tool: 'Read',
+              readSanitization: null,
+            },
+            async advance() {
+              throw new GatewayError(
+                502,
+                'api_error',
+                'provider input token budget exceeded before generation'
+              );
+            },
+          });
+        },
+      }
+    );
+
+    await assert.rejects(
+      manager.processRequest(
+        claudeSessionRequest('session-context-read-diagnostics'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_read_bad_result',
+                  content: [
+                    {
+                      type: 'image',
+                      source: {
+                        type: 'base64',
+                        media_type: 'image/png',
+                        data: 'x',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      ),
+      /token budget exceeded/u
+    );
+
+    const driftTrace = entries.find(function findDriftTrace(entry) {
+      return entry.event === 'codex.session.context_recovery_unmatched';
+    });
+    assert.equal(Boolean(driftTrace), true);
+    assert.match(
+      driftTrace.details.read_context.read_tool_result_parse_error,
+      /unsupported tool_result content block type/u
+    );
+    ok('Read diagnostic tracing records malformed results without replacing the provider failure');
+  }
+);
 
 await runTest(
   'Codex autocompact-thrash final text recovers as context overflow',

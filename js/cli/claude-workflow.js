@@ -32,6 +32,8 @@ const CLAUDE_SESSION_FLAGS = new Set([
   ...CLAUDE_OPTIONAL_VALUE_FLAGS,
   ...CLAUDE_REQUIRED_VALUE_FLAGS,
 ]);
+const CLAUDE_MODEL_FLAGS = new Set(['--model', '-m']);
+const CLAUDE_PERMISSION_MODE_FLAGS = new Set(['--permission-mode']);
 
 function usage() {
   return [
@@ -40,6 +42,7 @@ function usage() {
     '  claude-workflow "Use a workflow to delegate a tiny subagent task."',
     '  claude-workflow --resume <session-id>',
     '  claude-workflow --continue',
+    '  claude-workflow -- <claude options or command>',
     '',
     'Behavior:',
     '  - no arguments: starts normal interactive Claude Code on the configured main/frontier model through a local gateway',
@@ -47,20 +50,25 @@ function usage() {
     '  - Workflow subagents default to a Codex/GPT-labeled model id mapped to a Codex route',
     '  - routed subagent responses also report Codex/GPT metadata in Claude Code UI by default',
     '  - sonnet/haiku/opus alias slots remap to the routed subagent model id, so alias-pinned agents display and use the Codex-backed id (override with ANTHROPIC_DEFAULT_SONNET_MODEL etc.)',
-    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), Codex auto-compaction uses body-after-prefix scope, dynamic tool results are byte-capped per result and per session, and live sessions recycle before the window can overflow',
+    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), Codex auto-compaction uses body-after-prefix scope, upstream Codex owns token-aware dynamic-tool truncation by default, and live sessions recycle before the window can overflow',
     '  - workflows launched or resumed outside claude-workflow need the shared gateway daemon (claude-workflow-gateway) or routed model ids will 404 at Anthropic',
     '  - other non-frontier Claude model ids also route to Codex by default',
     '  - with prompt text: runs a one-shot "claude -p" prompt through the same gateway',
     '  - --resume, -r, --continue, -c, --fork-session, --from-pr, and --session-id pass through to interactive Claude',
-    '  - interactive and one-shot launches default to --dangerously-skip-permissions auto mode',
-    '  - --yolo and --dangerously-skip-permissions keep auto mode explicit',
+    '  - use -- before any other Claude option or command; unknown wrapper flags fail instead of becoming prompt text',
+    '  - interactive and one-shot launches intentionally default to --dangerously-skip-permissions',
+    '  - --yolo and --dangerously-skip-permissions keep permission bypass explicit',
     '  - --no-yolo or CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false restores permission prompts',
+    '  - an explicit Claude --permission-mode after -- also disables the default bypass flag',
+    '  - claude-workflow owns --model; configure ULTRATHINK_GATEWAY_MAIN_MODEL_ID instead',
+    '  - permission bypass is unsafe in untrusted repositories or on machines that are not otherwise isolated',
     '',
     'Requirements:',
     '  - claude CLI on PATH',
     '  - codex CLI on PATH and already logged in (for Codex-backed routed models)',
     '  - Claude Code local auth or gateway-compatible Anthropic auth for Anthropic passthrough',
-    '  - optional overrides can live in ~/.ultrathink.env or .env',
+    '  - trusted overrides can live in ~/.claude-workflow.env (legacy ~/.ultrathink.env is also read)',
+    '  - project .env is ignored unless CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true is set in the parent shell',
   ].join('\n');
 }
 
@@ -143,11 +151,32 @@ function parseCliArgs(rawArgs) {
     envFlag('ULTRATHINK_WORKFLOWS_SKIP_PERMISSIONS', true)
   );
   let passthrough = false;
+  let claudeOptionsEnded = false;
+  let interactiveSession = false;
 
   for (let index = 0; index < rawArgs.length; index += 1) {
     const arg = rawArgs[index];
     if (passthrough) {
-      promptArgs.push(arg);
+      if (claudeOptionsEnded) {
+        claudeArgs.push(arg);
+        continue;
+      }
+      if (arg === '--') {
+        claudeOptionsEnded = true;
+        claudeArgs.push(arg);
+        continue;
+      }
+      const equalsIndex = arg.indexOf('=');
+      const flagName = equalsIndex > 0 ? arg.slice(0, equalsIndex) : arg;
+      if (CLAUDE_MODEL_FLAGS.has(flagName)) {
+        throw new Error(
+          `${flagName} is managed by claude-workflow; set ULTRATHINK_GATEWAY_MAIN_MODEL_ID instead`
+        );
+      }
+      if (CLAUDE_PERMISSION_MODE_FLAGS.has(flagName)) {
+        skipPermissions = false;
+      }
+      claudeArgs.push(arg);
       continue;
     }
 
@@ -169,6 +198,7 @@ function parseCliArgs(rawArgs) {
     const equalsIndex = arg.indexOf('=');
     const flagName = equalsIndex > 0 ? arg.slice(0, equalsIndex) : arg;
     if (CLAUDE_SESSION_FLAGS.has(flagName)) {
+      interactiveSession = true;
       claudeArgs.push(arg);
       if (
         equalsIndex < 0 &&
@@ -184,11 +214,18 @@ function parseCliArgs(rawArgs) {
       continue;
     }
 
+    if (arg.startsWith('-')) {
+      throw new Error(
+        `unknown claude-workflow option ${arg}; pass Claude CLI options after --`
+      );
+    }
+
     promptArgs.push(arg);
   }
 
   return {
     claudeArgs,
+    interactiveSession,
     promptArgs,
     skipPermissions,
   };
@@ -236,8 +273,14 @@ function buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId) {
   return buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId);
 }
 
-function buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions) {
-  if (claudeArgs.length > 0 || promptArgs.length === 0) {
+function buildClaudeArgs(
+  mainModelId,
+  claudeArgs,
+  promptArgs,
+  skipPermissions,
+  interactiveSession = false
+) {
+  if (interactiveSession || promptArgs.length === 0) {
     const nextArgs = ['--model', mainModelId, ...claudeArgs, ...promptArgs];
     if (skipPermissions) {
       nextArgs.unshift('--dangerously-skip-permissions');
@@ -245,7 +288,7 @@ function buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions) {
     return nextArgs;
   }
 
-  const nextArgs = ['-p', '--model', mainModelId, promptArgs.join(' ')];
+  const nextArgs = ['-p', '--model', mainModelId, ...claudeArgs, promptArgs.join(' ')];
   if (skipPermissions) {
     nextArgs.splice(1, 0, '--dangerously-skip-permissions');
   }
@@ -330,12 +373,13 @@ async function closeGateway(runtime) {
 
 async function main() {
   const rawArgs = process.argv.slice(2);
-  const { claudeArgs, promptArgs, skipPermissions } = parseCliArgs(rawArgs);
 
   if (isHelpRequest(rawArgs)) {
     process.stdout.write(`${usage()}\n`);
     return;
   }
+
+  const { claudeArgs, interactiveSession, promptArgs, skipPermissions } = parseCliArgs(rawArgs);
 
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildWorkflowGatewayConfig();
@@ -386,7 +430,13 @@ async function main() {
     }
 
     const exitCode = await runClaude(
-      buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions),
+      buildClaudeArgs(
+        mainModelId,
+        claudeArgs,
+        promptArgs,
+        skipPermissions,
+        interactiveSession
+      ),
       buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId),
       function onChild(child) {
         claudeChild = child;

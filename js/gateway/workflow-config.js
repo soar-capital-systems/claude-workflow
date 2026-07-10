@@ -23,6 +23,11 @@ const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
 const WORKFLOW_CODEX_INPUT_MAX_TOKENS = 180_000;
 const WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR = 7;
 const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
+// Current Codex app-server releases own token-aware tool-output truncation.
+// Avoid layering the gateway's byte heuristics on top for workflow sessions;
+// operators can still opt into either gateway cap with its existing env var.
+const WORKFLOW_CODEX_TOOL_RESULT_MAX_BYTES = 0;
+const WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES = 0;
 const GLM_AUTO_COMPACT_WINDOW = '1000000';
 const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
 const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
@@ -184,6 +189,14 @@ function mainRouteDisplayName(provider) {
 }
 
 function routedModelId(provider, upstreamModel, reasoningEffort, requestedModel) {
+  const durableCodexTier =
+    provider === 'codex'
+      ? String(upstreamModel || '').match(/^gpt-\d+(?:\.\d+)*-(sol|terra|luna)$/u)?.[1]
+      : null;
+  if (durableCodexTier) {
+    return `codex-${durableCodexTier}`;
+  }
+
   const effort = reasoningEffort ? `-${modelIdPart(reasoningEffort)}` : '';
   return [
     `${modelIdPart(provider)}-${modelIdPart(upstreamModel)}${effort}`,
@@ -218,7 +231,12 @@ function parseRequestedPort(defaultPort = 0) {
   return parsed;
 }
 
-export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}) {
+export function buildWorkflowGatewayConfig({
+  defaultPort = 0,
+  port = null,
+  host = null,
+  dynamicToolsOnly = false,
+} = {}) {
   const baseConfig = loadGatewayConfig();
   const mainModelId = envString('ULTRATHINK_GATEWAY_MAIN_MODEL_ID', DEFAULT_MAIN_MODEL_ID);
   const mainProvider = normalizedRouteProvider(
@@ -234,7 +252,7 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
   );
   const rawSubagentModelId = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID',
-    'claude-sonnet-4-7'
+    'claude-sonnet-5'
   );
   const subagentUpstreamModel = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL',
@@ -242,7 +260,7 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
   );
   const subagentReasoningEffort = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT',
-    'medium'
+    'max'
   );
   const subagentVerbosity = envString('ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY', 'high');
   const defaultMainRoute = {
@@ -269,6 +287,16 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
   )
     ? baseConfig.codex.autoCompactTokenLimit
     : workflowAutoCompactTokenLimit(codexInputMaxTokens);
+  const codexToolResultMaxBytes = envString(
+    'ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES'
+  )
+    ? baseConfig.codex.toolResultMaxBytes
+    : WORKFLOW_CODEX_TOOL_RESULT_MAX_BYTES;
+  const codexToolResultWindowMaxBytes = envString(
+    'ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES'
+  )
+    ? baseConfig.codex.toolResultWindowMaxBytes
+    : WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES;
   const subagentModelId = displayModels
     ? envString(
         'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID',
@@ -292,7 +320,7 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
     ...baseRouteMap,
   };
   // Keep only the frontier main model family on Anthropic. Every other Claude id
-  // (Opus, Sonnet, Haiku, ...) falls through to the Codex gpt-5.5 route unless
+  // (Opus, Sonnet, Haiku, ...) falls through to the configured Codex route unless
   // the operator pins their own passthrough list. Frontier dated variants
   // (e.g. claude-fable-5[1m]-20260601) stay on Anthropic via the trailing wildcard.
   const passthroughEnvProvided =
@@ -305,18 +333,21 @@ export function buildWorkflowGatewayConfig({ defaultPort = 0, port = null } = {}
   return {
     config: {
       ...baseConfig,
-      host: envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
+      host: host ?? envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
       port: port ?? parseRequestedPort(defaultPort),
       displayRoutedModel: displayModels,
       routeMap,
       anthropicPassthroughModels,
       codex: {
         ...baseConfig.codex,
+        dynamicToolsOnly: Boolean(dynamicToolsOnly),
         idleTimeoutMs: envString('ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS')
           ? baseConfig.codex.idleTimeoutMs
           : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
         inputMaxTokens: codexInputMaxTokens,
         autoCompactTokenLimit: codexAutoCompactTokenLimit,
+        toolResultMaxBytes: codexToolResultMaxBytes,
+        toolResultWindowMaxBytes: codexToolResultWindowMaxBytes,
       },
       exposedModels: dedupeStrings([
         ...routeModelAliases(mainModelId),

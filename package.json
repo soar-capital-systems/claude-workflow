@@ -6,7 +6,7 @@
   "private": true,
   "bin": {
     "claude-workflow": "js/cli/claude-workflow.js",
-    "claude-workflow-gateway": "js/cli/claude-workflow-daemon.js"
+    "claude-workflow-gateway": "scripts/claude-workflow-daemon.sh"
   },
   "scripts": {
     "start": "node js/cli/claude-workflow.js",
@@ -15,8 +15,11 @@
     "daemon:status": "bash scripts/claude-workflow-daemon.sh status",
     "daemon:stop": "bash scripts/claude-workflow-daemon.sh stop",
     "daemon:log": "bash scripts/claude-workflow-daemon.sh log",
-    "check": "node --check js/cli/claude-workflow.js js/cli/claude-workflow-daemon.js js/anthropic-gateway-index.js js/gateway/anthropic-format.js js/gateway/codex-provider.js js/gateway/config.js js/gateway/model-routing.js js/gateway/proxy.js js/gateway/server.js js/gateway/trace.js js/gateway/workflow-config.js js/utils/env-loader.js js/utils/safe-path.js test/gateway.test.js test/glm/live-glm-gateway.js test/lifecycle/_helpers.js",
-    "test": "node test/gateway.test.js",
+    "check": "node scripts/check-syntax.mjs",
+    "test": "npm run -s check && npm run -s test:gateway",
+    "test:gateway": "node test/gateway.test.js && node test/codex-provider-hardening.test.js && node test/daemon-observability.test.js && node --test test/security-hardening.test.js",
+    "test:package": "node test/package-install-smoke.test.js",
+    "prepack": "npm run -s check",
     "test:live:glm": "node test/glm/live-glm-gateway.js"
   },
   "keywords": [
@@ -46,6 +49,11 @@
   "files": [
     "js",
     "scripts",
+    ".env.example",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "docs",
     "README.md",
     "LICENSE"
   ]

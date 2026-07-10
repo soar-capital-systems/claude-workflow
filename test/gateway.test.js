@@ -209,8 +209,8 @@ function parseSsePayloads(text) {
 }
 
 const CODEX_REQUEST_MODEL = 'claude-sonnet-4-7';
-const CODEX_UPSTREAM_MODEL = 'gpt-5.5';
-const WORKFLOW_DISPLAY_SUBAGENT_MODEL = 'codex-gpt-5.5-medium-via-claude-sonnet-4-7';
+const CODEX_UPSTREAM_MODEL = 'gpt-5.6-terra';
+const WORKFLOW_DISPLAY_SUBAGENT_MODEL = 'codex-terra';
 const CLEAN_PROXY_ENV = Object.freeze({
   HTTP_PROXY: '',
   http_proxy: '',
@@ -238,7 +238,12 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: '',
   ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '',
   ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: '',
+  ULTRATHINK_GATEWAY_CODEX_MODEL: '',
+  ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_CODEX_VERBOSITY: '',
   ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '',
+  ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES: '',
+  ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: '',
@@ -251,6 +256,9 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_MAIN_PROVIDER: '',
   ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL: '',
+  ULTRATHINK_GATEWAY_OPENAI_MODEL: '',
+  ULTRATHINK_GATEWAY_OPENAI_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_OPENAI_VERBOSITY: '',
   ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID: '',
   ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: '',
@@ -996,6 +1004,41 @@ await runTest('gateway defaults Codex-backed routes to writable never-approval s
   }
 });
 
+await runTest('gateway treats blank numeric env values as unset', async function testBlankNumericConfig() {
+  await withTemporaryEnv(
+    {
+      ULTRATHINK_GATEWAY_PORT: '',
+      ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS: '   ',
+      ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '',
+      ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS: '',
+      ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS: '',
+      ULTRATHINK_GATEWAY_TRACE_MAX_BYTES: '0',
+    },
+    async function assertBlankNumericFallbacks() {
+      const config = loadGatewayConfig();
+      assert.equal(config.port, 4319);
+      assert.equal(config.requestTimeoutMs, 5 * 60_000);
+      assert.equal(config.codex.inputMaxTokens, 192_000);
+      assert.equal(config.codex.maxSessions, 16);
+      assert.equal(config.codex.pendingToolTimeoutMs, 10 * 60_000);
+      assert.equal(config.traceMaxBytes, 256);
+      ok('blank numeric environment variables no longer clamp to their minimum values');
+    }
+  );
+});
+
+await runTest('gateway accepts conventional false values for Codex routing', async function testCodexEnabledFlag() {
+  for (const disabledValue of ['0', 'false', 'no', 'off']) {
+    await withTemporaryEnv(
+      { ULTRATHINK_GATEWAY_CODEX_ENABLED: disabledValue },
+      async function assertDisabledFlag() {
+        assert.equal(loadGatewayConfig().codex.enabled, false);
+      }
+    );
+  }
+  ok('Codex routing boolean parsing is consistent with the other gateway flags');
+});
+
 await runTest('gateway can make a configured frontier model the only Anthropic passthrough default', async function testConfigurableAnthropicPassthroughModels() {
   await withTemporaryEnv(
     {
@@ -1010,7 +1053,7 @@ await runTest('gateway can make a configured frontier model the only Anthropic p
       assert.equal(frontierRoute.provider, 'anthropic');
       assert.equal(frontierRoute.upstreamModel, 'claude-fable-5');
       assert.equal(olderOpusRoute.provider, 'codex');
-      assert.equal(olderOpusRoute.upstreamModel, 'gpt-5.5');
+      assert.equal(olderOpusRoute.upstreamModel, CODEX_UPSTREAM_MODEL);
       ok('only the configured frontier model stays on Anthropic while older Claude ids route to Codex');
     }
   );
@@ -1040,6 +1083,17 @@ await runTest('gateway strips client-only [1m] qualifiers before Anthropic passt
   assert.equal(fableRoute.requestedModel, 'claude-fable-5[1m]');
   assert.equal(fableRoute.upstreamModel, 'claude-fable-5');
   ok('client-visible [1m] aliases use the plain Anthropic API model id upstream');
+});
+
+await runTest('workflow defaults never send the client-only [1m] qualifier upstream', async function testWorkflowMainAliasStripping() {
+  await withTemporaryEnv(CLEAN_WORKFLOW_ENV, async function assertWorkflowMainAlias() {
+    const { config, mainModelId } = buildWorkflowGatewayConfig();
+    const route = resolveModelRoute(mainModelId, config);
+    assert.equal(mainModelId, 'claude-fable-5[1m]');
+    assert.equal(route.provider, 'anthropic');
+    assert.equal(route.upstreamModel, 'claude-fable-5');
+    ok('workflow example/default aliases are resolved to a valid Anthropic model id');
+  });
 });
 
 await runTest('gateway wildcard route-map entries override passthrough patterns', async function testWildcardRouteMapEntry() {
@@ -1176,16 +1230,37 @@ await runTest(
 );
 
 await runTest(
-  'claude-workflow defaults Codex auto-compaction below its recycle budget',
-  async function testWorkflowCodexAutoCompactDefault() {
+  'claude-workflow defaults Codex context ownership to the upstream app-server',
+  async function testWorkflowCodexContextDefaults() {
     await withTemporaryEnv(
       CLEAN_WORKFLOW_ENV,
-      async function assertWorkflowCodexAutoCompactDefault() {
+      async function assertWorkflowCodexContextDefaults() {
         const { config } = buildWorkflowGatewayConfig();
         assert.equal(config.codex.inputMaxTokens, 180_000);
         assert.equal(config.codex.autoCompactTokenLimit, 126_000);
         assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
-        ok('workflow Codex sessions compact before they reach the gateway recycle threshold');
+        assert.equal(config.codex.toolResultMaxBytes, 0);
+        assert.equal(config.codex.toolResultWindowMaxBytes, 0);
+        ok('workflow Codex sessions use upstream token-aware tool-output truncation by default');
+      }
+    );
+  }
+);
+
+await runTest(
+  'claude-workflow preserves explicit gateway tool-result byte caps',
+  async function testWorkflowCodexToolResultOverrides() {
+    await withTemporaryEnv(
+      {
+        ...CLEAN_WORKFLOW_ENV,
+        ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES: '2048',
+        ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES: '8192',
+      },
+      async function assertWorkflowCodexToolResultOverrides() {
+        const { config } = buildWorkflowGatewayConfig();
+        assert.equal(config.codex.toolResultMaxBytes, 2048);
+        assert.equal(config.codex.toolResultWindowMaxBytes, 8192);
+        ok('operators can opt workflow sessions back into gateway byte caps');
       }
     );
   }
@@ -1213,16 +1288,29 @@ await runTest('gateway config exposes the Codex fork idle timeout', async functi
   );
 });
 
+await runTest('gateway config exposes the pending Codex tool timeout', async function testCodexPendingToolTimeoutConfig() {
+  await withTemporaryEnv(
+    { ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS: '25000' },
+    async function assertPendingToolTimeoutConfig() {
+      const config = loadGatewayConfig();
+      assert.equal(config.codex.pendingToolTimeoutMs, 25_000);
+      ok('pending dynamic-tool sessions have an independent bounded lifetime');
+    }
+  );
+});
+
 await runTest('gateway config exposes the Codex idle-pool defaults', async function testCodexIdlePoolDefaults() {
   await withTemporaryEnv(
     {
       ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS: undefined,
       ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS: undefined,
+      ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS: undefined,
     },
     async function assertIdlePoolDefaults() {
       const config = loadGatewayConfig();
       assert.equal(config.codex.forkIdleTimeoutMs, 30_000);
       assert.equal(config.codex.maxSessions, 16);
+      assert.equal(config.codex.pendingToolTimeoutMs, 10 * 60_000);
       ok('Codex idle-pool defaults are explicit in gateway config');
     }
   );
@@ -1577,7 +1665,7 @@ await runTest('gateway trace context keeps Claude session and routed model ident
     claude_parent_agent_id: 'parent-1',
     provider: 'codex',
     requested_model: 'claude-sonnet-4-7',
-    upstream_model: 'gpt-5.5',
+    upstream_model: CODEX_UPSTREAM_MODEL,
     sandbox: 'workspace-write',
     approval_policy: 'never',
   });
@@ -1645,7 +1733,7 @@ await runTest('Codex dynamic tool registry aliases reserved Claude tool names', 
   ok('reserved Claude tool names are remapped before reaching Codex app-server');
 });
 
-await runTest('Codex dynamic Read tool metadata teaches safe offsets', async function testCodexReadToolGuidance() {
+await runTest('Codex dynamic Read tool metadata teaches safe paging', async function testCodexReadToolGuidance() {
   const readSchema = {
     type: 'object',
     properties: {
@@ -1669,13 +1757,29 @@ await runTest('Codex dynamic Read tool metadata teaches safe offsets', async fun
   assert.equal(tool.name, 'ext_tool_001');
   assert.equal(registry.byInternalName.get('ext_tool_001')?.originalName, 'Read');
   assert.match(tool.description, /Codex Read guidance/u);
-  assert.match(tool.description, /zero-based continuation index/u);
+  assert.match(tool.description, /1-based source line/u);
+  assert.match(tool.description, /25,000 tokens or 256 KB/u);
   assert.match(tool.inputSchema.properties.offset.description, /Old offset docs/u);
-  assert.match(tool.inputSchema.properties.offset.description, /Displayed line numbers/u);
+  assert.match(tool.inputSchema.properties.offset.description, /1-based source line/u);
   assert.match(tool.inputSchema.properties.limit.description, /Old limit docs/u);
-  assert.match(tool.inputSchema.properties.limit.description, /continuing a large file/u);
+  assert.match(tool.inputSchema.properties.limit.description, /small explicit range/u);
   assert.equal(readSchema.properties.offset.description, 'Old offset docs.');
-  ok('Read tools receive Codex-specific offset guidance without mutating Claude tool schemas');
+  ok('Read tools receive source-accurate paging guidance without mutating Claude tool schemas');
+});
+
+await runTest('Codex dynamic shell tools teach bounded diff inspection', async function testCodexLargeOutputToolGuidance() {
+  const registry = buildCodexDynamicToolRegistry([
+    { name: 'Bash', description: 'Runs a command.', input_schema: { type: 'object' } },
+    { name: 'Grep', description: 'Searches files.', input_schema: { type: 'object' } },
+  ]);
+
+  for (const tool of registry.dynamicTools) {
+    assert.match(tool.description, /Codex large-output guidance/u);
+    assert.match(tool.description, /git diff --stat/u);
+    assert.match(tool.description, /every hunk can be accounted for/u);
+    assert.match(tool.description, /partial or truncated result as incomplete/u);
+  }
+  ok('Bash and Grep advertise a gap-aware large-diff protocol to routed Codex sessions');
 });
 
 await runTest('Codex session manager reuses the pending session when a matching tool_result arrives', async function testToolResultSessionReuse() {
@@ -1804,6 +1908,41 @@ await runTest('Codex session manager forks unrelated tool_result requests while 
   assert.equal(createdSessionKeys.length, 2);
   assert.match(createdSessionKeys[1], /:fork:/u);
   ok('unrelated tool_result requests no longer collide with a different pending tool_result');
+});
+
+await runTest('Codex tool_result routing ignores matching ids outside the latest user turn', async function testHistoricalToolResultDoesNotMatchPendingCall() {
+  const createdSessionKeys = [];
+  const manager = stubCodexSessionManager(function recordSessionKey(sessionKey) {
+    createdSessionKeys.push(sessionKey);
+  });
+  const route = codexRoute();
+  const req = claudeSessionRequest('session-historical-tool-result');
+  const canonical = manager.ensureSession(req, codexUserRequest('Primary request.'), route);
+  canonical.pendingToolCall = { callId: 'call_reused' };
+
+  await manager.processRequest(
+    req,
+    {
+      model: CODEX_REQUEST_MODEL,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_reused', content: 'stale old result' },
+          ],
+        },
+        { role: 'assistant', content: 'That result belongs to an older turn.' },
+        { role: 'user', content: 'Unrelated current request.' },
+      ],
+      tools: [],
+    },
+    route
+  );
+
+  assert.equal(createdSessionKeys.length, 2);
+  assert.match(createdSessionKeys[1], /:fork:/u);
+  assert.equal(canonical.pendingToolCall.callId, 'call_reused');
+  ok('historical tool results cannot hijack a pending call with a colliding id');
 });
 
 await runTest('Codex session manager forks unrelated side requests while the canonical turn is still in progress', async function testActiveBoundaryForking() {
@@ -1946,7 +2085,7 @@ await runTest('Codex session manager clears startup reservations after synchrono
   ok('non-evicted sessions do not keep stale routing reservations after request startup fails');
 });
 
-await runTest('Codex session manager protects startup reservations from pool eviction', async function testRoutingReservationBlocksPoolEviction() {
+await runTest('Codex session manager rejects admission while the pool is startup-reserved', async function testRoutingReservationBlocksPoolEviction() {
   const createdSessionKeys = [];
   const closedSessionKeys = [];
   let nextLastUsedAt = 1;
@@ -1987,22 +2126,25 @@ await runTest('Codex session manager protects startup reservations from pool evi
   assert.equal(createdSessionKeys.length, 1);
   assert.equal(manager.sessions.get(createdSessionKeys[0])?.routingReservation?.requestFingerprint !== undefined, true);
 
-  await manager.processRequest(
-    claudeSessionRequest('session-reserved-pool-2'),
-    codexUserRequest('Second request.'),
-    route
+  await assert.rejects(
+    manager.processRequest(
+      claudeSessionRequest('session-reserved-pool-2'),
+      codexUserRequest('Second request.'),
+      route
+    ),
+    /max_sessions=1/u
   );
   await sleep(0);
 
   assert.deepEqual(closedSessionKeys, []);
-  assert.equal(manager.sessions.size, 2);
+  assert.equal(manager.sessions.size, 1);
 
   reservedStartupResolve(finalOutcome());
   await first;
   await sleep(0);
 
-  assert.deepEqual(closedSessionKeys, [createdSessionKeys[1]]);
-  ok('max-session cleanup skips reserved startup sessions until their request settles');
+  assert.deepEqual(closedSessionKeys, []);
+  ok('hard pool admission preserves the reserved session without exceeding max_sessions');
 });
 
 await runTest('Codex session manager uses a shorter idle timeout for fork sessions', async function testForkSessionIdleTimeout() {
@@ -2053,7 +2195,7 @@ await runTest('Codex session manager treats blank manual fork timeouts as unset'
   ok('blank manual fork timeout values do not disable fork recycling');
 });
 
-await runTest('Codex session manager ignores Claude system prompt churn for session continuity', async function testSystemPromptChurn() {
+await runTest('Codex session manager isolates materially different system instructions', async function testSystemPromptChanges() {
   const createdSessionKeys = [];
   const manager = stubCodexSessionManager(
     function recordSessionKey(sessionKey) {
@@ -2095,8 +2237,9 @@ await runTest('Codex session manager ignores Claude system prompt churn for sess
     function noop() {}
   );
 
-  assert.equal(createdSessionKeys.length, 1);
-  ok('changing Claude system prompt text no longer shards the routed Codex session');
+  assert.equal(createdSessionKeys.length, 2);
+  assert.notEqual(createdSessionKeys[0], createdSessionKeys[1]);
+  ok('changed system instructions cannot reuse a Codex thread pinned to stale developer instructions');
 });
 
 await runTest('Codex session manager aborts and evicts a live session when the gateway request is aborted', async function testAbortEvictsLiveSession() {
@@ -2237,7 +2380,7 @@ await runTest('Codex session manager caps old idle Codex app-server sessions', a
   ok('idle Codex app-server pressure is bounded by closing the oldest disposable sessions');
 });
 
-await runTest('Codex session manager keeps sessions waiting for tool_result', async function testMaxSessionPoolKeepsPendingToolResultSessions() {
+await runTest('Codex session manager keeps pending tool_result sessions within the hard pool cap', async function testMaxSessionPoolKeepsPendingToolResultSessions() {
   let firstSession = null;
   const { closedSessions, manager } = pooledCodexSessionManager(
     { maxSessions: 1 },
@@ -2251,13 +2394,16 @@ await runTest('Codex session manager keeps sessions waiting for tool_result', as
   await manager.processRequest(claudeSessionRequest('pool-pending'), requestBody, route);
   firstSession.pendingToolCall = { callId: 'call_waiting' };
 
-  await manager.processRequest(claudeSessionRequest('pool-new'), requestBody, route);
+  await assert.rejects(
+    manager.processRequest(claudeSessionRequest('pool-new'), requestBody, route),
+    /max_sessions=1/u
+  );
   await sleep(25);
 
   assert.equal(closedSessions.length, 0);
-  assert.equal(manager.sessions.size, 2);
+  assert.equal(manager.sessions.size, 1);
   await manager.close();
-  ok('pool pressure does not close sessions that still own pending tool_result state');
+  ok('pool pressure rejects new admission instead of closing or exceeding a pending session');
 });
 
 await runTest('Codex session manager treats blank manual pool caps as unset', async function testBlankMaxSessionPoolDefaults() {
@@ -2625,7 +2771,7 @@ await runTest(
 );
 
 await runTest(
-  'Codex app-server sanitizes unsafe Read arguments and returns offset feedback',
+  'Codex app-server preserves Read arguments and returns paging feedback',
   async function testCodexReadArgumentsAndFeedback() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-feedback-'));
     const codexPath = path.join(tempDir, 'codex-read-feedback');
@@ -2722,7 +2868,9 @@ await runTest(
           name: 'Read',
           input: {
             file_path: '/tmp/example.txt',
-            limit: 20,
+            offset: 1300000,
+            limit: '20',
+            pages: '',
           },
         });
 
@@ -2776,23 +2924,19 @@ await runTest(
 
         assert.equal(finalOutcome.type, 'final');
         assert.equal(continuedCall.result.success, false);
-        assert.match(continuedText, /Proxy Read offset note:/u);
-        assert.match(continuedText, /exceeds the gateway rewrite threshold/u);
+        assert.doesNotMatch(continuedText, /Proxy Read offset note:/u);
         assert.match(continuedText, /Codex Read guidance:/u);
-        assert.match(continuedText, /zero-based continuation index/u);
-        assert.deepEqual(sanitizeTrace.details.sanitization.reasons, [
-          'empty_pages_removed',
-          'offset_exceeds_rewrite_threshold',
-          'limit_normalized',
-        ]);
-        assert.equal(sanitizeTrace.details.sanitization.sanitized_limit, 20);
-        assert.equal(sanitizeTrace.details.sanitization.empty_pages_removed, true);
+        assert.match(continuedText, /1-based source line/u);
+        assert.equal(sanitizeTrace, undefined);
         assert.equal(inputTrace.details.summary.message_count, 1);
         assert.equal(inputTrace.details.summary.text_bytes > 0, true);
-        assert.equal(resultTrace.details.read_result_feedback.rewriteNoteAppended, true);
         assert.equal(resultTrace.details.read_result_feedback.guidanceAppended, true);
-        assert.equal(resultTrace.details.read_sanitization.offset_removed, true);
-        ok('unsafe Read offset requests are rewritten before Claude runs the tool and explained afterward');
+        assert.equal(resultTrace.details.read_sanitization.changed, false);
+        assert.equal(resultTrace.details.read_sanitization.original_offset, 1300000);
+        assert.equal(resultTrace.details.read_sanitization.sanitized_offset, 1300000);
+        assert.equal(resultTrace.details.read_sanitization.sanitized_limit, '20');
+        assert.equal(resultTrace.details.read_sanitization.offset_removed, false);
+        ok('Read arguments pass through unchanged while failures receive source-accurate guidance');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -2808,7 +2952,7 @@ await runTest(
 );
 
 await runTest(
-  'Codex app-server truncates large Read results with continuation metadata',
+  'Codex app-server hard-bounds large Read results without inventing a cursor',
   async function testCodexReadResultTruncation() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-truncate-'));
     const codexPath = path.join(tempDir, 'codex-read-truncate');
@@ -2952,14 +3096,16 @@ await runTest(
         assert.match(continuedText, /^Warning: truncated Read output/u);
         assert.match(continuedText, /Total output lines: 120/u);
         assert.match(continuedText, /Read output omitted to fit Codex context budget/u);
-        assert.match(continuedText, /For continuation reads/u);
+        assert.match(continuedText, /middle is an unseen gap/u);
+        assert.match(continuedText, /Do not advance a continuation cursor/u);
         assert.equal(continuedText.includes('line-001'), true);
         assert.equal(continuedText.includes('line-060'), false);
         assert.equal(continuedText.includes('line-120'), true);
+        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 900, true);
         assert.equal(resultTrace.details.read_tool_result, true);
         assert.equal(resultTrace.details.tool_result_truncated, true);
         assert.equal(resultTrace.details.raw_result_bytes > resultTrace.details.result_bytes, true);
-        ok('large Read results preserve boundaries and continuation instructions when shortened');
+        ok('large Read results obey the byte cap and identify the omitted middle as an unseen gap');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -3036,7 +3182,7 @@ await runTest(
             cwd: tempDir,
             idleTimeoutMs: 0,
             inputMaxTokens: 10_000,
-            toolResultMaxBytes: 40,
+            toolResultMaxBytes: 160,
           },
         });
         const initialRequest = {
@@ -3103,10 +3249,11 @@ await runTest(
         assert.equal(finalOutcome.type, 'final');
         assert.equal(continuedCall.result.success, true);
         assert.match(continuedText, /^Warning: truncated output/u);
-        assert.match(continuedText, /chars truncated/u);
+        assert.match(continuedText, /output omitted to fit byte budget/u);
         assert.equal(continuedText.includes('MIDDLE_SHOULD_BE_REMOVED'), false);
-        assert.equal(continuedText.includes('AAAAAAAAAAAAAAAAAAAA'), true);
-        assert.equal(continuedText.includes('BBBBBBBBBBBBBBBBBBBB'), true);
+        assert.equal(continuedText.includes('AAAAAAAA'), true);
+        assert.equal(continuedText.includes('BBBBBBBB'), true);
+        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 160, true);
         assert.equal(continuedText.length < rawResult.length, true);
         ok('large Claude tool_result payloads are bounded before they enter Codex app-server history');
       } finally {
@@ -3275,11 +3422,15 @@ await runTest(
 
         assert.equal(continuedTexts[0], 'A'.repeat(40));
         assert.match(continuedTexts[1], /^Warning: truncated output/u);
-        assert.match(continuedTexts[1], /chars truncated/u);
-        assert.match(continuedTexts[2], /^Warning: truncated output/u);
-        assert.match(continuedTexts[2], /40 chars truncated/u);
-        assert.equal(continuedTexts[2].includes('CCCC'), false);
-        ok('aggregate dynamic-tool output is bounded across a Codex session');
+        assert.equal(Buffer.byteLength(continuedTexts[1], 'utf8'), 30);
+        assert.equal(continuedTexts[2], '');
+        assert.equal(
+          continuedTexts.reduce(function sumBytes(total, text) {
+            return total + Buffer.byteLength(text, 'utf8');
+          }, 0),
+          70
+        );
+        ok('aggregate dynamic-tool output, including truncation metadata, obeys the hard session cap');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -3355,7 +3506,15 @@ await runTest(
         );
         const secondOutcome = await manager.processRequest(
           req,
-          codexUserRequest('Second usage turn.'),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'First usage turn.' },
+              { role: 'assistant', content: [{ type: 'text', text: firstOutcome.text }] },
+              { role: 'user', content: 'Second usage turn.' },
+            ],
+            tools: [],
+          },
           codexRoute()
         );
 
@@ -3517,7 +3676,15 @@ await runTest(
         );
         const secondOutcome = await manager.processRequest(
           req,
-          codexUserRequest('Second cumulative usage turn.'),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'First last-only usage turn.' },
+              { role: 'assistant', content: [{ type: 'text', text: firstOutcome.text }] },
+              { role: 'user', content: 'Second cumulative usage turn.' },
+            ],
+            tools: [],
+          },
           codexRoute()
         );
 
@@ -4114,6 +4281,144 @@ await runTest('fresh Codex sessions seed the app-server turn with the supplied t
   }
 });
 
+await runTest('Codex sessions recycle when Claude rewinds or compacts the transcript', async function testCodexTranscriptContinuity() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-continuity-'));
+  const codexPath = path.join(tempDir, 'codex-continuity');
+  const turnLogPath = path.join(tempDir, 'turn-log.jsonl');
+  const { entries, tracer } = captureTracer();
+
+  try {
+    await makeExecutable(
+      codexPath,
+      '#!/usr/bin/env node\n' +
+        "import fs from 'node:fs';\n" +
+        "import readline from 'node:readline';\n" +
+        'const rl = readline.createInterface({ input: process.stdin });\n' +
+        'let turnCount = 0;\n' +
+        'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+        "rl.on('line', function onLine(line) {\n" +
+        '  const message = JSON.parse(line);\n' +
+        "  if (message.method === 'initialize') {\n" +
+        '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'thread/start') {\n" +
+        '    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n' +
+        '    return;\n' +
+        '  }\n' +
+        "  if (message.method === 'turn/start') {\n" +
+        '    turnCount += 1;\n' +
+        '    const turnId = `turn-${process.pid}-${turnCount}`;\n' +
+        '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_LOG, `${JSON.stringify({ pid: process.pid, input: message.params.input[0].text })}\\n`, "utf8");\n' +
+        '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+        '    setTimeout(function completeTurn() {\n' +
+        '      send({ method: "item/completed", params: { turnId, item: { type: "agentMessage", id: `message-${turnId}`, text: `R${turnCount}` } } });\n' +
+        '      send({ method: "turn/completed", params: { turn: { id: turnId, status: "completed" } } });\n' +
+        '    }, 10);\n' +
+        '  }\n' +
+        '});\n'
+    );
+
+    const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+    process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+    const manager = new CodexSessionManager(
+      {
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+          forkIdleTimeoutMs: 0,
+        },
+      },
+      { tracer }
+    );
+    const req = claudeSessionRequest('session-transcript-continuity');
+    const route = codexRoute();
+
+    try {
+      const first = await manager.processRequest(req, codexUserRequest('A'), route);
+      assert.equal(first.text, 'R1');
+      const second = await manager.processRequest(
+        req,
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: [{ type: 'text', text: 'R1' }] },
+            { role: 'user', content: 'B' },
+          ],
+          tools: [],
+        },
+        route
+      );
+      assert.equal(second.text, 'R2');
+
+      await manager.processRequest(
+        req,
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: [{ type: 'text', text: 'R1' }] },
+            { role: 'user', content: 'C after rewind' },
+          ],
+          tools: [],
+        },
+        route
+      );
+
+      await manager.processRequest(
+        req,
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            { role: 'user', content: 'Compacted summary of the authoritative history.' },
+            { role: 'user', content: 'D after compaction' },
+          ],
+          tools: [],
+        },
+        route
+      );
+
+      const turns = (await fs.readFile(turnLogPath, 'utf8'))
+        .trim()
+        .split(/\n/u)
+        .map(function parseTurn(line) {
+          return JSON.parse(line);
+        });
+      assert.equal(turns.length, 4);
+      assert.equal(turns[0].pid, turns[1].pid, 'ordinary continuation must reuse one thread');
+      assert.equal(turns[1].input.includes('B'), true);
+      assert.equal(turns[1].input.includes('A'), false, 'live continuation should send latest-only input');
+      assert.notEqual(turns[2].pid, turns[1].pid, 'rewind must replace the stale thread');
+      assert.match(turns[2].input, /A/u);
+      assert.match(turns[2].input, /R1/u);
+      assert.match(turns[2].input, /C after rewind/u);
+      assert.equal(turns[2].input.includes('B'), false);
+      assert.notEqual(turns[3].pid, turns[2].pid, 'compaction must replace the pre-summary thread');
+      assert.match(turns[3].input, /Compacted summary/u);
+      assert.match(turns[3].input, /D after compaction/u);
+      assert.equal(
+        entries.filter(function isDivergence(entry) {
+          return entry.event === 'codex.session.transcript_diverged';
+        }).length,
+        2
+      );
+      ok('rewinds and compaction replay the current authoritative transcript on clean threads');
+    } finally {
+      await manager.close();
+      if (previousTarget === undefined) {
+        delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      } else {
+        process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+      }
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 await runTest('Codex sessions recycle before the reported context can overflow the window', async function testCodexSessionContextPressureRecycle() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-recycle-'));
   const codexPath = path.join(tempDir, 'codex-recycle');
@@ -4324,13 +4629,17 @@ await runTest(
 );
 
 await runTest(
-  'Codex matching tool_result requests recycle when replay pressure exceeds stale usage estimates',
-  async function testCodexToolResultReplayPressureRecycle() {
+  'Codex keeps a 12k-line matching tool_result on its pending call under stale usage',
+  async function testCodexToolResultStaysOnPendingCallUnderStaleUsage() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-'));
     const codexPath = path.join(tempDir, 'codex-tool-result-replay');
     const turnLogPath = path.join(tempDir, 'turn-log.json');
     const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
     const replayMarker = 'RESULT_MARKER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
+    const largeResult = Array.from({ length: 12_000 }, function resultLine(_, index) {
+      const sentinel = index === 6_000 ? replayMarker : 'payload';
+      return `line-${String(index + 1).padStart(5, '0')} ${sentinel} ${'x'.repeat(32)}`;
+    }).join('\n');
 
     try {
       await fs.writeFile(toolResponsesPath, '[]', 'utf8');
@@ -4398,6 +4707,7 @@ await runTest(
             cwd: tempDir,
             idleTimeoutMs: 0,
             inputMaxTokens: 100,
+            toolResultMaxBytes: 10_000,
           },
         });
 
@@ -4452,7 +4762,7 @@ await runTest(
                   {
                     type: 'tool_result',
                     tool_use_id: 'call_replay',
-                    content: replayMarker,
+                    content: largeResult,
                   },
                 ],
               },
@@ -4464,14 +4774,19 @@ await runTest(
 
         const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
         const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+        assert.equal(toolResponses.length, 1);
+        const continuedText = toolResponses[0].message.result.contentItems[0].text;
 
         assert.equal(finalOutcome.type, 'final');
-        assert.equal(turns.length, 2);
-        assert.notEqual(turns[0].pid, turns[1].pid);
-        assert.equal(turns[1].input.includes(replayMarker), true);
-        assert.deepEqual(toolResponses, []);
+        assert.equal(turns.length, 1);
+        assert.equal(toolResponses[0].pid, turns[0].pid);
+        assert.match(continuedText, /^Warning: truncated output/u);
+        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 10_000, true);
+        assert.equal(continuedText.includes('line-00001'), true);
+        assert.equal(continuedText.includes('line-12000'), true);
+        assert.equal(continuedText.includes(replayMarker), false);
         ok(
-          'matching tool_result requests recycle to a fresh transcript replay when replay pressure exceeds stale usage'
+          'a large raw result is hard-bounded and continued on the original pending app-server call'
         );
       } finally {
         await manager?.close();
@@ -4493,8 +4808,8 @@ await runTest(
 );
 
 await runTest(
-  'Codex matching tool_result requests recycle when replay pressure exceeds missing usage estimates',
-  async function testCodexToolResultReplayPressureRecycleWithoutUsage() {
+  'Codex keeps a matching tool_result on its pending call before usage arrives',
+  async function testCodexToolResultStaysOnPendingCallWithoutUsage() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-nou-'));
     const codexPath = path.join(tempDir, 'codex-tool-result-replay-no-usage');
     const turnLogPath = path.join(tempDir, 'turn-log.json');
@@ -4635,14 +4950,15 @@ await runTest(
 
         const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
         const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+        assert.equal(toolResponses.length, 1);
+        const continuedText = toolResponses[0].message.result.contentItems[0].text;
 
         assert.equal(finalOutcome.type, 'final');
-        assert.equal(turns.length, 2);
-        assert.notEqual(turns[0].pid, turns[1].pid);
-        assert.equal(turns[1].input.includes(replayMarker), true);
-        assert.deepEqual(toolResponses, []);
+        assert.equal(turns.length, 1);
+        assert.equal(toolResponses[0].pid, turns[0].pid);
+        assert.equal(continuedText, replayMarker);
         ok(
-          'matching tool_result requests recycle to a fresh transcript replay even before the app-server reports usage'
+          'missing usage cannot cause a pending dynamic-tool call to be destroyed and replayed as text'
         );
       } finally {
         await manager?.close();
@@ -4847,7 +5163,7 @@ await runTest('Codex transcript budget includes omission notices and separators'
   }
 });
 
-await runTest('fresh Codex fork sessions start from the current request only', async function testCodexForkSessionSkipsOldTranscript() {
+await runTest('fresh Codex fork sessions bootstrap from the authoritative request transcript', async function testCodexForkSessionKeepsTranscript() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-fork-input-'));
   const codexPath = path.join(tempDir, 'codex-fork-input');
   const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
@@ -4904,8 +5220,8 @@ await runTest('fresh Codex fork sessions start from the current request only', a
         {
           model: CODEX_REQUEST_MODEL,
           messages: [
-            { role: 'user', content: 'Very old workflow context that should not enter a fork.' },
-            { role: 'assistant', content: 'Prior canonical answer that belongs to another thread.' },
+            { role: 'user', content: 'Authoritative workflow context for the fork.' },
+            { role: 'assistant', content: 'Prior answer included in the supplied transcript.' },
             { role: 'user', content: 'Current fork side request.' },
           ],
           tools: [],
@@ -4921,10 +5237,10 @@ await runTest('fresh Codex fork sessions start from the current request only', a
         });
       const forkInput = turnParams.at(-1).input[0].text;
       assert.equal(forkInput.includes('Current fork side request.'), true);
-      assert.equal(forkInput.includes('Very old workflow context'), false);
-      assert.equal(forkInput.includes('Prior canonical answer'), false);
+      assert.equal(forkInput.includes('Authoritative workflow context'), true);
+      assert.equal(forkInput.includes('Prior answer included'), true);
       await manager.close();
-      ok('forked side traffic no longer replays the whole accumulated Claude transcript');
+      ok('fresh fork threads preserve the bounded transcript supplied by Claude');
     } finally {
       if (previousTarget === undefined) {
         delete process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
@@ -5379,11 +5695,12 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-daemon-'));
   const envFile = path.join(tempDir, 'gateway.env');
   const daemonPath = new URL('../js/cli/claude-workflow-daemon.js', import.meta.url).pathname;
+  const port = await freePort();
 
   const child = spawn(process.execPath, [daemonPath], {
     env: {
       ...process.env,
-      ULTRATHINK_GATEWAY_DAEMON_PORT: '0',
+      ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
       CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
     },
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -5406,14 +5723,15 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
       }
     }
     assert.notEqual(envText, '', `daemon never wrote env file; stderr: ${stderr}`);
-    const baseUrlMatch = envText.match(/^export ANTHROPIC_BASE_URL="([^"]+)"$/mu);
+    const baseUrlMatch = envText.match(/^export ANTHROPIC_BASE_URL='([^']+)'$/mu);
     assert.notEqual(baseUrlMatch, null);
-    assert.match(envText, /^export CLAUDE_CODE_SUBAGENT_MODEL="[^"]+"$/mu);
-    assert.match(envText, /^export ANTHROPIC_DEFAULT_SONNET_MODEL="[^"]+"$/mu);
+    assert.match(envText, /^export CLAUDE_CODE_SUBAGENT_MODEL='[^']+'$/mu);
+    assert.match(envText, /^export ANTHROPIC_DEFAULT_SONNET_MODEL='[^']+'$/mu);
+    assert.equal((await fs.stat(envFile)).mode & 0o777, 0o600);
 
     const health = await fetch(`${baseUrlMatch[1]}/healthz`);
     assert.equal(health.ok, true);
-    ok('daemon starts on an OS-assigned port, serves healthz, and publishes shell exports');
+    ok('daemon starts on its managed fixed port, serves healthz, and publishes shell-safe exports');
   } finally {
     child.kill('SIGTERM');
     await new Promise(function waitExit(resolve) {
@@ -5454,8 +5772,9 @@ await runTest('claude-workflow daemon script starts and stops the recorded daemo
     const stop = await runProcess('bash', [daemonScript, 'stop'], env);
     assert.equal(stop.code, 0, stop.stderr || stop.stdout);
     await waitForProcessExit(daemonPid);
+    await assert.rejects(fs.access(envFile));
     daemonPid = 0;
-    ok('daemon script lifecycle manages the recorded pid on Linux and macOS shells');
+    ok('daemon script lifecycle waits for the recorded pid and invalidates stale exports');
   } finally {
     if (daemonPid > 0 && processExists(daemonPid)) {
       try {
@@ -5485,7 +5804,30 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     });
     assert.equal(zshInstall.code, 0, zshInstall.stderr || zshInstall.stdout);
     const zshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
-    assert.match(zshrc, /claude-workflow-gateway\.bashrc/u);
+    assert.match(zshrc, /command -v claude-workflow-gateway/u);
+    assert.match(zshrc, /claude-workflow gateway/u);
+    assert.equal(zshrc.includes(daemonScript), false);
+
+    const zshReinstall = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(zshReinstall.code, 0, zshReinstall.stderr || zshReinstall.stdout);
+    const refreshedZshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    assert.equal((refreshedZshrc.match(/# >>> claude-workflow gateway >>>/gu) || []).length, 1);
+
+    const malformedZshrc = `${refreshedZshrc}\n# >>> claude-workflow gateway >>>\nexport IMPORTANT_AFTER=1\n`;
+    await fs.writeFile(path.join(tempDir, '.zshrc'), malformedZshrc, 'utf8');
+    const malformedInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(malformedInstall.code, 1);
+    assert.match(malformedInstall.stderr, /malformed shell hook markers/u);
+    assert.equal(await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8'), malformedZshrc);
+    await fs.writeFile(path.join(tempDir, '.zshrc'), refreshedZshrc, 'utf8');
 
     const bashInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
@@ -5494,8 +5836,25 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     });
     assert.equal(bashInstall.code, 0, bashInstall.stderr || bashInstall.stdout);
     const bashrc = await fs.readFile(path.join(tempDir, '.bashrc'), 'utf8');
-    assert.match(bashrc, /claude-workflow-gateway\.bashrc/u);
-    ok('install-shell writes the hook to zshrc for zsh users and bashrc for bash users');
+    assert.match(bashrc, /command -v claude-workflow-gateway/u);
+
+    const unsupported = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/usr/bin/fish',
+    });
+    assert.equal(unsupported.code, 1);
+    assert.match(unsupported.stderr, /unsupported shell fish/u);
+
+    const uninstall = await runProcess('bash', [daemonScript, 'uninstall-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(uninstall.code, 0, uninstall.stderr || uninstall.stdout);
+    const uninstalledZshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    assert.equal(uninstalledZshrc.includes('>>> claude-workflow gateway >>>'), false);
+    ok('shell hooks use the stable PATH command, refresh on upgrades, and uninstall cleanly');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -5572,8 +5931,40 @@ await runTest('gateway enforces auth for /v1 and exposes Claude-shaped model dis
       }),
       ['claude-opus-4-8', 'claude-sonnet-4-7']
     );
-    assert.match(payload.data[1].display_name, /Codex profile gpt-5\.5\/low/u);
+    assert.match(payload.data[1].display_name, /Codex profile gpt-5\.6-terra\/low/u);
     ok('model discovery is Claude-shaped and auth-gated');
+  } finally {
+    await runtime.close();
+  }
+});
+
+await runTest('non-loopback health checks hide diagnostics without gateway auth', async function testGatewayHealthPrivacy() {
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(
+    gatewayConfig({
+      host: '0.0.0.0',
+      port: gatewayPort,
+      sharedSecret: 'health-secret',
+      runtimeRevision: 'private-revision',
+      traceDir: '/tmp/private-example-trace',
+    })
+  );
+  await waitForListening(runtime.server);
+
+  try {
+    const unauthenticated = await fetch(`http://127.0.0.1:${gatewayPort}/healthz`);
+    assert.deepEqual(await unauthenticated.json(), {
+      ok: true,
+      service: 'claude-workflow-gateway',
+    });
+
+    const authenticated = await fetch(`http://127.0.0.1:${gatewayPort}/healthz`, {
+      headers: { authorization: 'Bearer health-secret' },
+    });
+    const details = await authenticated.json();
+    assert.equal(details.runtime_revision, 'private-revision');
+    assert.equal(details.trace_dir, '/tmp/private-example-trace');
+    ok('public health is minimal while authenticated operators retain diagnostics');
   } finally {
     await runtime.close();
   }
@@ -6325,7 +6716,7 @@ await runTest(
       });
       const customRouteHealth = await runWithDisplayEnv('custom-route-health.json', {
         ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-          'claude-sonnet-4-7': {
+          'claude-sonnet-5': {
             provider: 'codex',
             upstream_model: 'gpt-custom',
             reasoning_effort: 'xhigh',
@@ -6361,7 +6752,7 @@ await runTest(
       });
       const invalidRoute = await runLauncherWithDisplayEnv('invalid-route-health.json', {
         ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-          'claude-sonnet-4-7': {
+          'claude-sonnet-5': {
             provider: 'bogus',
           },
         }),
@@ -6371,7 +6762,7 @@ await runTest(
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
       assert.equal(defaultHealth.autoCompactWindow, '');
       // The launcher now defaults the frontier main model to Fable 5 1m and keeps
-      // the Fable 5 family on Anthropic; lower-tier Claude ids route to Codex gpt-5.5.
+      // the Fable 5 family on Anthropic; lower-tier Claude ids route to Codex Terra.
       assert.deepEqual(
         defaultHealth.health.anthropic_passthrough_models,
         ['claude-fable-5*']
@@ -6380,16 +6771,17 @@ await runTest(
         defaultHealth.health.exposed_models.includes('claude-fable-5[1m]'),
         true
       );
-      assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.5');
+      assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.6-terra');
+      assert.equal(defaultHealth.health.codex_reasoning_effort, 'max');
       assert.match(
         modelDisplayName(defaultHealth, 'claude-opus-4-8') || '',
-        /Codex gpt-5\.5/u
+        /Codex gpt-5\.6-terra/u
       );
       assert.equal(optedOutHealth.health.display_routed_model, false);
-      assert.equal(optedOutHealth.subagentModel, 'claude-sonnet-4-7');
+      assert.equal(optedOutHealth.subagentModel, 'claude-sonnet-5');
       assert.equal(workflowOptOutHealth.health.display_routed_model, false);
-      assert.equal(workflowOptOutHealth.subagentModel, 'claude-sonnet-4-7');
-      assert.equal(customRouteHealth.subagentModel, 'codex-gpt-custom-xhigh-via-claude-sonnet-4-7');
+      assert.equal(workflowOptOutHealth.subagentModel, 'claude-sonnet-5');
+      assert.equal(customRouteHealth.subagentModel, 'codex-gpt-custom-xhigh-via-claude-sonnet-5');
       assert.equal(
         customRouteHealth.health.exposed_models.includes(customRouteHealth.subagentModel),
         true
@@ -6403,7 +6795,7 @@ await runTest(
       );
       assert.equal(
         frontierHealth.subagentModel,
-        'codex-gpt-5.5-xhigh-via-claude-sonnet-4-7'
+        'codex-gpt-5.5-xhigh-via-claude-sonnet-5'
       );
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
@@ -6439,7 +6831,7 @@ await runTest(
       assert.notEqual(invalidRoute.result.code, 0);
       assert.match(
         invalidRoute.result.stderr,
-        /entry for claude-sonnet-4-7 must set provider/u
+        /entry for claude-sonnet-5 must set provider/u
       );
       ok('claude-workflow defaults routed response model display on and supports explicit opt-out');
     } finally {
@@ -6632,7 +7024,7 @@ await runTest(
 );
 
 await runTest(
-  'claude-workflow defaults to auto mode and keeps yolo flags out of prompts',
+  'claude-workflow preserves intentional permission bypass and native passthrough',
   async function testWorkflowCliYoloPermissionFlags() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-yolo-'));
     const claudePath = path.join(tempDir, 'claude');
@@ -6699,6 +7091,26 @@ await runTest(
         ['--', 'Explain', '--help'],
         'claude-passthrough-help-args.json'
       );
+      const permissionPlanArgs = await runWithArgs(
+        ['--', '--permission-mode', 'plan', '--allowedTools', 'Read,Grep'],
+        'claude-permission-plan-args.json'
+      );
+      const oneShotJsonArgs = await runWithArgs(
+        ['Reply with exactly CLI_OK.', '--', '--output-format', 'json'],
+        'claude-one-shot-json-args.json'
+      );
+      const variadicPassthroughArgs = await runWithArgs(
+        ['--', '--add-dir', 'first', 'second', '--background', '--worktree'],
+        'claude-variadic-passthrough-args.json'
+      );
+      const nativeDelimiterArgs = await runWithArgs(
+        ['--', '--', '--model'],
+        'claude-native-delimiter-args.json'
+      );
+      const doctorArgs = await runWithArgs(
+        ['--', 'doctor'],
+        'claude-doctor-args.json'
+      );
       const resumeSessionId = 'd3512e5e-c859-4109-aad1-f517c268d1e5';
       const resumeArgs = await runWithArgs(
         ['--resume', resumeSessionId],
@@ -6721,14 +7133,35 @@ await runTest(
       assert.equal(interactiveArgs.includes('--dangerously-skip-permissions'), true);
       assert.equal(interactiveArgs.includes('-p'), false);
       assert.equal(interactiveArgs.includes('--model'), true);
-      for (const args of [defaultPromptArgs, yoloArgs, dangerousArgs, passthroughHelpArgs]) {
+      for (const args of [defaultPromptArgs, yoloArgs, dangerousArgs, passthroughHelpArgs, doctorArgs]) {
         assert.equal(args.includes('--dangerously-skip-permissions'), true);
         assert.equal(args.includes('--yolo'), false);
       }
       assert.equal(defaultPromptArgs.at(-1), 'Reply with exactly CLI_OK.');
       assert.equal(yoloArgs.at(-1), 'Reply with exactly CLI_OK.');
       assert.equal(dangerousArgs.at(-1), 'Reply with exactly CLI_OK.');
-      assert.equal(passthroughHelpArgs.at(-1), 'Explain --help');
+      assert.equal(passthroughHelpArgs.includes('-p'), false);
+      assert.deepEqual(passthroughHelpArgs.slice(-2), ['Explain', '--help']);
+      assert.equal(permissionPlanArgs.includes('--dangerously-skip-permissions'), false);
+      assert.deepEqual(permissionPlanArgs.slice(-4), [
+        '--permission-mode',
+        'plan',
+        '--allowedTools',
+        'Read,Grep',
+      ]);
+      assert.equal(oneShotJsonArgs.includes('-p'), true);
+      assert.equal(oneShotJsonArgs.includes('--output-format'), true);
+      assert.equal(oneShotJsonArgs.includes('json'), true);
+      assert.equal(oneShotJsonArgs.at(-1), 'Reply with exactly CLI_OK.');
+      assert.deepEqual(variadicPassthroughArgs.slice(-5), [
+        '--add-dir',
+        'first',
+        'second',
+        '--background',
+        '--worktree',
+      ]);
+      assert.deepEqual(nativeDelimiterArgs.slice(-2), ['--', '--model']);
+      assert.equal(doctorArgs.at(-1), 'doctor');
       assert.equal(optedOutArgs.includes('--dangerously-skip-permissions'), false);
       assert.equal(optedOutArgs.includes('--no-yolo'), false);
       assert.equal(optedOutArgs.at(-1), 'Reply with exactly CLI_OK.');
@@ -6755,8 +7188,42 @@ await runTest(
       assert.equal(explicitSessionArgs.includes('--session-id'), true);
       assert.equal(explicitSessionArgs.includes(resumeSessionId), true);
 
+      const unknownFlagResult = await runProcess(
+        'node',
+        ['js/cli/claude-workflow.js', '--effort', 'high'],
+        {
+          ...process.env,
+          ...CLEAN_WORKFLOW_ENV,
+          PATH: `${tempDir}:${process.env.PATH || ''}`,
+          ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
+          ULTRATHINK_TEST_CLAUDE_ARGS_PATH: path.join(tempDir, 'must-not-exist.json'),
+          ANTHROPIC_AUTH_TOKEN: '',
+          ANTHROPIC_API_KEY: '',
+        }
+      );
+      assert.equal(unknownFlagResult.code, 1);
+      assert.match(unknownFlagResult.stderr, /pass Claude CLI options after --/u);
+      await assert.rejects(fs.access(path.join(tempDir, 'must-not-exist.json')));
+
+      const modelOverrideResult = await runProcess(
+        'node',
+        ['js/cli/claude-workflow.js', '--', '--model', 'claude-opus-4-8'],
+        {
+          ...process.env,
+          ...CLEAN_WORKFLOW_ENV,
+          PATH: `${tempDir}:${process.env.PATH || ''}`,
+          ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
+          ULTRATHINK_TEST_CLAUDE_ARGS_PATH: path.join(tempDir, 'model-must-not-exist.json'),
+          ANTHROPIC_AUTH_TOKEN: '',
+          ANTHROPIC_API_KEY: '',
+        }
+      );
+      assert.equal(modelOverrideResult.code, 1);
+      assert.match(modelOverrideResult.stderr, /managed by claude-workflow/u);
+      await assert.rejects(fs.access(path.join(tempDir, 'model-must-not-exist.json')));
+
       ok(
-        'claude-workflow defaults to auto mode while preserving explicit yolo aliases, opt-out, and Claude session flags'
+        'claude-workflow keeps intentional yolo defaults while preserving opt-out, session flags, and explicit Claude passthrough'
       );
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -6837,7 +7304,7 @@ await runTest(
   }
 );
 
-await runTest('gateway routes non-frontier requests to the Codex GPT-5.5 low profile', async function testOpenAiRouting() {
+await runTest('gateway routes non-frontier requests to the Codex Terra low profile', async function testOpenAiRouting() {
   const openAiPort = await freePort();
   let capturedBody = null;
   let capturedUrl = null;
@@ -6866,7 +7333,7 @@ await runTest('gateway routes non-frontier requests to the Codex GPT-5.5 low pro
             finish_reason: 'stop',
             message: {
               role: 'assistant',
-              content: 'Remapped through the Codex GPT-5.5 low profile.',
+              content: 'Remapped through the Codex Terra low profile.',
             },
           },
         ],
@@ -6919,7 +7386,7 @@ await runTest('gateway routes non-frontier requests to the Codex GPT-5.5 low pro
     const payload = await response.json();
 
     assert.equal(capturedUrl, '/v1/chat/completions');
-    assert.equal(capturedBody.model, 'gpt-5.5');
+    assert.equal(capturedBody.model, 'gpt-5.6-terra');
     assert.equal(capturedBody.reasoning_effort, 'low');
     assert.equal(capturedBody.verbosity, 'low');
     assert.equal(capturedBody.max_completion_tokens, 256);
@@ -6935,10 +7402,10 @@ await runTest('gateway routes non-frontier requests to the Codex GPT-5.5 low pro
     assert.deepEqual(payload.content, [
       {
         type: 'text',
-        text: 'Remapped through the Codex GPT-5.5 low profile.',
+        text: 'Remapped through the Codex Terra low profile.',
       },
     ]);
-    ok('non-frontier requests remap to the Codex-targeted GPT-5.5 low profile');
+    ok('non-frontier requests remap to the Codex-targeted Terra low profile');
   } finally {
     await runtime.close();
     await closeServer(openAiServer);
@@ -7007,12 +7474,12 @@ await runTest(
       assert.equal(response.status, 200);
       const payload = await response.json();
 
-      assert.equal(capturedBody.model, 'gpt-5.5');
+      assert.equal(capturedBody.model, 'gpt-5.6-terra');
       assert.equal(
         payload.model,
         routedResponseModel({
           provider: 'openai',
-          upstreamModel: 'gpt-5.5',
+          upstreamModel: 'gpt-5.6-terra',
           reasoningEffort: 'low',
           requestedModel: 'claude-sonnet-4-7',
         })
@@ -8411,7 +8878,7 @@ await runTest('gateway streams OpenAI chunks as Anthropic SSE events', async fun
       messageStart.payload.message.model,
       routedResponseModel({
         provider: 'openai',
-        upstreamModel: 'gpt-5.5',
+        upstreamModel: 'gpt-5.6-terra',
         reasoningEffort: 'low',
         requestedModel: 'claude-sonnet-4-7',
       })

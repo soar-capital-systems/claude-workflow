@@ -8,12 +8,15 @@
  * and background Claude Code sessions can route through it via exported env
  * (see scripts/claude-workflow-daemon.sh and scripts/claude-workflow-gateway.bashrc).
  * On listen it publishes the env exports to
- * ~/.cache/ultrathink/claude-workflow-gateway.env for shells to source.
+ * ${XDG_STATE_HOME:-~/.cache}/claude-workflow/claude-workflow-gateway.env
+ * for shells to source.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 import { createGatewayServer } from '../gateway/server.js';
 import {
@@ -24,6 +27,7 @@ import {
 } from '../gateway/workflow-config.js';
 
 const DEFAULT_DAEMON_PORT = 4318;
+const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
 function log(message) {
   process.stderr.write(`claude-workflow-gateway: ${message}\n`);
@@ -34,16 +38,16 @@ function log(message) {
 // fight over one port (launcher EADDRINUSE, or the daemon health check
 // probing a transient launcher gateway). Keep this default in sync with
 // scripts/claude-workflow-daemon.sh.
-function daemonPort() {
+export function daemonPort() {
   const configured = envString('ULTRATHINK_GATEWAY_DAEMON_PORT');
   if (!configured) {
     return DEFAULT_DAEMON_PORT;
   }
 
   const parsed = Number(configured);
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
     throw new Error(
-      `ULTRATHINK_GATEWAY_DAEMON_PORT must be an integer between 0 and 65535, got ${configured}`
+      `ULTRATHINK_GATEWAY_DAEMON_PORT must be an integer between 1 and 65535, got ${configured}`
     );
   }
 
@@ -51,27 +55,111 @@ function daemonPort() {
 }
 
 function envFilePath() {
+  const stateHome = envString('XDG_STATE_HOME') || path.join(os.homedir(), '.cache');
   return (
     envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE') ||
-    path.join(os.homedir(), '.cache', 'ultrathink', 'claude-workflow-gateway.env')
+    path.join(stateHome, 'claude-workflow', 'claude-workflow-gateway.env')
   );
 }
 
+export function quotePosixShellValue(value) {
+  const text = String(value);
+  if (text.includes('\0')) {
+    throw new Error('workflow environment values must not contain NUL bytes');
+  }
+
+  return `'${text.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function serializeWorkflowEnvironment(clientEnv) {
+  return `${Object.entries(clientEnv)
+    .map(function toExport([key, value]) {
+      if (!ENV_KEY_PATTERN.test(key)) {
+        throw new Error(`invalid workflow environment variable name: ${key}`);
+      }
+      return `export ${key}=${quotePosixShellValue(value)}`;
+    })
+    .join('\n')}\n`;
+}
+
+function ensureEnvironmentDirectory(directory, hardenExistingDirectory) {
+  const existed = fs.existsSync(directory);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stats = fs.lstatSync(directory);
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error(`workflow environment directory must be a real directory: ${directory}`);
+  }
+  if (!existed || hardenExistingDirectory) {
+    fs.chmodSync(directory, 0o700);
+  } else if ((stats.mode & 0o077) !== 0) {
+    throw new Error(
+      `custom workflow environment directory must not be accessible by group or other users: ${directory}`
+    );
+  }
+}
+
+export function writeWorkflowEnvironmentFile(
+  targetPath,
+  clientEnv,
+  { hardenExistingDirectory = true } = {}
+) {
+  const target = path.resolve(targetPath);
+  const directory = path.dirname(target);
+  ensureEnvironmentDirectory(directory, hardenExistingDirectory);
+
+  const tempPath = path.join(
+    directory,
+    `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
+  );
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, serializeWorkflowEnvironment(clientEnv), 'utf8');
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(tempPath, target);
+    fs.chmodSync(target, 0o600);
+    return target;
+  } catch (error) {
+    if (descriptor !== null) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Preserve the original write error.
+      }
+    }
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (cleanupError) {
+      if (cleanupError?.code !== 'ENOENT') {
+        // Preserve the original write error.
+      }
+    }
+    throw error;
+  }
+}
+
 function writeEnvFile(config, gatewayBaseUrl, subagentModelId) {
+  const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
   const target = envFilePath();
   const clientEnv = buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId);
-  const lines = Object.entries(clientEnv).map(function toExport([key, value]) {
-    return `export ${key}=${JSON.stringify(String(value))}`;
+  return writeWorkflowEnvironmentFile(target, clientEnv, {
+    // The default cache directory belongs exclusively to this daemon. An
+    // explicit custom path may live in a broader user-managed directory, so
+    // do not silently chmod that existing directory.
+    hardenExistingDirectory: !configuredTarget,
   });
-
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-  return target;
 }
 
 async function main() {
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
-    buildWorkflowGatewayConfig({ port: daemonPort() });
+    buildWorkflowGatewayConfig({
+      port: daemonPort(),
+      host: '127.0.0.1',
+      dynamicToolsOnly: true,
+    });
 
   const runtime = createGatewayServer(config);
 
@@ -130,7 +218,21 @@ async function main() {
   });
 }
 
-main().catch(function onError(error) {
-  log(error?.stack || error?.message || String(error));
-  process.exitCode = 1;
-});
+function isDirectExecution() {
+  if (!process.argv[1]) {
+    return false;
+  }
+
+  try {
+    return fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
+}
+
+if (isDirectExecution()) {
+  main().catch(function onError(error) {
+    log(error?.stack || error?.message || String(error));
+    process.exitCode = 1;
+  });
+}

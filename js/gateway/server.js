@@ -1282,15 +1282,40 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   const toolReasoningCache = new Map();
 
   app.get('/healthz', function healthz(req, res) {
-    res.json({
+    const basicHealth = {
       ok: true,
       service: 'claude-workflow-gateway',
+    };
+    const mayExposeDiagnostics =
+      isGatewayLoopbackHost(config.host) ||
+      (Boolean(config.sharedSecret) && authHeaderSecret(req) === config.sharedSecret);
+    if (!mayExposeDiagnostics) {
+      res.json(basicHealth);
+      return;
+    }
+
+    res.json({
+      ...basicHealth,
+      runtime_revision: config.runtimeRevision || null,
+      runtime_started_at: config.runtimeStartedAt || null,
+      runtime_pid: process.pid,
+      trace_enabled: tracer?.enabled === true,
+      trace_dir: tracer?.traceDir || config.traceDir || null,
+      trace_file: tracer?.traceFilePath || null,
+      trace_max_bytes: tracer?.traceMaxBytes ?? config.traceMaxBytes ?? null,
+      trace_max_files: tracer?.traceMaxFiles ?? config.traceMaxFiles ?? null,
+      trace_write_failed: Boolean(tracer?.lastError),
       codex_target_model: config.codex?.model || null,
       codex_sandbox: config.codex?.sandbox || null,
       codex_approval_policy: config.codex?.approvalPolicy || null,
       codex_reasoning_effort: config.codex?.reasoningEffort || null,
       codex_verbosity: config.codex?.verbosity || null,
       codex_enabled: Boolean(config.codex?.enabled),
+      codex_input_max_tokens: config.codex?.inputMaxTokens ?? null,
+      codex_tool_result_max_bytes: config.codex?.toolResultMaxBytes ?? null,
+      codex_tool_result_window_max_bytes: config.codex?.toolResultWindowMaxBytes ?? null,
+      codex_auto_compact_token_limit: config.codex?.autoCompactTokenLimit ?? null,
+      codex_auto_compact_token_limit_scope: config.codex?.autoCompactTokenLimitScope || null,
       openai_model: config.openai?.model || null,
       openai_reasoning_effort: config.openai?.reasoningEffort || null,
       deepseek_model: config.deepseek?.model || null,

@@ -6,13 +6,14 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_PENDING_TOOL_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
 const DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES = 64_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 // Cold-start bound only: once the Codex app-server reports the model's real
 // context window (thread/tokenUsage/updated), budgets adapt to it. Codex
-// gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
-// thread overhead, so keep the pre-learning default safely below that.
+// Keep the pre-learning default conservative; once app-server reports the
+// selected model's real context window, the session budget adapts to it.
 const DEFAULT_INPUT_MAX_TOKENS = 192_000;
 // Fraction of the reported context window usable as input budget; the rest
 // is headroom for the model's reasoning and output.
@@ -28,12 +29,22 @@ const NON_RESERVING_SELECTION_REASONS = new Set([
 ]);
 // Selection reasons under which a between-turns session may be recycled for
 // context pressure; replay-style selections must keep their session intact.
-const RECYCLE_ELIGIBLE_SELECTION_REASONS = new Set(['canonical', 'matching_tool_result']);
+const RECYCLE_ELIGIBLE_SELECTION_REASONS = new Set(['canonical']);
 const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
   /remote app server .*transport failed/iu,
   /WebSocket protocol error: Connection reset without closing handshake/iu,
 ];
-const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const CODEX_REASONING_EFFORTS = new Set([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
+const CODEX_VERBOSITIES = new Set(['low', 'medium', 'high']);
+const MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION = Object.freeze([0, 144, 1]);
 // Recycle a live Codex session before its real context (as reported by the
 // app-server) can overflow the gateway's effective input budget. Long tool
 // loops accumulate history turn by turn, so per-payload budgets alone cannot
@@ -55,31 +66,71 @@ const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 const READ_TOOL_NAME = 'Read';
-const READ_OFFSET_REWRITE_THRESHOLD = 1_000_000;
 const READ_GUIDANCE_HEADER = 'Codex Read guidance:';
-const READ_REWRITE_NOTE_HEADER = 'Proxy Read offset note:';
-const READ_OFFSET_EXCEEDS_REASON = 'offset_exceeds_rewrite_threshold';
-const READ_INVALID_OFFSET_REASON = 'invalid_offset_removed';
-const READ_INVALID_LIMIT_REASON = 'invalid_limit_removed';
-const READ_EMPTY_PAGES_REASON = 'empty_pages_removed';
+const LARGE_OUTPUT_GUIDANCE_HEADER = 'Codex large-output guidance:';
+const LARGE_OUTPUT_TOOL_NAMES = new Set(['Bash', 'Grep']);
 const READ_OFFSET_SCHEMA_DESCRIPTION =
-  'Optional zero-based continuation index. Use only after a prior Read of the same file returned content and more lines are needed. Compute as prior offset plus returned line count. Displayed line numbers, grep line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets. Omit when unsure.';
+  'Optional 1-based source line at which to start reading. It matches the source line numbers shown by Read. For continuation, use the exact next offset reported by Read or the line after the last contiguous source line actually shown; never advance across omitted output.';
 const READ_LIMIT_SCHEMA_DESCRIPTION =
-  'Optional number of lines to read. Omit when opening a file. Use with offset only when continuing a large file.';
-const READ_CONTINUATION_HINT =
-  'For continuation reads, use offset = previous offset + returned line count; displayed line numbers are not valid offsets.';
+  'Optional maximum number of source lines to read. For large or dense files, begin with a small explicit range. If even a tiny range is too large because lines are very long, use targeted Grep or Bash byte/character/JSON queries instead.';
 const READ_OUTPUT_OMISSION_MARKER =
   '\n\n[...Read output omitted to fit Codex context budget...]\n\n';
 const READ_OFFSET_GUIDANCE_LINES = [
   READ_GUIDANCE_HEADER,
-  '- offset is an optional zero-based continuation index, not a line number lookup.',
-  '- Use offset only after a prior Read of the same file returned content and more lines are needed.',
-  '- Compute offset as prior offset plus the number of lines returned by that prior Read.',
-  '- Displayed line numbers, grep line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets.',
-  '- Omit offset and limit when opening a file or when unsure.',
+  '- offset is the 1-based source line to start at and matches the line numbers displayed by Read.',
+  '- Continue from the exact offset reported by Read, or from the line after the last contiguous source line actually shown.',
+  '- Claude Read can reject a result before the gateway sees it when a page exceeds roughly 25,000 tokens or 256 KB. Reduce limit and retry.',
+  '- Line paging cannot split one very long/minified line. Use targeted Grep, jq, or Bash byte/character slices for dense JSON, CSV, and generated files.',
+  '- Partial, truncated, head/tail, or omitted output is not complete coverage. Never advance past or make completeness claims about an unseen gap.',
+];
+const LARGE_OUTPUT_GUIDANCE_LINES = [
+  LARGE_OUTPUT_GUIDANCE_HEADER,
+  '- For a large git diff, inventory first with git diff --stat, --numstat, and --name-only; then inspect one file and bounded hunk range at a time.',
+  "- If a diff is still large, snapshot it to a temporary file, index hunk headers with rg -n '^@@', and read explicit output ranges so every hunk can be accounted for.",
+  '- Prefer targeted rg/Grep queries and bounded output over printing a whole large file or diff.',
+  '- Treat every partial or truncated result as incomplete. Do not claim whole-file or whole-diff coverage until each planned file/range/hunk is accounted for.',
 ];
 
 function noop() {}
+
+function parseCodexAppServerVersion(initializeResult) {
+  const userAgent = String(initializeResult?.userAgent || initializeResult?.user_agent || '');
+  const match = userAgent.match(/codex_cli_rs\/(\d+)\.(\d+)\.(\d+)/u);
+  return match ? match.slice(1, 4).map(Number) : null;
+}
+
+function versionAtLeast(version, minimum) {
+  if (!version) {
+    return false;
+  }
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (version[index] > minimum[index]) {
+      return true;
+    }
+    if (version[index] < minimum[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertDynamicToolsOnlyCodexCompatibility(config, initializeResult) {
+  if (config?.codex?.dynamicToolsOnly !== true) {
+    return;
+  }
+
+  const version = parseCodexAppServerVersion(initializeResult);
+  if (versionAtLeast(version, MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION)) {
+    return;
+  }
+
+  const detected = version ? version.join('.') : 'unknown';
+  throw new GatewayError(
+    502,
+    'api_error',
+    `shared gateway requires Codex CLI 0.144.1 or newer for dynamic-tools-only threads (detected ${detected}); update Codex and restart claude-workflow-gateway`
+  );
+}
 
 function signalChildProcessTree(child, signal) {
   if (!child) {
@@ -233,18 +284,28 @@ function readOffsetGuidance() {
   return READ_OFFSET_GUIDANCE_LINES.join('\n');
 }
 
+function largeOutputGuidance() {
+  return LARGE_OUTPUT_GUIDANCE_LINES.join('\n');
+}
+
 function codexToolDescription(tool) {
   const description = tool?.description || tool?.name || '';
-  if (!isReadToolName(tool?.name)) {
+  const readTool = isReadToolName(tool?.name);
+  const largeOutputTool = LARGE_OUTPUT_TOOL_NAMES.has(tool?.name);
+  if (!readTool && !largeOutputTool) {
     return description;
   }
 
-  if (description.includes(READ_GUIDANCE_HEADER)) {
-    return description;
+  const guidance = [];
+  if (readTool && !description.includes(READ_GUIDANCE_HEADER)) {
+    guidance.push(readOffsetGuidance());
+  }
+  if (largeOutputTool && !description.includes(LARGE_OUTPUT_GUIDANCE_HEADER)) {
+    guidance.push(largeOutputGuidance());
   }
 
   const base = description || 'Reads a file from the local filesystem.';
-  return `${base}\n\n${readOffsetGuidance()}`;
+  return guidance.length > 0 ? `${base}\n\n${guidance.join('\n\n')}` : base;
 }
 
 function appendSchemaPropertyDescription(schema, propertyName, description) {
@@ -377,89 +438,6 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function integerToolArgument(value) {
-  if (Number.isInteger(value)) {
-    return value;
-  }
-
-  if (typeof value !== 'string') {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  if (!/^-?\d+$/u.test(trimmed)) {
-    return null;
-  }
-
-  const parsed = Number(trimmed);
-  return Number.isSafeInteger(parsed) ? parsed : null;
-}
-
-function markReadIntegerArgumentRemoved(info, key, reason) {
-  switch (key) {
-    case 'offset':
-      info.offsetRemoved = true;
-      info.offsetRemovedReason = reason;
-      return;
-    case 'limit':
-      info.limitRemoved = true;
-      info.limitRemovedReason = reason;
-      return;
-    default:
-      return;
-  }
-}
-
-function recordSanitizedReadIntegerArgument(info, key, value) {
-  switch (key) {
-    case 'offset':
-      info.sanitizedOffset = value;
-      return;
-    case 'limit':
-      info.sanitizedLimit = value;
-      return;
-    default:
-      return;
-  }
-}
-
-function removeReadIntegerArgument(args, key, info, reason) {
-  delete args[key];
-  info.changed = true;
-  info.reasons.push(reason);
-  markReadIntegerArgumentRemoved(info, key, reason);
-}
-
-function normalizeReadIntegerArgument(args, key, info, options) {
-  if (!Object.hasOwn(args, key)) {
-    return;
-  }
-
-  const original = args[key];
-  const parsed = integerToolArgument(original);
-  if (parsed === null || parsed < options.minimum) {
-    removeReadIntegerArgument(args, key, info, options.invalidReason);
-    return;
-  }
-
-  if (key === 'offset') {
-    info.hadOffset = true;
-    info.originalOffset = original;
-    if (parsed >= READ_OFFSET_REWRITE_THRESHOLD) {
-      removeReadIntegerArgument(args, key, info, READ_OFFSET_EXCEEDS_REASON);
-      return;
-    }
-  }
-
-  if (original !== parsed) {
-    args[key] = parsed;
-    info.changed = true;
-    info.reasons.push(`${key}_normalized`);
-  }
-
-  recordSanitizedReadIntegerArgument(info, key, parsed);
-}
-
 function readFilePathFromArgs(args) {
   if (typeof args.file_path === 'string') {
     return args.file_path;
@@ -488,8 +466,8 @@ function sanitizeCodexToolCallArguments(toolName, args, callId = null) {
     reasons: [],
     hadOffset: Object.hasOwn(safeArgs, 'offset'),
     originalOffset: safeArgs.offset ?? null,
-    sanitizedOffset: null,
-    sanitizedLimit: null,
+    sanitizedOffset: safeArgs.offset ?? null,
+    sanitizedLimit: safeArgs.limit ?? null,
     offsetRemoved: false,
     offsetRemovedReason: null,
     limitRemoved: false,
@@ -497,22 +475,6 @@ function sanitizeCodexToolCallArguments(toolName, args, callId = null) {
     emptyPagesRemoved: false,
     filePath: readFilePathFromArgs(safeArgs),
   };
-
-  if (safeArgs.pages === '') {
-    delete safeArgs.pages;
-    info.changed = true;
-    info.emptyPagesRemoved = true;
-    info.reasons.push(READ_EMPTY_PAGES_REASON);
-  }
-
-  normalizeReadIntegerArgument(safeArgs, 'offset', info, {
-    minimum: 0,
-    invalidReason: READ_INVALID_OFFSET_REASON,
-  });
-  normalizeReadIntegerArgument(safeArgs, 'limit', info, {
-    minimum: 1,
-    invalidReason: READ_INVALID_LIMIT_REASON,
-  });
 
   return {
     arguments: safeArgs,
@@ -640,14 +602,6 @@ function estimateIncomingRequestTokens(requestBody) {
 
   try {
     return estimateTokensFromJson(latest.content ?? '');
-  } catch {
-    return 0;
-  }
-}
-
-function estimateReplayTranscriptTokens(requestBody) {
-  try {
-    return estimateTokensFromText(renderTranscriptInput(requestBody));
   } catch {
     return 0;
   }
@@ -854,7 +808,7 @@ function utf8SuffixByByteBudget(text, maxBytes) {
   return text.slice(start);
 }
 
-function truncateMiddleByByteBudget(text, maxBytes) {
+function truncateMiddleByByteBudget(text, maxBytes, options = {}) {
   const value = String(text || '');
   const originalBytes = Buffer.byteLength(value, 'utf8');
   if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
@@ -868,23 +822,44 @@ function truncateMiddleByByteBudget(text, maxBytes) {
   }
 
   const budget = Math.max(0, Math.trunc(maxBytes));
-  const leftBudget = Math.floor(budget / 2);
-  const rightBudget = budget - leftBudget;
-  const prefix = utf8PrefixByByteBudget(value, leftBudget);
-  const suffix = utf8SuffixByByteBudget(value, rightBudget);
-  const removedChars = Math.max(0, value.length - prefix.length - suffix.length);
+  const marker = options.marker || '\n[...output omitted to fit byte budget...]\n';
+  const markerBytes = byteLength(marker);
+  if (budget <= markerBytes) {
+    return {
+      text: utf8PrefixByByteBudget(marker, budget),
+      truncated: true,
+      originalBytes,
+      originalTokenCount: approxCodexOutputTokenCount(value),
+      totalLines: countOutputLines(value),
+    };
+  }
+
+  const contentBudget = budget - markerBytes;
+  const leftBudget = Math.floor(contentBudget / 2);
+  const rightBudget = contentBudget - leftBudget;
+  let prefix = options.lineAligned
+    ? lineAlignedPrefixByByteBudget(value, leftBudget)
+    : utf8PrefixByByteBudget(value, leftBudget);
+  let suffix = options.lineAligned
+    ? lineAlignedSuffixByByteBudget(value, rightBudget)
+    : utf8SuffixByByteBudget(value, rightBudget);
+
+  // Very long single lines cannot be aligned without discarding the whole
+  // preview, so retain byte-safe fragments while keeping the hard bound.
+  if (!prefix && leftBudget > 0) {
+    prefix = utf8PrefixByByteBudget(value, leftBudget);
+  }
+  if (!suffix && rightBudget > 0) {
+    suffix = utf8SuffixByByteBudget(value, rightBudget);
+  }
 
   return {
-    text: `${prefix}...${removedChars} chars truncated...${suffix}`,
+    text: `${prefix}${marker}${suffix}`,
     truncated: true,
     originalBytes,
     originalTokenCount: approxCodexOutputTokenCount(value),
     totalLines: countOutputLines(value),
   };
-}
-
-function normalizeNewlines(text) {
-  return String(text || '').replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
 }
 
 function lineAlignedPrefixByByteBudget(text, maxBytes) {
@@ -907,18 +882,8 @@ function lineAlignedSuffixByByteBudget(text, maxBytes) {
   return suffix.slice(newlineIndex + 1);
 }
 
-function readContinuationHint(totalLines, pendingToolCall = null) {
-  const previousOffset = integerToolArgument(pendingToolCall?.arguments?.offset);
-  if (previousOffset === null) {
-    return READ_CONTINUATION_HINT;
-  }
-
-  const nextOffset = previousOffset + totalLines;
-  return `${READ_CONTINUATION_HINT} This Read started at offset ${previousOffset} and returned ${totalLines} line(s), so the next sequential offset is ${nextOffset}.`;
-}
-
-function limitCodexReadToolResultText(text, maxBytes, pendingToolCall = null) {
-  const value = normalizeNewlines(text);
+function limitCodexReadToolResultText(text, maxBytes) {
+  const value = String(text || '');
   const originalBytes = Buffer.byteLength(value, 'utf8');
   const originalTokenCount = approxCodexOutputTokenCount(value);
   const totalLines = countOutputLines(value);
@@ -937,25 +902,19 @@ function limitCodexReadToolResultText(text, maxBytes, pendingToolCall = null) {
   const warning =
     `Warning: truncated Read output (original token count: ${originalTokenCount})\n` +
     `Total output lines: ${totalLines}\n` +
-    'Read output was shortened for Codex context budget. If omitted content matters, reread a smaller chunk before advancing past it.\n' +
-    readContinuationHint(totalLines, pendingToolCall);
-  const warningBytes = byteLength(`${warning}\n\n`);
-  const markerBytes = byteLength(READ_OUTPUT_OMISSION_MARKER);
-  const contentBudget = Math.max(1, Math.trunc(maxBytes) - warningBytes - markerBytes);
-  const prefixBudget = Math.max(1, Math.floor(contentBudget / 2));
-  const suffixBudget = Math.max(1, contentBudget - prefixBudget);
-  let prefix = lineAlignedPrefixByByteBudget(value, prefixBudget);
-  let suffix = lineAlignedSuffixByByteBudget(value, suffixBudget);
-
-  if (!prefix) {
-    prefix = utf8PrefixByByteBudget(value, prefixBudget);
-  }
-  if (!suffix) {
-    suffix = utf8SuffixByByteBudget(value, suffixBudget);
-  }
+    'The middle is an unseen gap. Do not advance a continuation cursor past it or claim complete coverage; reread smaller explicit 1-based source ranges.\n\n';
+  const budget = Math.max(0, Math.trunc(maxBytes));
+  const warningText = utf8PrefixByByteBudget(warning, budget);
+  const warningBytes = byteLength(warningText);
+  const body = warningBytes < budget
+    ? truncateMiddleByByteBudget(value, budget - warningBytes, {
+        marker: READ_OUTPUT_OMISSION_MARKER,
+        lineAligned: true,
+      }).text
+    : '';
 
   return {
-    text: `${warning}\n\n${prefix}${READ_OUTPUT_OMISSION_MARKER}${suffix}`,
+    text: `${warningText}${body}`,
     truncated: true,
     originalBytes,
     originalTokenCount,
@@ -966,24 +925,36 @@ function limitCodexReadToolResultText(text, maxBytes, pendingToolCall = null) {
 
 function limitCodexToolResultText(text, maxBytes, options = {}) {
   if (isReadToolName(options.toolName)) {
-    return limitCodexReadToolResultText(text, maxBytes, options.pendingToolCall || null);
+    return limitCodexReadToolResultText(text, maxBytes);
   }
 
-  const result = truncateMiddleByByteBudget(text, maxBytes);
-  if (!result.truncated) {
-    return result;
+  const value = String(text || '');
+  const originalBytes = byteLength(value);
+  if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
+    return truncateMiddleByByteBudget(value, maxBytes);
   }
 
+  const originalTokenCount = approxCodexOutputTokenCount(value);
+  const totalLines = countOutputLines(value);
+  const warning =
+    `Warning: truncated output (original token count: ${originalTokenCount})\n` +
+    `Total output lines: ${totalLines}\n\n`;
+  const budget = Math.max(0, Math.trunc(maxBytes));
+  const warningText = utf8PrefixByByteBudget(warning, budget);
+  const warningBytes = byteLength(warningText);
+  const body = warningBytes < budget
+    ? truncateMiddleByByteBudget(value, budget - warningBytes).text
+    : '';
   return {
-    ...result,
-    text:
-      `Warning: truncated output (original token count: ${result.originalTokenCount})\n` +
-      `Total output lines: ${result.totalLines}\n\n` +
-      result.text,
+    text: `${warningText}${body}`,
+    truncated: true,
+    originalBytes,
+    originalTokenCount,
+    totalLines,
   };
 }
 
-function codexThreadConfigOverrides(config) {
+function codexThreadConfigOverrides(config, route = null) {
   const overrides = {};
   const autoCompactTokenLimit = numberOrDefault(config?.codex?.autoCompactTokenLimit, 0);
   const autoCompactTokenLimitScope =
@@ -994,6 +965,18 @@ function codexThreadConfigOverrides(config) {
   }
   if (typeof autoCompactTokenLimitScope === 'string' && autoCompactTokenLimitScope.trim() !== '') {
     overrides.model_auto_compact_token_limit_scope = autoCompactTokenLimitScope.trim();
+  }
+
+  const verbosity = String(route?.verbosity || '').trim().toLowerCase();
+  if (verbosity) {
+    if (!CODEX_VERBOSITIES.has(verbosity)) {
+      throw new GatewayError(
+        400,
+        'invalid_request_error',
+        `unsupported Codex verbosity ${route.verbosity}; expected low, medium, or high`
+      );
+    }
+    overrides.model_verbosity = verbosity;
   }
 
   return overrides;
@@ -1052,17 +1035,9 @@ function hasMatchingToolResult(requestBody, pendingToolCall) {
     return false;
   }
 
-  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex];
-    if (message?.role !== 'user') {
-      continue;
-    }
-
-    for (const block of normalizeContentBlocks(message.content, 'tool_result message')) {
-      if (block?.type === 'tool_result' && block.tool_use_id === pendingToolCall.callId) {
-        return true;
-      }
+  for (const block of latestUserContentBlocks(requestBody, 'tool_result message')) {
+    if (block?.type === 'tool_result' && block.tool_use_id === pendingToolCall.callId) {
+      return true;
     }
   }
 
@@ -1168,38 +1143,17 @@ function renderToolResultContent(content) {
   return joinTextParts(parts);
 }
 
-function readOffsetRewriteNote(readSanitization) {
-  if (!readSanitization?.offsetRemoved) {
-    return '';
-  }
-
-  const file = readSanitization.filePath ? ` for ${readSanitization.filePath}` : '';
-  const originalOffset = String(readSanitization.originalOffset ?? 'unknown');
-  if (readSanitization.offsetRemovedReason === READ_OFFSET_EXCEEDS_REASON) {
-    return (
-      `${READ_REWRITE_NOTE_HEADER}\n` +
-      `- Requested Read offset ${originalOffset}${file} exceeds the gateway rewrite threshold of ${READ_OFFSET_REWRITE_THRESHOLD}.\n` +
-      '- This Read starts at the beginning of the file.\n' +
-      '- For continuation reads, use offset after a prior Read of the same file returned content and more lines are needed.\n' +
-      '- Compute offset as prior offset plus the number of lines returned by that prior Read.'
-    );
-  }
-
-  return (
-    `${READ_REWRITE_NOTE_HEADER}\n` +
-    `- Requested Read offset ${originalOffset}${file} is not a valid non-negative integer offset.\n` +
-    '- The invalid offset was removed before running Read.\n' +
-    '- Use offset only as a zero-based continuation index after a prior Read returned content.'
-  );
-}
-
 function looksLikeReadOffsetResult(output) {
   const lower = output.toLowerCase();
   return (
-    lower.includes('offset') &&
-    (lower.includes('file has') ||
-      lower.includes('out of range') ||
-      (lower.includes('line') && lower.includes('requested')))
+    (lower.includes('offset') &&
+      (lower.includes('file has') ||
+        lower.includes('out of range') ||
+        (lower.includes('line') && lower.includes('requested')))) ||
+    lower.includes('exceeds maximum allowed tokens') ||
+    lower.includes('exceeds maximum allowed size') ||
+    lower.includes('partial view') ||
+    lower.includes('[truncated:')
   );
 }
 
@@ -1217,24 +1171,13 @@ function shouldAppendReadOffsetGuidance(output, pendingToolCall, isError) {
     return false;
   }
 
-  const args = pendingToolCall.arguments || {};
-  const hadOffset = pendingToolCall.readSanitization?.hadOffset || Object.hasOwn(args, 'offset');
-  if (!hadOffset) {
-    return false;
-  }
-
-  if (!looksLikeReadOffsetResult(output)) {
-    return false;
-  }
-
-  return isError || looksLikeReadOffsetWarning(output);
+  return isError || (looksLikeReadOffsetResult(output) && looksLikeReadOffsetWarning(output));
 }
 
 function appendReadToolResultFeedback(text, pendingToolCall, isError) {
   let output = String(text || '');
   const feedback = {
     readTool: isReadToolName(pendingToolCall?.tool),
-    rewriteNoteAppended: false,
     guidanceAppended: false,
   };
 
@@ -1243,12 +1186,6 @@ function appendReadToolResultFeedback(text, pendingToolCall, isError) {
       text: output,
       feedback,
     };
-  }
-
-  const rewriteNote = readOffsetRewriteNote(pendingToolCall.readSanitization);
-  if (rewriteNote && !output.includes(READ_REWRITE_NOTE_HEADER)) {
-    output = `${output}\n\n${rewriteNote}`;
-    feedback.rewriteNoteAppended = true;
   }
 
   if (shouldAppendReadOffsetGuidance(output, pendingToolCall, isError)) {
@@ -1292,6 +1229,77 @@ function renderMessageTranscript(message) {
   }
 
   return `[${message.role || 'unknown'}]\n${content}`;
+}
+
+function latestUserContentBlocks(requestBody, label = 'latest user message') {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === 'user') {
+      return normalizeContentBlocks(message.content, label);
+    }
+  }
+  return [];
+}
+
+function canonicalContinuityMessage(message) {
+  return [
+    message?.role || 'unknown',
+    normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`).map(
+      renderTranscriptBlock
+    ),
+  ];
+}
+
+function continuityMessages(requestBody) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  return messages
+    .filter(function excludeSystemMessage(message) {
+      return message?.role !== 'system';
+    })
+    .map(canonicalContinuityMessage);
+}
+
+function outcomeAssistantMessage(outcome) {
+  const content = [];
+  if (typeof outcome?.text === 'string' && outcome.text !== '') {
+    content.push({ type: 'text', text: outcome.text });
+  }
+  if (outcome?.type === 'tool_use' && outcome.toolCall) {
+    content.push({
+      type: 'tool_use',
+      id: outcome.toolCall.id,
+      name: outcome.toolCall.name,
+      input: outcome.toolCall.input || {},
+    });
+  }
+  return { role: 'assistant', content };
+}
+
+function continuityFingerprint(messages) {
+  return crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex');
+}
+
+function makeContinuityAnchor(requestBody, outcome) {
+  const messages = continuityMessages(requestBody);
+  messages.push(canonicalContinuityMessage(outcomeAssistantMessage(outcome)));
+  return {
+    messageCount: messages.length,
+    fingerprint: continuityFingerprint(messages),
+  };
+}
+
+function matchesContinuityAnchor(requestBody, anchor) {
+  if (!anchor) {
+    return true;
+  }
+  const messages = continuityMessages(requestBody);
+  if (messages.length < anchor.messageCount) {
+    return false;
+  }
+  return (
+    continuityFingerprint(messages.slice(0, anchor.messageCount)) === anchor.fingerprint
+  );
 }
 
 function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
@@ -1513,28 +1521,19 @@ function isPossibleCodexContextWindowError(error) {
 }
 
 function toolResultPayloadFromRequest(requestBody, callId) {
-  const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
-
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex];
-    if (message?.role !== 'user') {
+  for (const block of latestUserContentBlocks(requestBody, 'tool_result message')) {
+    if (block?.type !== 'tool_result') {
       continue;
     }
 
-    for (const block of normalizeContentBlocks(message.content, 'tool_result message')) {
-      if (block?.type !== 'tool_result') {
-        continue;
-      }
-
-      if (block.tool_use_id !== callId) {
-        continue;
-      }
-
-      return {
-        text: renderToolResultContent(block.content),
-        isError: block.is_error === true,
-      };
+    if (block.tool_use_id !== callId) {
+      continue;
     }
+
+    return {
+      text: renderToolResultContent(block.content),
+      isError: block.is_error === true,
+    };
   }
 
   return null;
@@ -1633,7 +1632,8 @@ function buildSessionIdentityKey(route, req) {
 function buildSessionBaseKey(route, req, requestBody) {
   const identityKey = buildSessionIdentityKey(route, req);
   const toolKey = shortHash(effectiveToolSchemaSignature(requestBody));
-  return `${identityKey}:${toolKey}`;
+  const systemKey = shortHash(renderSystemPrompt(requestBody));
+  return `${identityKey}:${toolKey}:${systemKey}`;
 }
 
 function buildForkSessionKey(baseKey, fingerprint) {
@@ -1665,13 +1665,9 @@ function validateCodexRequestControls(requestBody) {
 
 function extractToolResultIds(requestBody) {
   const toolResultIds = new Set();
-  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
-  for (const message of messages) {
-    const blocks = normalizeContentBlocks(message?.content, 'message content');
-    for (const block of blocks) {
-      if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string' && block.tool_use_id) {
-        toolResultIds.add(block.tool_use_id);
-      }
+  for (const block of latestUserContentBlocks(requestBody, 'tool_result message')) {
+    if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string' && block.tool_use_id) {
+      toolResultIds.add(block.tool_use_id);
     }
   }
   return toolResultIds;
@@ -1734,14 +1730,15 @@ class CodexAppServerConnection extends EventEmitter {
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', this.handleStdout.bind(this));
     this.child.stderr.on('data', this.handleStderr.bind(this));
+    this.child.stdin.on('error', this.handleStdinError.bind(this));
     this.child.on('error', this.handleExit.bind(this));
     this.child.on('close', this.handleClose.bind(this));
 
     const initializeResult = await this.rawRequest('initialize', {
       clientInfo: {
-        name: 'ultrathink_gateway',
-        title: 'UltraThink Gateway',
-        version: '1.0.0',
+        name: 'claude_workflow_gateway',
+        title: 'Claude Workflow Gateway',
+        version: '0.1.0',
       },
       capabilities: {
         experimentalApi: true,
@@ -1753,6 +1750,7 @@ class CodexAppServerConnection extends EventEmitter {
       params: {},
     });
     this.initialized = true;
+    assertDynamicToolsOnlyCodexCompatibility(this.config, initializeResult);
     return initializeResult;
   }
 
@@ -1794,6 +1792,16 @@ class CodexAppServerConnection extends EventEmitter {
         new GatewayError(502, 'api_error', `Codex app-server transport failed: ${text}`)
       );
     }
+  }
+
+  handleStdinError(error) {
+    this.handleExit(
+      new GatewayError(
+        502,
+        'api_error',
+        `Codex app-server stdin failed: ${error?.message || String(error)}`
+      )
+    );
   }
 
   handleExit(error) {
@@ -1873,7 +1881,16 @@ class CodexAppServerConnection extends EventEmitter {
       throw new GatewayError(502, 'api_error', 'Codex app-server is not available');
     }
 
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    try {
+      this.child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+        if (error) {
+          this.handleStdinError(error);
+        }
+      });
+    } catch (error) {
+      this.handleStdinError(error);
+      throw error;
+    }
   }
 
   async request(method, params) {
@@ -2036,10 +2053,12 @@ class CodexGatewaySession {
     this.pendingToolCall = null;
     this.activeBoundary = null;
     this.routingReservation = null;
+    this.transcriptAnchor = null;
     this.toolResultWindowBytes = 0;
     this.latestTotalUsage = emptyUsage();
     this.latestContextTokens = 0;
     this.idleTimer = null;
+    this.pendingToolTimer = null;
     this.lastUsedAt = Date.now();
     this.disposed = false;
 
@@ -2047,6 +2066,7 @@ class CodexGatewaySession {
       tool_count: this.effectiveTools.length,
       thread_source: this.threadSource,
       ephemeral_thread: this.ephemeralThread,
+      dynamic_tools_only: this.config.codex.dynamicToolsOnly === true,
     });
   }
 
@@ -2062,31 +2082,64 @@ class CodexGatewaySession {
     }) || null;
   }
 
-  touch(onExpire, timeoutMs = this.config.codex.idleTimeoutMs) {
+  touch(
+    onExpire,
+    timeoutMs = this.config.codex.idleTimeoutMs,
+    pendingToolTimeoutMs = DEFAULT_PENDING_TOOL_TIMEOUT_MS
+  ) {
     this.lastUsedAt = Date.now();
     clearTimeout(this.idleTimer);
+    clearTimeout(this.pendingToolTimer);
+    this.idleTimer = null;
+    this.pendingToolTimer = null;
+    if (this.routingReservation || (this.activeBoundary && !this.activeBoundary.finished)) {
+      return;
+    }
+
+    if (this.pendingToolCall) {
+      const effectivePendingTimeoutMs = Math.max(
+        0,
+        numberOrDefault(pendingToolTimeoutMs, DEFAULT_PENDING_TOOL_TIMEOUT_MS)
+      );
+      if (effectivePendingTimeoutMs <= 0) {
+        return;
+      }
+
+      this.pendingToolTimer = setTimeout(() => {
+        onExpire(this.sessionKey, 'pending_tool_timeout');
+      }, effectivePendingTimeoutMs);
+      this.pendingToolTimer.unref?.();
+      return;
+    }
+
     const effectiveTimeoutMs = Math.max(0, numberOrDefault(timeoutMs, 0));
     if (effectiveTimeoutMs <= 0 || !this.isIdle()) {
       return;
     }
 
     this.idleTimer = setTimeout(() => {
-      onExpire(this.sessionKey);
+      onExpire(this.sessionKey, 'idle_timeout');
     }, effectiveTimeoutMs);
     this.idleTimer.unref?.();
   }
 
   clearIdleTimer() {
     clearTimeout(this.idleTimer);
+    clearTimeout(this.pendingToolTimer);
     this.idleTimer = null;
+    this.pendingToolTimer = null;
   }
 
   isIdle() {
-    return !this.routingReservation && (!this.activeBoundary || this.activeBoundary.finished);
+    return (
+      !this.routingReservation &&
+      !this.pendingToolCall &&
+      (!this.activeBoundary || this.activeBoundary.finished)
+    );
   }
 
   isDisposableIdle() {
-    return !this.routingReservation && !this.pendingToolCall && this.isIdle();
+    return this.isIdle();
   }
 
   isForkSession() {
@@ -2133,15 +2186,11 @@ class CodexGatewaySession {
   }
 
   initialInputMode() {
-    if (this.bootstrapMode) {
-      return this.bootstrapMode;
-    }
+    return this.bootstrapMode || 'transcript';
+  }
 
-    if (this.isForkSession()) {
-      return 'latest';
-    }
-
-    return 'transcript';
+  isTranscriptContinuous(requestBody) {
+    return matchesContinuityAnchor(requestBody, this.transcriptAnchor);
   }
 
   initialTurnInput(requestBody) {
@@ -2216,7 +2265,7 @@ class CodexGatewaySession {
       return;
     }
 
-    const threadConfig = codexThreadConfigOverrides(this.config);
+    const threadConfig = codexThreadConfigOverrides(this.config, this.route);
     const result = await this.connection.request('thread/start', {
       model: this.route.upstreamModel,
       cwd: this.config.codex.cwd,
@@ -2224,10 +2273,11 @@ class CodexGatewaySession {
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
-      serviceName: 'ultrathink_gateway',
+      serviceName: 'claude_workflow_gateway',
       threadSource: this.threadSource,
       ...(Object.keys(threadConfig).length > 0 ? { config: threadConfig } : {}),
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
+      ...(this.config.codex.dynamicToolsOnly === true ? { environments: [] } : {}),
     });
 
     this.threadId = result.thread?.id || null;
@@ -2239,6 +2289,7 @@ class CodexGatewaySession {
       thread_id: this.threadId,
       thread_source: this.threadSource,
       ephemeral_thread: this.ephemeralThread,
+      dynamic_tools_only: this.config.codex.dynamicToolsOnly === true,
       thread_config: threadConfig,
     });
   }
@@ -2308,13 +2359,13 @@ class CodexGatewaySession {
       effectiveToolResultMaxBytes,
       {
         toolName: this.pendingToolCall.tool,
-        pendingToolCall: this.pendingToolCall,
       }
     );
-    const finalToolResultText = limitTextByTokenBudget(
-      limitedToolResult.text,
-      this.inputMaxTokens()
-    );
+    // Current Codex applies its model's token-aware function-output policy
+    // when it records dynamic-tool results. Do not pre-truncate the response
+    // again using the gateway's turn-input budget; optional byte caps above
+    // remain available for operators that need a transport-level hard bound.
+    const finalToolResultText = limitedToolResult.text;
     const toolResult = {
       ...rawToolResult,
       text: finalToolResultText,
@@ -2330,7 +2381,7 @@ class CodexGatewaySession {
       result_bytes: resultBytes,
       result_length: toolResult.text.length,
       tool_result_truncated: limitedToolResult.truncated,
-      tool_result_input_budget_truncated: finalToolResultText !== limitedToolResult.text,
+      tool_result_input_budget_truncated: false,
       tool_result_max_bytes: Number.isFinite(toolResultMaxBytes) ? toolResultMaxBytes : null,
       tool_result_window_bytes: this.toolResultWindowBytes,
       tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
@@ -2532,6 +2583,7 @@ class CodexGatewaySession {
       cleanup();
       boundary.finished = true;
       populateEstimatedUsage(boundary, requestBody, outcome);
+      this.transcriptAnchor = makeContinuityAnchor(requestBody, outcome);
       boundary.outcome = {
         ...outcome,
         usage: boundary.usage,
@@ -2814,6 +2866,7 @@ class CodexGatewaySession {
     }
     this.disposed = true;
     clearTimeout(this.idleTimer);
+    clearTimeout(this.pendingToolTimer);
     traceLog(this.tracer, 'codex.session.closed');
     await this.connection.close(reason);
   }
@@ -2995,6 +3048,32 @@ export class CodexSessionManager {
       request_fingerprint: selection.requestFingerprint,
     });
 
+    if (
+      session &&
+      selection.selectionReason === 'canonical' &&
+      session.isTranscriptContinuous?.(requestBody) === false
+    ) {
+      const divergedSession = session;
+      traceLog(requestTracer || this.tracer, 'codex.session.transcript_diverged', {
+        session_key: selection.sessionKey,
+        selection_reason: selection.selectionReason,
+        expected_message_count: divergedSession.transcriptAnchor?.messageCount || null,
+        expected_fingerprint: divergedSession.transcriptAnchor?.fingerprint || null,
+      });
+      this.sessions.delete(selection.sessionKey);
+      void Promise.resolve()
+        .then(function closeDivergedSession() {
+          return divergedSession.close(
+            new Error('Claude transcript diverged from the live Codex thread')
+          );
+        })
+        .catch(function ignoreDivergedSessionCloseFailure() {});
+      session = null;
+      // The current Claude request is authoritative after a rewind, branch, or
+      // compaction. Seed a clean Codex thread from its bounded transcript.
+      options = { ...options, bootstrapMode: 'transcript' };
+    }
+
     const pressure = session
       ? this.contextPressureDecision(session, selection.selectionReason, requestBody)
       : null;
@@ -3005,7 +3084,6 @@ export class CodexSessionManager {
         context_tokens: pressure.contextTokens,
         incoming_tokens: pressure.incomingTokens,
         projected_live_tokens: pressure.projectedLiveTokens,
-        replay_transcript_tokens: pressure.replayTranscriptTokens || null,
         projected_tokens: pressure.projectedTokens,
         recycle_limit: pressure.limit,
         model_context_window: session.knownModelContextWindow?.() || null,
@@ -3021,6 +3099,7 @@ export class CodexSessionManager {
     }
 
     if (!session) {
+      this.ensureSessionCapacity(selection.sessionKey, requestTracer);
       session = this.createSession(
         route,
         req,
@@ -3226,19 +3305,10 @@ export class CodexSessionManager {
     const limit = this.recycleContextTokenLimit(session);
     const incomingTokens = estimateIncomingRequestTokens(requestBody);
     const projectedLiveTokens = contextTokens > 0 ? contextTokens + incomingTokens : 0;
-    // Matching tool_result follow-ups can arrive with stale or partial
-    // app-server usage snapshots. Compare against the full Claude replay too:
-    // if replaying the same request would already exceed the recycle
-    // threshold, prefer a fresh transcript-bounded session over continuing
-    // the old paused tool call.
-    const replayTranscriptTokens =
-      selectionReason === 'matching_tool_result'
-        ? estimateReplayTranscriptTokens(requestBody)
-        : 0;
-    if (projectedLiveTokens <= 0 && replayTranscriptTokens <= 0) {
+    if (projectedLiveTokens <= 0) {
       return null;
     }
-    const projectedTokens = Math.max(projectedLiveTokens, replayTranscriptTokens);
+    const projectedTokens = projectedLiveTokens;
     if (projectedTokens < limit) {
       return null;
     }
@@ -3247,7 +3317,6 @@ export class CodexSessionManager {
       contextTokens,
       incomingTokens,
       projectedLiveTokens,
-      replayTranscriptTokens,
       projectedTokens,
       limit,
     };
@@ -3271,7 +3340,7 @@ export class CodexSessionManager {
 
   async runPreparedSessionRequest(options) {
     const { req, requestBody, route, requestTracer, sessionOptions = {} } = options;
-    const { session, reservation } = this.prepareSessionRequest(
+    const { session, reservation, selectionReason } = this.prepareSessionRequest(
       req,
       requestBody,
       route,
@@ -3289,7 +3358,8 @@ export class CodexSessionManager {
         return options.run(session);
       },
       req.abortSignal,
-      reservation
+      reservation,
+      !['boundary_replay', 'routing_reservation_replay'].includes(selectionReason)
     );
   }
 
@@ -3323,12 +3393,85 @@ export class CodexSessionManager {
     return Math.max(0, numberOrDefault(this.config.codex.idleTimeoutMs, 0));
   }
 
+  maxSessions() {
+    return Math.max(
+      1,
+      numberOrDefault(this.config.codex.maxSessions, DEFAULT_MAX_SESSIONS)
+    );
+  }
+
+  ensureSessionCapacity(incomingSessionKey, requestTracer = null) {
+    const maxSessions = this.maxSessions();
+    if (this.sessions.size < maxSessions) {
+      return;
+    }
+
+    const candidates = Array.from(this.sessions.entries())
+      .filter(function disposableCandidate([, session]) {
+        return session.isDisposableIdle?.();
+      })
+      .sort(function oldestFirst(left, right) {
+        return (left[1].lastUsedAt || 0) - (right[1].lastUsedAt || 0);
+      });
+
+    while (this.sessions.size >= maxSessions && candidates.length > 0) {
+      const [sessionKey, session] = candidates.shift();
+      if (this.sessions.get(sessionKey) !== session) {
+        continue;
+      }
+
+      this.sessions.delete(sessionKey);
+      traceLog(requestTracer || this.tracer, 'codex.session.evicted_max_sessions', {
+        session_key: sessionKey,
+        incoming_session_key: incomingSessionKey,
+        max_sessions: maxSessions,
+        admission_eviction: true,
+      });
+      void Promise.resolve(
+        session.close(
+          new GatewayError(
+            499,
+            'api_error',
+            `Codex session pool admitted a replacement at max_sessions=${maxSessions}`
+          )
+        )
+      ).catch((error) => {
+        traceLog(requestTracer || this.tracer, 'codex.session.max_pool_cleanup_failed', {
+          session_key: sessionKey,
+          error_message: error?.message || String(error),
+        });
+      });
+    }
+
+    if (this.sessions.size >= maxSessions) {
+      throw new GatewayError(
+        503,
+        'overloaded_error',
+        `Codex session pool is at capacity (max_sessions=${maxSessions}); all sessions are active or waiting for tool results`
+      );
+    }
+  }
+
+  pendingToolTimeoutMs() {
+    return Math.max(
+      0,
+      numberOrDefault(
+        this.config.codex.pendingToolTimeoutMs,
+        DEFAULT_PENDING_TOOL_TIMEOUT_MS
+      )
+    );
+  }
+
   armIdleTimer(session) {
     if (this.sessions.get(session.sessionKey) !== session) {
       return;
     }
 
-    session.touch(this.expireSession.bind(this), this.sessionIdleTimeoutMs(session));
+    session.touch(
+      this.expireSession.bind(this),
+      this.sessionIdleTimeoutMs(session),
+      this.pendingToolTimeoutMs()
+    );
     void this.evictExcessIdleSessions(session).catch((error) => {
       traceLog(this.tracer, 'codex.session.max_pool_cleanup_failed', {
         session_key: session.sessionKey,
@@ -3337,9 +3480,15 @@ export class CodexSessionManager {
     });
   }
 
-  async runSessionRequest(session, run, signal, reservation = null) {
+  async runSessionRequest(
+    session,
+    run,
+    signal,
+    reservation = null,
+    abortSessionOnSignal = true
+  ) {
     try {
-      return await this.runWithAbort(session, run, signal);
+      return await this.runWithAbort(session, run, signal, abortSessionOnSignal);
     } catch (error) {
       if (this.isEvictableFailure(error)) {
         await this.evictSession(session.sessionKey, session, error, 'codex.session.evicted');
@@ -3351,7 +3500,7 @@ export class CodexSessionManager {
     }
   }
 
-  async runWithAbort(session, run, signal) {
+  async runWithAbort(session, run, signal, abortSessionOnSignal = true) {
     if (!signal) {
       return run();
     }
@@ -3370,7 +3519,9 @@ export class CodexSessionManager {
 
     if (signal.aborted) {
       const error = abortError();
-      await this.abortSession(session.sessionKey, error);
+      if (abortSessionOnSignal) {
+        await this.abortSession(session.sessionKey, error);
+      }
       throw error;
     }
 
@@ -3393,12 +3544,14 @@ export class CodexSessionManager {
 
       function onAbort() {
         const error = abortError();
-        void manager.abortSession(session.sessionKey, error).catch(function traceAbortFailure(closeError) {
-          traceLog(manager.tracer, 'codex.session.abort_cleanup_failed', {
-            session_key: session.sessionKey,
-            error_message: closeError?.message || String(closeError),
+        if (abortSessionOnSignal) {
+          void manager.abortSession(session.sessionKey, error).catch(function traceAbortFailure(closeError) {
+            traceLog(manager.tracer, 'codex.session.abort_cleanup_failed', {
+              session_key: session.sessionKey,
+              error_message: closeError?.message || String(closeError),
+            });
           });
-        });
+        }
         settle(reject, error);
       }
 
@@ -3449,7 +3602,7 @@ export class CodexSessionManager {
     await session.close(reason);
   }
 
-  async expireSession(sessionKey) {
+  async expireSession(sessionKey, reason = 'idle_timeout') {
     const session = this.sessions.get(sessionKey);
     if (!session) {
       return;
@@ -3458,15 +3611,21 @@ export class CodexSessionManager {
     this.sessions.delete(sessionKey);
     traceLog(this.tracer, 'codex.session.expired', {
       session_key: sessionKey,
+      reason,
     });
-    await session.close();
+    await session.close(
+      reason === 'pending_tool_timeout'
+        ? new GatewayError(
+            504,
+            'api_error',
+            `Codex session expired while waiting for tool_result after ${this.pendingToolTimeoutMs()}ms`
+          )
+        : null
+    );
   }
 
   async evictExcessIdleSessions(protectedSession = null) {
-    const maxSessions = Math.max(
-      1,
-      numberOrDefault(this.config.codex.maxSessions, DEFAULT_MAX_SESSIONS)
-    );
+    const maxSessions = this.maxSessions();
     if (this.sessions.size <= maxSessions) {
       return;
     }

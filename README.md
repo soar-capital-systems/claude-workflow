@@ -1,223 +1,276 @@
 # Claude Workflow
 
-`claude-workflow` launches the normal Claude Code TUI through a private local Anthropic-compatible gateway. The main/frontier Claude model stays on Anthropic, while workflow subagents and lower-tier Claude model ids can route to Codex through your local `codex login`.
+`claude-workflow` runs Claude Code through a local Anthropic-compatible gateway. The main/frontier model stays on Anthropic using your normal Claude Code login, while workflow subagents and selected lower-tier model IDs are routed to the local Codex CLI using `codex login`.
 
-The default local setup does not require Gemini, DeepSeek, OpenAI, or Anthropic API keys. It uses Claude Code local auth for Anthropic passthrough and `codex app-server` for Codex-backed routes.
+No model API key is required for the default setup.
+
+```text
+Claude Code -> localhost gateway -> Anthropic (main/frontier model)
+                                -> Codex app-server (workflow subagents)
+```
+
+> [!WARNING]
+> The launcher intentionally adds `--dangerously-skip-permissions` by default. This gives Claude Code unrestricted automation permissions. Use it only in repositories and machine environments you trust. Use `--no-yolo` when you want normal permission prompts.
 
 ## Requirements
 
-- Node.js 20 or newer
-- `claude` CLI on `PATH`
-- `codex` CLI on `PATH`
-- Local Claude Code auth
-- `codex login`
+| Component | Supported baseline | Notes |
+| --- | --- | --- |
+| Node.js | 20 or newer | Required by the gateway |
+| Claude Code | Current native CLI; verified with 2.1.206 | Install from [Anthropic's setup guide](https://docs.anthropic.com/en/docs/claude-code/getting-started) |
+| Codex CLI | 0.144.1 or newer | Required for shared-daemon dynamic-tools-only threads; see [OpenAI Codex](https://github.com/openai/codex) |
+| OS | macOS, Linux, or WSL | The daemon manager requires Bash |
+| Shell hook | zsh or Bash | Other shells can point `CLAUDE_WORKFLOW_SHELL_RC` at a POSIX-compatible zsh/Bash rc file |
 
-Check the required CLIs:
+Authenticate both CLIs before starting:
 
 ```bash
-command -v claude
-command -v codex
+claude --version
+codex --version
 codex login status
 ```
+
+### Default model choice
+
+The workflow default is `gpt-5.6-terra` at `max` reasoning, exposed to Claude Code under the short stable label `codex-terra`. [OpenAI describes Terra](https://openai.com/index/previewing-gpt-5-6-sol/) as the balanced everyday GPT-5.6 tier; it costs less than Sol and is a good fit when several delegated agents may run in parallel.
+
+For the highest single-agent capability, opt into `gpt-5.6-sol` with `max`. Sol is OpenAI's flagship and most capable tier. The workflow does not default to `ultra`: that effort can delegate to more subagents itself, which creates nested orchestration inside Claude's existing workflow delegation.
+
+```bash
+# Highest capability instead of the balanced default
+ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.6-sol \
+ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max \
+CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=codex-sol \
+claude-workflow
+```
+
+GPT-5.6 is currently a limited preview. The configured model must appear in `codex app-server`'s model catalog for your Codex workspace. If your account does not have it, set the upstream model to one your workspace exposes.
 
 ## Install
 
 ```bash
-npm install
+git clone https://github.com/yshaaban/claude-workflow.git
+cd claude-workflow
+npm ci
 npm link
 ```
 
-After linking, run from the project you want Claude Code and Codex to work in:
+`npm link` installs two commands:
+
+- `claude-workflow` — per-session launcher with an isolated dynamic localhost port.
+- `claude-workflow-gateway` — shared-daemon lifecycle manager.
+
+## Quick start
+
+Run from the repository Claude should work in:
 
 ```bash
-cd /path/to/your/project
+cd /path/to/project
 claude-workflow
 ```
 
-One-shot prompt mode:
+One-shot prompt:
 
 ```bash
-claude-workflow "Use a workflow to delegate a tiny subagent task, then summarize what happened."
+claude-workflow "Delegate a focused review to workflow subagents, then summarize the findings."
 ```
 
-Resume an existing Claude Code conversation through a fresh local gateway:
+Resume or continue a Claude Code session:
 
 ```bash
-claude-workflow --resume d3512e5e-c859-4109-aad1-f517c268d1e5
+claude-workflow --resume <session-id>
 claude-workflow --continue
 ```
 
-Do not export `ANTHROPIC_BASE_URL` yourself when using the launcher. It starts the local gateway first, chooses a port, then sets `ANTHROPIC_BASE_URL` only for the child Claude process.
-
-## Behavior
-
-- Starts a private local gateway on `127.0.0.1` with an OS-assigned port by default.
-- Starts Claude Code on `ULTRATHINK_GATEWAY_MAIN_MODEL_ID`, defaulting to `claude-fable-5[1m]`.
-- Keeps the `claude-fable-5*` frontier family on Anthropic by default.
-- Routes the default workflow subagent model to Codex `gpt-5.5`.
-- Shows routed model metadata by default, such as `codex-gpt-5.5-medium-via-claude-sonnet-4-7`.
-- Runs Codex app-server sessions with `workspace-write` and `approvalPolicy=never` unless overridden.
-- Launches Claude Code with `--dangerously-skip-permissions` by default.
-- Passes Claude Code session flags such as `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, `--from-pr`, and `--session-id` through to interactive Claude.
-
-Safe multi-folder behavior is the default. Leave `ULTRATHINK_GATEWAY_PORT` unset, or set it to `0`, so each `claude-workflow` process gets its own localhost port. If you force a fixed port such as `4318`, only one process can use it at a time.
-
-## Shared Gateway Daemon
-
-Sessions started outside the launcher, such as plain `claude`, `claude --resume`, or background workflow runs, have no private per-session gateway. If they request routed model ids directly from Anthropic, those ids can 404. The shared daemon runs the same workflow routing on a fixed local port and publishes shell exports for normal Claude Code sessions:
+The launcher owns model routing. Put wrapper options before `--` and native Claude options or commands after it:
 
 ```bash
-npm run daemon
-npm run daemon:status
-npm run daemon:stop
-npm run daemon:log
+# One-shot JSON output
+claude-workflow "Review the current diff." -- --output-format json
 
-# Install the shell hook. It writes to ~/.zshrc for zsh users and ~/.bashrc
-# otherwise; remove that block to disable.
-bash scripts/claude-workflow-daemon.sh install-shell
+# Native Claude options
+claude-workflow -- --add-dir ../shared --permission-mode plan
+
+# Native Claude commands
+claude-workflow -- doctor
+claude-workflow -- --version
 ```
 
-The daemon uses `ULTRATHINK_GATEWAY_DAEMON_PORT` (default `4318`), deliberately separate from the launcher's `ULTRATHINK_GATEWAY_PORT`. The `claude-workflow` launcher still overrides the daemon exports with its own private gateway.
+Unknown wrapper flags fail instead of silently becoming prompt text. Configure the main model with `ULTRATHINK_GATEWAY_MAIN_MODEL_ID`; native `--model` is deliberately rejected because it would bypass the gateway route contract.
 
-To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000`; the standalone raw gateway default is `192000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of that effective budget, not 75% of a larger model window. New Codex threads also set `model_auto_compact_token_limit_scope=body_after_prefix` by default so post-compaction summaries do not immediately count against the next compaction window again; the workflow launcher and daemon default `model_auto_compact_token_limit` to 70% of the Codex input ceiling unless `ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT` is set. Claude tool results sent back to Codex dynamic tools are capped per result by `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES` (default `10000`, set `0` to disable) and across a session by `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES` (default `64000`, set `0` to disable). The aggregate budget resets after Codex reports a real context shrink. If Codex still reports context exhaustion before stream output is forwarded, including `prompt is too long: ... maximum`, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
+## Permission behavior
 
-Permission flags:
+The permission bypass is intentional and can be made explicit:
 
 ```bash
-# Default behavior, made explicit
 claude-workflow --yolo
 claude-workflow --dangerously-skip-permissions
+```
 
-# Restore Claude Code permission prompts
+Restore Claude Code's normal permission flow for one invocation or by environment:
+
+```bash
 claude-workflow --no-yolo
 CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false claude-workflow
+claude-workflow -- --permission-mode plan
 ```
+
+An explicit native `--permission-mode` suppresses the injected bypass flag for that invocation.
+
+## Shared gateway daemon
+
+Plain `claude`, resumed/background sessions, and sessions started outside the wrapper do not inherit a per-launch gateway. Install the shell hook when those sessions should use the same workflow routing:
+
+```bash
+claude-workflow-gateway start
+claude-workflow-gateway status
+claude-workflow-gateway restart
+claude-workflow-gateway log
+
+claude-workflow-gateway install-shell
+# Later, to remove the managed block:
+claude-workflow-gateway uninstall-shell
+```
+
+The manager:
+
+- binds only to `127.0.0.1` on port 4318 by default;
+- publishes shell-safe exports in a private state directory;
+- verifies service identity, PID, and a source/config revision on every health check;
+- restarts stale code or changed trusted home configuration;
+- serializes concurrent startup and terminates the exact recorded process on stop;
+- keeps private, bounded, rotating JSONL traces by default.
+
+New installs use `${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow`. Existing `~/.cache/ultrathink` daemon state is detected so upgrades do not strand an already-running gateway. Override the location with `CLAUDE_WORKFLOW_GATEWAY_STATE_DIR`.
+
+The shell installer updates `~/.zshrc` or `~/.bashrc`, follows an rc-file symlink, preserves file mode, writes a backup, and refuses malformed/nested marker blocks.
+
+## Repository isolation
+
+Per-session launchers start Codex in the caller's repository and retain the configured Codex native environment.
+
+The shared daemon cannot safely use one startup directory for every repository. Its Codex threads therefore send `environments: []`: Codex-native shell and patch execution are disabled, while Claude-provided dynamic tools remain available. This is why the shared daemon requires Codex 0.144.1 or newer.
+
+Workflow entrypoints also ignore the current repository's `.env` by default. A repository cannot opt itself in. To trust it explicitly, export this in the parent shell before launching:
+
+```bash
+export CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true
+```
+
+## Large files and 12k-line diffs
+
+The gateway now treats large output as a coverage problem, not merely a context-window problem:
+
+- Claude `Read` offsets remain unchanged and are documented as 1-based source lines.
+- A matching `tool_result` always continues its live pending Codex call, even when the result is hundreds of kilobytes.
+- Current Codex owns token-aware dynamic-tool history truncation by default; optional gateway byte caps remain hard compatibility bounds.
+- Truncation always identifies an unseen gap and never invents a continuation cursor.
+- Bash/Grep tool descriptions require diff inventories, bounded per-hunk reads, and explicit accounting before claiming complete review.
+- Fresh, rewound, branched, or compacted Claude transcripts seed a clean Codex thread from a bounded authoritative replay.
+- Only a matching tool result in the latest user turn can resume a pending call.
+
+The offline suite includes a 12,000-line / roughly 500 KiB pending-result regression. See [Large files and diffs](docs/LARGE_FILES_AND_DIFFS.md) for the upstream Codex audit, failure analysis, operating protocol, and validation oracle.
+
+## Context and session strategy
+
+The workflow profile uses these defaults:
+
+- 180,000-token configured input ceiling, further bounded to 80% of the context window reported by Codex.
+- proactive thread recycling at 75% of the effective input budget;
+- bounded transcript replay first, latest-only input only as a last overflow recovery step;
+- Codex auto-compaction at 70% of the configured workflow ceiling with `body_after_prefix` scope;
+- upstream Codex token-aware tool-output truncation (gateway per-result and aggregate byte caps default to disabled);
+- 16 hard session slots, 30-second fork idle timeout, and an independent 10-minute pending-tool timeout.
+
+When every session slot is active, reserved, or waiting for a tool result, new unrelated work receives a retryable 503 instead of growing the process pool without bound.
 
 ## Configuration
 
-Configuration is read from the parent process environment, then a project `.env`, then `~/.claude-workflow.env`, then `~/.ultrathink.env` for compatibility with the original extraction source.
+Precedence for workflow entrypoints is:
 
-Common values:
+1. Parent process environment.
+2. Project `.env` only after parent-set `CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true`.
+3. `~/.claude-workflow.env`.
+4. Legacy `~/.ultrathink.env`.
 
-```bash
-ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]
-ULTRATHINK_GATEWAY_MAIN_PROVIDER=anthropic
-ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-fable-5*
-ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID=claude-sonnet-4-7
-ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.5
-ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=medium
-ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY=high
-```
+Common settings:
 
-Client-visible `[1m]` suffixes are aliases only. Anthropic passthrough sends the plain API model id upstream, for example `claude-opus-4-8[1m]` -> `claude-opus-4-8`. For Opus 4.8 1M passthrough:
+| Variable | Workflow default | Purpose |
+| --- | --- | --- |
+| `ULTRATHINK_GATEWAY_MAIN_MODEL_ID` | `claude-fable-5[1m]` | Claude Code-facing main model alias |
+| `ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL` | qualifier-stripped main ID | Actual Anthropic model ID |
+| `ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID` | `claude-sonnet-5` | Claude-facing workflow agent slot |
+| `ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL` | `gpt-5.6-terra` | Balanced Codex model tier |
+| `ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT` | `max` | Maximum single-agent reasoning |
+| `CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID` | `codex-terra` | Short Claude UI-facing routed label |
+| `ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY` | `high` | Codex response verbosity |
+| `ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS` | `16` | Hard app-server process/session cap |
+| `ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS` | `600000` | Independent pending-tool lifetime; `0` disables expiry |
+| `ULTRATHINK_GATEWAY_DAEMON_PORT` | `4318` | Managed shared daemon |
+| `ULTRATHINK_GATEWAY_PORT` | `0` launcher / `4319` raw gateway | Per-launch or standalone bind |
 
-```bash
-ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-opus-4-8[1m]
-ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-opus-4-8*
-# Optional explicit upstream override:
-# ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=claude-opus-4-8
-```
+See the packaged [.env.example](.env.example) for every supported route, budget, trace, proxy, and authentication setting.
 
-Codex route:
+## Security model
 
-```bash
-ULTRATHINK_GATEWAY_CODEX_COMMAND=codex
-ULTRATHINK_GATEWAY_CODEX_MODEL=gpt-5.5
-ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT=low
-ULTRATHINK_GATEWAY_CODEX_VERBOSITY=low
-ULTRATHINK_GATEWAY_CODEX_SANDBOX=workspace-write
-ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY=never
-ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=180000
-ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES=10000
-ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES=64000
-ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT=126000
-ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE=body_after_prefix
-ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS=30000
-ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
-```
+- The default gateway is loopback-only. A non-loopback bind is rejected unless `ULTRATHINK_GATEWAY_SHARED_SECRET` is set.
+- A loopback daemon is not an authorization boundary against other processes running as the same OS user.
+- With a shared secret, Anthropic passthrough requires a gateway-side `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`; the gateway never forwards its own shared secret upstream.
+- Published env, PID/revision state, logs, and traces are private. Symlinked state/trace targets and broadly accessible custom directories are rejected.
+- Unauthenticated non-loopback `/healthz` responses expose only service readiness, not PIDs, paths, revisions, or budgets.
+- Trace files rotate at 8 MiB with three files retained, and oversized events become bounded metadata records.
 
-`ULTRATHINK_GATEWAY_CODEX_COMMAND` is only the executable name or path. Do not set it to `codex app-server`; the gateway appends `app-server` itself.
+See [SECURITY.md](SECURITY.md) for reporting and deployment guidance.
 
-DeepSeek main route:
+## Standalone raw gateway
 
-```bash
-ULTRATHINK_GATEWAY_MAIN_PROVIDER=deepseek
-ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]
-ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY=your_deepseek_api_key
-ULTRATHINK_GATEWAY_DEEPSEEK_MODEL=deepseek-v4-pro
-ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT=max
-ULTRATHINK_THINKING_LEVEL=HIGH
-# Optional opt-out: ULTRATHINK_THINKING_LEVEL=OFF
-```
-
-DeepSeek thinking-mode routes omit `tool_choice` because the live API rejects that field while thinking is enabled. Tools are still advertised, and DeepSeek can choose tool calls normally.
-DeepSeek V4 uses a 1M context window by default, so `[1m]` Claude aliases can map directly to `deepseek-v4-pro` or `deepseek-v4-flash`.
-DeepSeek thinking is enabled by default and sends `reasoning_effort=max`.
-Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
-
-GLM main route:
-
-```bash
-ULTRATHINK_GATEWAY_MAIN_PROVIDER=glm
-ULTRATHINK_GATEWAY_MAIN_MODEL_ID=glm-5.2[1m]
-ULTRATHINK_GATEWAY_GLM_API_KEY=your_zai_api_key
-ULTRATHINK_GATEWAY_GLM_MODEL=glm-5.2
-ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT=max
-# Optional explicit default endpoint:
-# ULTRATHINK_GATEWAY_GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
-# Optional opt-out: ULTRATHINK_THINKING_LEVEL=OFF
-```
-
-GLM routes use Z.ai's OpenAI-compatible Coding Plan endpoint. `ZAI_API_KEY` and `GLM_API_KEY` are also accepted for local configuration.
-GLM 5.2 uses `glm-5.2` upstream. Client-visible aliases such as `glm-5.2[1m]` are exposed to Claude Code but stripped before the Z.ai API call.
-GLM thinking is enabled by default with `thinking.type=enabled`, `clear_thinking=false`, and `reasoning_effort=max`. GLM routes preserve `reasoning_content` across tool-result turns.
-
-Standalone route-map entries can also use exact keys or wildcard keys. Exact keys win before wildcard keys:
-
-```bash
-ULTRATHINK_GATEWAY_EXPOSED_MODELS=claude-fable-5[1m]
-ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"claude-fable-5*":{"provider":"deepseek","model":"deepseek-v4-pro","reasoningEffort":"max","displayName":"Fable 5 via DeepSeek V4 Pro"}}'
-```
-
-GLM route-map entries use the same shape:
-
-```bash
-ULTRATHINK_GATEWAY_EXPOSED_MODELS=glm-5.2[1m]
-ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"glm-5.2[1m]":{"provider":"glm","model":"glm-5.2","reasoningEffort":"max","displayName":"GLM 5.2"}}'
-```
-
-Wildcard route-map keys match requests, but they are not concrete model ids. Set `ULTRATHINK_GATEWAY_EXPOSED_MODELS` when a standalone client depends on `/v1/models` discovery.
-
-If you bind the gateway to a non-loopback host, set `ULTRATHINK_GATEWAY_SHARED_SECRET`. `claude-workflow` rejects unauthenticated non-loopback launches. If the shared secret is set and your main route still uses Anthropic passthrough, also set `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` on the gateway.
-
-Corporate proxy environments are supported for gateway upstream HTTP requests through `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY`. Proxy URLs must use `http://` or `https://`. The launcher adds the local gateway host to `NO_PROXY` and `no_proxy` for the child Claude process so Claude does not try to reach `127.0.0.1` through the proxy.
-
-See [.env.example](.env.example) for the full option set.
-
-## Standalone Raw Gateway
-
-The package also exposes the raw Anthropic-compatible gateway for targeted debugging:
+For protocol debugging without the workflow profile:
 
 ```bash
 npm run start:gateway
 ```
 
-After `npm link`, `claude-workflow-gateway` starts the shared workflow daemon rather than this raw gateway.
-
-Endpoints:
+It defaults to `127.0.0.1:4319` and exposes:
 
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 - `GET /v1/models`
 - `GET /healthz`
 
-## Development
+## Troubleshooting
+
+Check the daemon and exact loaded revision:
 
 ```bash
-npm install
-npm run check
-npm test
-npm run test:live:glm
+claude-workflow-gateway status
+claude-workflow-gateway log 100
+curl -s http://127.0.0.1:4318/healthz
 ```
 
-The gateway test suite uses fake Claude/Codex app-server processes for offline coverage of routing, streaming, tool calls, session reuse, startup reservations, proxy behavior, and launcher preflight handling. `npm run test:live:glm` spends live Z.ai quota only when `ULTRATHINK_GATEWAY_GLM_API_KEY`, `ZAI_API_KEY`, or `GLM_API_KEY` is set.
+Common failures:
+
+- `codex is not logged in` — run `codex login` and `codex login status`.
+- `requires Codex CLI 0.144.1 or newer` — update Codex, then run `claude-workflow-gateway restart`.
+- fixed-port collision — unset `ULTRATHINK_GATEWAY_PORT` or set it to `0` for per-launch use.
+- shared secret breaks Claude OAuth passthrough — configure `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`, or keep a local loopback gateway without a shared secret.
+- custom trace directory rejected — create it with mode 0700, or use the managed default.
+- routed model ID reaches Anthropic and 404s — launch through `claude-workflow` or install/restart the shared gateway shell hook.
+
+## Development and release checks
+
+```bash
+npm ci
+npm run check
+npm test
+npm run test:package
+```
+
+The offline suite covers routing, streaming, persistent/forked sessions, transcript rewinds, tool loops, 12k-line results, child-process failures, daemon lifecycle/revision checks, shell injection, trace rotation/concurrency, permission behavior, and packed npm-bin execution. Live GLM validation is opt-in with `npm run test:live:glm` and a configured API key.
+
+Additional references:
+
+- [CHANGELOG.md](CHANGELOG.md)
+- [SUPPORT.md](SUPPORT.md)
+- [Large files and diffs](docs/LARGE_FILES_AND_DIFFS.md)
+- [Anthropic Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage)
+- [OpenAI Codex source](https://github.com/openai/codex)

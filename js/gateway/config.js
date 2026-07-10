@@ -69,6 +69,10 @@ export function envFlag(name, fallback = false) {
 }
 
 function clampNumber(value, fallback, options = {}) {
+  if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) {
+    return fallback;
+  }
+
   const number = Number(value);
   if (!Number.isFinite(number)) {
     return fallback;
@@ -107,9 +111,12 @@ function parseRouteMap(value) {
   return parsed;
 }
 
-function optionalResolvedPath(value) {
+function optionalTracePath(value) {
   const configured = firstDefinedString(value);
   if (!configured) {
+    return '';
+  }
+  if (DISABLED_FLAG_VALUES.has(configured.toLowerCase())) {
     return '';
   }
   return path.resolve(expandHomePath(configured));
@@ -175,14 +182,28 @@ export function loadGatewayConfig() {
     exactRouteMapModels.length > 0 ? exactRouteMapModels : DEFAULT_EXPOSED_MODELS;
 
   return {
-    host: process.env.ULTRATHINK_GATEWAY_HOST || '127.0.0.1',
-    port: clampNumber(process.env.ULTRATHINK_GATEWAY_PORT, 4318, {
+    host: firstDefinedString(process.env.ULTRATHINK_GATEWAY_HOST, '127.0.0.1'),
+    port: clampNumber(process.env.ULTRATHINK_GATEWAY_PORT, 4319, {
       min: 1,
       max: 65535,
     }),
-    traceDir: optionalResolvedPath(process.env.ULTRATHINK_GATEWAY_TRACE_DIR),
+    traceDir: optionalTracePath(process.env.ULTRATHINK_GATEWAY_TRACE_DIR),
+    traceMaxBytes: clampNumber(
+      process.env.ULTRATHINK_GATEWAY_TRACE_MAX_BYTES,
+      8 * 1024 * 1024,
+      { min: 256, max: 1024 * 1024 * 1024 }
+    ),
+    traceMaxFiles: clampNumber(process.env.ULTRATHINK_GATEWAY_TRACE_MAX_FILES, 3, {
+      min: 1,
+      max: 16,
+    }),
+    runtimeRevision: firstDefinedString(process.env.ULTRATHINK_GATEWAY_RUNTIME_REVISION),
+    runtimeStartedAt: firstDefinedString(
+      process.env.ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT,
+      new Date().toISOString()
+    ),
     displayRoutedModel: envFlag('ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL', false),
-    sharedSecret: process.env.ULTRATHINK_GATEWAY_SHARED_SECRET || '',
+    sharedSecret: firstDefinedString(process.env.ULTRATHINK_GATEWAY_SHARED_SECRET),
     requestTimeoutMs: clampNumber(
       process.env.ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS,
       5 * 60_000,
@@ -198,7 +219,7 @@ export function loadGatewayConfig() {
       DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS
     ),
     codex: {
-      enabled: firstEnvString(['ULTRATHINK_GATEWAY_CODEX_ENABLED'], 'true') !== 'false',
+      enabled: envFlag('ULTRATHINK_GATEWAY_CODEX_ENABLED', true),
       command: firstEnvString(['ULTRATHINK_GATEWAY_CODEX_COMMAND'], 'codex'),
       cwd: path.resolve(
         expandHomePath(
@@ -213,12 +234,12 @@ export function loadGatewayConfig() {
         ['ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY'],
         DEFAULT_CODEX_APPROVAL_POLICY
       ),
-      model: codexProfileValue('model', 'gpt-5.5'),
-      reasoningEffort: codexProfileValue('reasoningEffort', 'low'),
+      model: codexProfileValue('model', 'gpt-5.6-terra'),
+      reasoningEffort: codexProfileValue('reasoningEffort', 'max'),
       verbosity: codexProfileValue('verbosity', 'low'),
       inputMaxTokens: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS,
-        256_000,
+        192_000,
         { min: 0, max: 1_000_000 }
       ),
       toolResultMaxBytes: clampNumber(
@@ -249,6 +270,11 @@ export function loadGatewayConfig() {
         30_000,
         { min: 0, max: 24 * 60 * 60_000 }
       ),
+      pendingToolTimeoutMs: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS,
+        10 * 60_000,
+        { min: 0, max: 24 * 60 * 60_000 }
+      ),
       maxSessions: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS,
         16,
@@ -272,7 +298,7 @@ export function loadGatewayConfig() {
         process.env.ULTRATHINK_GATEWAY_OPENAI_BASE_URL,
         'https://api.openai.com/v1'
       ),
-      model: codexProfileValue('model', 'gpt-5.5'),
+      model: codexProfileValue('model', 'gpt-5.6-terra'),
       reasoningEffort: codexProfileValue('reasoningEffort', 'low'),
       verbosity: codexProfileValue('verbosity', 'low'),
     },

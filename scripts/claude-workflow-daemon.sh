@@ -61,6 +61,7 @@ validate_managed_port() {
 }
 
 ensure_private_state_dir() {
+  local node_bin
   if [ -L "$STATE_DIR" ]; then
     echo "claude-workflow-gateway: state directory must not be a symlink: $STATE_DIR" >&2
     return 1
@@ -70,7 +71,19 @@ ensure_private_state_dir() {
     echo "claude-workflow-gateway: state path is not a directory: $STATE_DIR" >&2
     return 1
   fi
-  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if ! chmod 700 "$STATE_DIR" 2>/dev/null; then
+    echo "claude-workflow-gateway: could not make state directory owner-only: $STATE_DIR" >&2
+    return 1
+  fi
+  node_bin="$(find_node)" || {
+    echo "claude-workflow-gateway: node not found" >&2
+    return 1
+  }
+  if ! path_has_owner_only_mode "$node_bin" "$STATE_DIR"; then
+    echo "claude-workflow-gateway: state directory does not enforce owner-only permissions: $STATE_DIR" >&2
+    echo "claude-workflow-gateway: on WSL, use the Linux filesystem or enable DrvFS metadata" >&2
+    return 1
+  fi
 }
 
 find_node() {
@@ -99,6 +112,59 @@ find_node() {
     return 0
   fi
   return 1
+}
+
+file_mode() {
+  local node_bin="$1"
+  local target="$2"
+  "$node_bin" - "$target" <<'NODE'
+const fs = require('node:fs');
+const stats = fs.statSync(process.argv[2]);
+process.stdout.write((stats.mode & 0o7777).toString(8));
+NODE
+}
+
+path_has_owner_only_mode() {
+  local node_bin="$1"
+  local target="$2"
+  "$node_bin" - "$target" <<'NODE'
+const fs = require('node:fs');
+const stats = fs.lstatSync(process.argv[2]);
+process.exit((stats.mode & 0o077) === 0 ? 0 : 1);
+NODE
+}
+
+validate_manager_paths() {
+  local trace_dir_normalized
+  case "$STATE_DIR" in
+    /*) ;;
+    *)
+      echo "claude-workflow-gateway: CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/XDG_STATE_HOME must resolve to an absolute path: $STATE_DIR" >&2
+      return 1
+      ;;
+  esac
+  case "$ENV_FILE" in
+    /*) ;;
+    *)
+      echo "claude-workflow-gateway: CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be an absolute path: $ENV_FILE" >&2
+      return 1
+      ;;
+  esac
+  if [ "${ULTRATHINK_GATEWAY_TRACE_DIR+x}" = "x" ]; then
+    case "${ULTRATHINK_GATEWAY_TRACE_DIR:-}" in
+      ''|/*) ;;
+      *)
+        trace_dir_normalized="$(printf '%s' "$ULTRATHINK_GATEWAY_TRACE_DIR" | tr '[:upper:]' '[:lower:]')"
+        case "$trace_dir_normalized" in
+          0|false|no|off) ;;
+          *)
+            echo "claude-workflow-gateway: ULTRATHINK_GATEWAY_TRACE_DIR must be absolute or disabled with off/false/no/0" >&2
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+  fi
 }
 
 # Hash the runtime source tree, including uncommitted edits, so a healthy
@@ -186,6 +252,7 @@ write_atomic_state_file() {
   local target="$1"
   local value="$2"
   local temp_file
+  local node_bin
 
   temp_file="$(umask 077 && mktemp "$STATE_DIR/.claude-workflow-gateway.XXXXXX")" || return 1
   if ! (umask 077 && printf '%s\n' "$value" >"$temp_file"); then
@@ -194,6 +261,15 @@ write_atomic_state_file() {
   fi
   if ! mv -f "$temp_file" "$target"; then
     rm -f "$temp_file"
+    return 1
+  fi
+  node_bin="$(find_node)" || {
+    rm -f "$target"
+    return 1
+  }
+  if ! path_has_owner_only_mode "$node_bin" "$target"; then
+    rm -f "$target"
+    echo "claude-workflow-gateway: state file does not enforce owner-only permissions: $target" >&2
     return 1
   fi
 }
@@ -206,8 +282,22 @@ const { spawn } = require('node:child_process');
 
 const daemonPath = process.argv[2];
 const logPath = process.argv[3];
+if (fs.existsSync(logPath)) {
+  const existingLogStats = fs.lstatSync(logPath);
+  if (existingLogStats.isSymbolicLink() || !existingLogStats.isFile()) {
+    throw new Error(`gateway log path must be a regular file: ${logPath}`);
+  }
+}
 const logFd = fs.openSync(logPath, 'a', 0o600);
 fs.chmodSync(logPath, 0o600);
+const logStats = fs.lstatSync(logPath);
+if (!logStats.isFile() || logStats.isSymbolicLink() || (logStats.mode & 0o077) !== 0) {
+  fs.closeSync(logFd);
+  throw new Error(
+    `gateway log does not enforce owner-only permissions: ${logPath}. ` +
+      'On WSL, use the Linux filesystem or enable DrvFS metadata.'
+  );
+}
 const child = spawn(process.execPath, [daemonPath], {
   detached: true,
   env: process.env,
@@ -279,6 +369,9 @@ daemon_pid() {
 # which stop/restart must never kill.
 pid_is_daemon() {
   local pid="$1"
+  local command_kind
+  local command_line
+  local node_bin
   case "$pid" in
     ''|*[!0-9]*)
       return 1
@@ -286,11 +379,58 @@ pid_is_daemon() {
   esac
 
   if [ -r "/proc/$pid/cmdline" ]; then
-    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "claude-workflow-daemon"
-    return $?
+    node_bin="$(find_node)" || return 1
+    command_kind="$("$node_bin" - "$pid" "$DAEMON_JS" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const pid = process.argv[2];
+const expectedDaemon = fs.realpathSync(process.argv[3]);
+const commandLine = fs.readFileSync(`/proc/${pid}/cmdline`);
+const args = commandLine.toString('utf8').split('\0').filter(Boolean);
+if (args.length < 2) {
+  process.exit(1);
+}
+
+let executable;
+try {
+  executable = path.basename(fs.realpathSync(`/proc/${pid}/exe`));
+} catch {
+  process.exit(1);
+}
+if (executable !== 'node' && executable !== 'nodejs') {
+  process.exit(1);
+}
+
+let daemonArgument;
+try {
+  daemonArgument = fs.realpathSync(args[1]);
+} catch {
+  process.exit(1);
+}
+if (daemonArgument === expectedDaemon) {
+  process.stdout.write('current');
+} else if (path.basename(daemonArgument) === 'claude-workflow-daemon.js') {
+  process.stdout.write('legacy');
+} else {
+  process.exit(1);
+}
+NODE
+)" || return 1
+    case "$command_kind" in
+      current) return 0 ;;
+      legacy) health_matches_runtime "$pid" ;;
+      *) return 1 ;;
+    esac
   fi
 
-  ps -p "$pid" -o command= 2>/dev/null | grep -q "claude-workflow-daemon"
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+  if printf '%s\n' "$command_line" | grep -Fq -- "node $DAEMON_JS" ||
+    printf '%s\n' "$command_line" | grep -Fq -- "nodejs $DAEMON_JS"; then
+    return 0
+  fi
+  printf '%s\n' "$command_line" | grep -Fq 'claude-workflow-daemon.js' &&
+    health_matches_runtime "$pid"
 }
 
 pid_running() {
@@ -524,8 +664,16 @@ stop_daemon() {
 
 shell_rc_path() {
   if [ -n "${CLAUDE_WORKFLOW_SHELL_RC:-}" ]; then
-    printf '%s\n' "$CLAUDE_WORKFLOW_SHELL_RC"
-    return 0
+    case "$CLAUDE_WORKFLOW_SHELL_RC" in
+      /*)
+        printf '%s\n' "$CLAUDE_WORKFLOW_SHELL_RC"
+        return 0
+        ;;
+      *)
+        echo "claude-workflow-gateway: CLAUDE_WORKFLOW_SHELL_RC must be an absolute path" >&2
+        return 1
+        ;;
+    esac
   fi
 
   local shell_name
@@ -559,9 +707,12 @@ resolve_shell_rc_target() {
   printf '%s\n' "$target"
 }
 
-strip_installed_shell_blocks() {
+rewrite_shell_blocks() {
   local shell_rc="$1"
+  local operation="${2:-remove}"
   local temp_file
+  local node_bin
+  local shell_rc_mode
   [ -f "$shell_rc" ] || return 0
   temp_file="$(mktemp "${shell_rc}.claude-workflow.XXXXXX")" || return 1
   if ! awk '
@@ -584,25 +735,11 @@ strip_installed_shell_blocks() {
     echo "claude-workflow-gateway: refusing to edit malformed shell hook markers in $shell_rc" >&2
     return 1
   fi
-  if [ -e "$shell_rc" ]; then
-    chmod "$(stat -f '%Lp' "$shell_rc" 2>/dev/null || stat -c '%a' "$shell_rc" 2>/dev/null || echo 600)" "$temp_file" 2>/dev/null || true
-    cp -p "$shell_rc" "${shell_rc}.claude-workflow.bak" 2>/dev/null || true
-  fi
-  mv -f "$temp_file" "$shell_rc"
-}
-
-install_shell() {
-  local shell_rc
-  shell_rc="$(shell_rc_path)" || return 1
-  shell_rc="$(resolve_shell_rc_target "$shell_rc")" || return 1
-  mkdir -p "$(dirname "$shell_rc")" || return 1
-  touch "$shell_rc" || return 1
-  strip_installed_shell_blocks "$shell_rc" || return 1
-
-  {
-    echo ''
-    echo '# >>> claude-workflow gateway >>>'
-    cat <<'EOF'
+  if [ "$operation" = "install" ]; then
+    if ! {
+      echo ''
+      echo '# >>> claude-workflow gateway >>>'
+      cat <<'EOF'
 if command -v claude-workflow-gateway >/dev/null 2>&1; then
   _CLAUDE_WORKFLOW_GATEWAY_MANAGER="$(command -v claude-workflow-gateway)"
   "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" ensure >/dev/null 2>&1
@@ -636,8 +773,45 @@ if command -v claude-workflow-gateway >/dev/null 2>&1; then
   unset _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT
 fi
 EOF
-    echo '# <<< claude-workflow gateway <<<'
-  } >>"$shell_rc"
+      echo '# <<< claude-workflow gateway <<<'
+    } >>"$temp_file"; then
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: could not build shell hook update for $shell_rc" >&2
+      return 1
+    fi
+  fi
+  if [ -e "$shell_rc" ]; then
+    node_bin="$(find_node)" || {
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: node not found" >&2
+      return 1
+    }
+    shell_rc_mode="$(file_mode "$node_bin" "$shell_rc")" || {
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: could not read shell rc mode: $shell_rc" >&2
+      return 1
+    }
+    if ! chmod "$shell_rc_mode" "$temp_file" 2>/dev/null; then
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: could not preserve shell rc mode: $shell_rc" >&2
+      return 1
+    fi
+    cp -p "$shell_rc" "${shell_rc}.claude-workflow.bak" 2>/dev/null || true
+  fi
+  if ! mv -f "$temp_file" "$shell_rc"; then
+    rm -f "$temp_file"
+    echo "claude-workflow-gateway: could not replace shell rc atomically: $shell_rc" >&2
+    return 1
+  fi
+}
+
+install_shell() {
+  local shell_rc
+  shell_rc="$(shell_rc_path)" || return 1
+  shell_rc="$(resolve_shell_rc_target "$shell_rc")" || return 1
+  mkdir -p "$(dirname "$shell_rc")" || return 1
+  touch "$shell_rc" || return 1
+  rewrite_shell_blocks "$shell_rc" install || return 1
   echo "claude-workflow-gateway: installed or refreshed shell hook in $shell_rc"
 }
 
@@ -645,9 +819,11 @@ uninstall_shell() {
   local shell_rc
   shell_rc="$(shell_rc_path)" || return 1
   shell_rc="$(resolve_shell_rc_target "$shell_rc")" || return 1
-  strip_installed_shell_blocks "$shell_rc" || return 1
+  rewrite_shell_blocks "$shell_rc" || return 1
   echo "claude-workflow-gateway: removed shell hook from $shell_rc"
 }
+
+validate_manager_paths || exit 1
 
 case "${1:-status}" in
   ensure)

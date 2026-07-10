@@ -90,7 +90,65 @@ try {
   });
   assert.equal(statusResult.status, 1, statusResult.stderr);
   assert.match(`${statusResult.stdout}\n${statusResult.stderr}`, /not running/u);
-  process.stdout.write('Packed install and npm bin manager smoke test passed.\n');
+
+  const globalPrefix = path.join(temporaryRoot, 'global-prefix');
+  const globalHome = path.join(temporaryRoot, 'global-home');
+  const globalState = path.join(temporaryRoot, 'global-state');
+  await fs.mkdir(globalHome);
+  run('npm', [
+    'install',
+    '--global',
+    '--install-links',
+    '--prefer-offline',
+    '--no-audit',
+    '--no-fund',
+    '--prefix',
+    globalPrefix,
+    ROOT,
+  ]);
+
+  if (process.platform !== 'win32') {
+    const globalPackage = path.join(
+      globalPrefix,
+      'lib',
+      'node_modules',
+      'claude-workflow'
+    );
+    assert.equal(
+      (await fs.lstat(globalPackage)).isSymbolicLink(),
+      false,
+      'documented global install must not depend on the source checkout'
+    );
+  }
+
+  const globalBinDirectory =
+    process.platform === 'win32' ? globalPrefix : path.join(globalPrefix, 'bin');
+  const workflowBin = path.join(
+    globalBinDirectory,
+    process.platform === 'win32' ? 'claude-workflow.cmd' : 'claude-workflow'
+  );
+  const globalGatewayBin = path.join(
+    globalBinDirectory,
+    process.platform === 'win32'
+      ? 'claude-workflow-gateway.cmd'
+      : 'claude-workflow-gateway'
+  );
+  run(workflowBin, ['--help']);
+  const globalStatusResult = run(globalGatewayBin, ['status'], {
+    env: {
+      ...process.env,
+      HOME: globalHome,
+      XDG_STATE_HOME: path.join(globalHome, '.state'),
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: globalState,
+      ULTRATHINK_GATEWAY_DAEMON_PORT: '65533',
+    },
+    expectedStatus: 1,
+    timeout: 5_000,
+  });
+  assert.equal(globalStatusResult.status, 1, globalStatusResult.stderr);
+  assert.match(`${globalStatusResult.stdout}\n${globalStatusResult.stderr}`, /not running/u);
+
+  process.stdout.write('Packed and self-contained global install smoke tests passed.\n');
 } finally {
   await fs.rm(temporaryRoot, { recursive: true, force: true });
 }

@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { CodexSessionManager } from '../js/gateway/codex-provider.js';
 
@@ -393,7 +394,7 @@ async function testProviderInChildProcess() {
     await testStdinEpipeDoesNotCrashGateway();
     return true;
   }
-  const child = spawn(process.execPath, [new URL(import.meta.url).pathname, '--epipe-child'], {
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--epipe-child'], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 
 const DAEMON_SCRIPT = path.resolve('scripts/claude-workflow-daemon.sh');
+const DAEMON_JS = path.resolve('js/cli/claude-workflow-daemon.js');
 
 function freePort() {
   return new Promise(function reservePort(resolve, reject) {
@@ -263,6 +264,43 @@ async function testManagedPortValidation() {
   }
 }
 
+async function testRelativeManagerPathsAreRejected() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-paths-'));
+  const absoluteState = path.join(root, 'state');
+  const baseEnv = {
+    ...process.env,
+    HOME: root,
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(await freePort()),
+  };
+
+  try {
+    const relativeState = await runProcess('bash', [DAEMON_SCRIPT, 'status'], {
+      ...baseEnv,
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: 'relative-state',
+    });
+    assert.equal(relativeState.code, 1);
+    assert.match(relativeState.stderr, /must resolve to an absolute path/u);
+
+    const relativeEnvFile = await runProcess('bash', [DAEMON_SCRIPT, 'status'], {
+      ...baseEnv,
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: absoluteState,
+      CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: 'relative.env',
+    });
+    assert.equal(relativeEnvFile.code, 1);
+    assert.match(relativeEnvFile.stderr, /ENV_FILE must be an absolute path/u);
+
+    const relativeTrace = await runProcess('bash', [DAEMON_SCRIPT, 'status'], {
+      ...baseEnv,
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: absoluteState,
+      ULTRATHINK_GATEWAY_TRACE_DIR: 'relative-trace',
+    });
+    assert.equal(relativeTrace.code, 1);
+    assert.match(relativeTrace.stderr, /TRACE_DIR must be absolute/u);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testStateDirectorySymlinkIsRejected() {
   if (process.platform === 'win32') {
     return;
@@ -286,6 +324,41 @@ async function testStateDirectorySymlinkIsRejected() {
     assert.equal((await fs.stat(target)).mode & 0o777, 0o755);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testStopRejectsUnrelatedPidWithDaemonPathArgument() {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-pid-'));
+  const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
+  const innocent = spawn(
+    process.execPath,
+    ['-e', 'setInterval(() => {}, 1000);', DAEMON_JS],
+    { stdio: 'ignore' }
+  );
+  const env = {
+    ...process.env,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(await freePort()),
+  };
+
+  try {
+    await waitForCondition(() => processExists(innocent.pid), 'innocent process to start');
+    await fs.writeFile(pidFile, `${innocent.pid}\n`, { mode: 0o600 });
+    const stopped = await runProcess('bash', [DAEMON_SCRIPT, 'stop'], env);
+    assert.equal(stopped.code, 0, stopped.stderr || stopped.stdout);
+    assert.match(stopped.stdout, /not running/u);
+    assert.equal(
+      processExists(innocent.pid),
+      true,
+      'manager must not signal a process that only mentions the daemon path in a later argument'
+    );
+    await assert.rejects(fs.access(pidFile));
+  } finally {
+    if (processExists(innocent.pid)) {
+      innocent.kill('SIGTERM');
+      await waitForCondition(() => !processExists(innocent.pid), 'innocent process to exit');
+    }
+    await fs.rm(stateDir, { recursive: true, force: true });
   }
 }
 
@@ -384,7 +457,9 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
 
 await testTraceDisableAndRuntimeConfig();
 await testManagedPortValidation();
+await testRelativeManagerPathsAreRejected();
 await testStateDirectorySymlinkIsRejected();
+await testStopRejectsUnrelatedPidWithDaemonPathArgument();
 await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();

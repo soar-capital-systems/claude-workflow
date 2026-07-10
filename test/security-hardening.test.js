@@ -165,6 +165,28 @@ test(
     assert.equal(fs.existsSync(commandSubstitutionMarker), false);
     assert.equal(fs.existsSync(backtickMarker), false);
 
+    const failedPublishTarget = path.join(stateDirectory, 'failed-publish.env');
+    const originalChmodSync = fs.chmodSync;
+    fs.chmodSync = function failPublishedFileChmod(targetPath, mode) {
+      if (path.resolve(targetPath) === path.resolve(failedPublishTarget)) {
+        throw new Error('simulated chmod failure');
+      }
+      return originalChmodSync(targetPath, mode);
+    };
+    try {
+      assert.throws(
+        () => writeWorkflowEnvironmentFile(failedPublishTarget, { VALUE: 'safe' }),
+        /simulated chmod failure/u
+      );
+    } finally {
+      fs.chmodSync = originalChmodSync;
+    }
+    assert.equal(
+      fs.existsSync(failedPublishTarget),
+      false,
+      'a post-rename hardening failure must remove the published env file'
+    );
+
     const unsafeCustomDirectory = path.join(root, 'unsafe-custom-state');
     await fsp.mkdir(unsafeCustomDirectory, { mode: 0o755 });
     await fsp.chmod(unsafeCustomDirectory, 0o755);

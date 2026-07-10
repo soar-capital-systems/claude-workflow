@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  offline:
+  test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -5795,18 +5795,25 @@ await runTest('claude-workflow daemon script starts and stops the recorded daemo
 await runTest('claude-workflow daemon script installs shell hooks for the active shell', async function testWorkflowGatewayDaemonInstallShell() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-shell-hook-'));
   const daemonScript = path.resolve('scripts/claude-workflow-daemon.sh');
+  const zshrcPath = path.join(tempDir, '.zshrc');
 
   try {
+    await fs.writeFile(zshrcPath, 'export PRESERVED_SETTING=1\n', {
+      encoding: 'utf8',
+      mode: 0o644,
+    });
+    await fs.chmod(zshrcPath, 0o644);
     const zshInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
       HOME: tempDir,
       SHELL: '/bin/zsh',
     });
     assert.equal(zshInstall.code, 0, zshInstall.stderr || zshInstall.stdout);
-    const zshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    const zshrc = await fs.readFile(zshrcPath, 'utf8');
     assert.match(zshrc, /command -v claude-workflow-gateway/u);
     assert.match(zshrc, /claude-workflow gateway/u);
     assert.equal(zshrc.includes(daemonScript), false);
+    assert.equal((await fs.stat(zshrcPath)).mode & 0o777, 0o644);
 
     const zshReinstall = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
@@ -5814,11 +5821,12 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       SHELL: '/bin/zsh',
     });
     assert.equal(zshReinstall.code, 0, zshReinstall.stderr || zshReinstall.stdout);
-    const refreshedZshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    const refreshedZshrc = await fs.readFile(zshrcPath, 'utf8');
     assert.equal((refreshedZshrc.match(/# >>> claude-workflow gateway >>>/gu) || []).length, 1);
+    assert.equal((await fs.stat(zshrcPath)).mode & 0o777, 0o644);
 
     const malformedZshrc = `${refreshedZshrc}\n# >>> claude-workflow gateway >>>\nexport IMPORTANT_AFTER=1\n`;
-    await fs.writeFile(path.join(tempDir, '.zshrc'), malformedZshrc, 'utf8');
+    await fs.writeFile(zshrcPath, malformedZshrc, 'utf8');
     const malformedInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
       HOME: tempDir,
@@ -5826,8 +5834,8 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     });
     assert.equal(malformedInstall.code, 1);
     assert.match(malformedInstall.stderr, /malformed shell hook markers/u);
-    assert.equal(await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8'), malformedZshrc);
-    await fs.writeFile(path.join(tempDir, '.zshrc'), refreshedZshrc, 'utf8');
+    assert.equal(await fs.readFile(zshrcPath, 'utf8'), malformedZshrc);
+    await fs.writeFile(zshrcPath, refreshedZshrc, 'utf8');
 
     const bashInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
@@ -5835,8 +5843,69 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       SHELL: '/bin/bash',
     });
     assert.equal(bashInstall.code, 0, bashInstall.stderr || bashInstall.stdout);
-    const bashrc = await fs.readFile(path.join(tempDir, '.bashrc'), 'utf8');
+    const bashrcPath = path.join(tempDir, '.bashrc');
+    const bashrc = await fs.readFile(bashrcPath, 'utf8');
     assert.match(bashrc, /command -v claude-workflow-gateway/u);
+
+    const fakeBin = path.join(tempDir, 'bin');
+    const hookState = path.join(tempDir, 'hook-state');
+    await fs.mkdir(fakeBin);
+    await makeExecutable(
+      path.join(fakeBin, 'claude-workflow-gateway'),
+      '#!/usr/bin/env bash\n' +
+        'set -u\n' +
+        'env_file="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/claude-workflow-gateway.env"\n' +
+        'case "${1:-}" in\n' +
+        '  ensure)\n' +
+        '    mkdir -p "$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"\n' +
+        '    printf "%s\\n" "export CLAUDE_WORKFLOW_HOOK_TEST=loaded" >"$env_file"\n' +
+        '    chmod 600 "$env_file"\n' +
+        '    ;;\n' +
+        '  status) exit 0 ;;\n' +
+        '  *) exit 1 ;;\n' +
+        'esac\n'
+    );
+    const sourceBashrc = await runProcess(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-c',
+        '. "$1"; test "$CLAUDE_WORKFLOW_HOOK_TEST" = loaded',
+        '_',
+        bashrcPath,
+      ],
+      {
+        ...process.env,
+        HOME: tempDir,
+        SHELL: '/bin/bash',
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
+      }
+    );
+    assert.equal(sourceBashrc.code, 0, sourceBashrc.stderr || sourceBashrc.stdout);
+
+    const zshProbe = await runProcess('sh', ['-c', 'command -v zsh'], process.env);
+    if (zshProbe.code === 0) {
+      const sourceZshrc = await runProcess(
+        'zsh',
+        [
+          '-f',
+          '-c',
+          'source "$1"; test "$CLAUDE_WORKFLOW_HOOK_TEST" = loaded',
+          '_',
+          zshrcPath,
+        ],
+        {
+          ...process.env,
+          HOME: tempDir,
+          SHELL: '/bin/zsh',
+          PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+          CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
+        }
+      );
+      assert.equal(sourceZshrc.code, 0, sourceZshrc.stderr || sourceZshrc.stdout);
+    }
 
     const unsupported = await runProcess('bash', [daemonScript, 'install-shell'], {
       ...process.env,
@@ -5852,7 +5921,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       SHELL: '/bin/zsh',
     });
     assert.equal(uninstall.code, 0, uninstall.stderr || uninstall.stdout);
-    const uninstalledZshrc = await fs.readFile(path.join(tempDir, '.zshrc'), 'utf8');
+    const uninstalledZshrc = await fs.readFile(zshrcPath, 'utf8');
     assert.equal(uninstalledZshrc.includes('>>> claude-workflow gateway >>>'), false);
     ok('shell hooks use the stable PATH command, refresh on upgrades, and uninstall cleanly');
   } finally {

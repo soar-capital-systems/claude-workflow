@@ -48,4 +48,13 @@ for (const file of [
   run('bash', ['-n', file]);
 }
 
+const zshProbe = spawnSync('zsh', ['--version'], {
+  cwd: ROOT,
+  encoding: 'utf8',
+  stdio: 'pipe',
+});
+if (!zshProbe.error && zshProbe.status === 0) {
+  run('zsh', ['-n', path.join(ROOT, 'scripts', 'claude-workflow-gateway.bashrc')]);
+}
+
 process.stdout.write('JavaScript and shell syntax checks passed.\n');

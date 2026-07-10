@@ -14,6 +14,8 @@
 - Transcript continuity detection for Claude rewinds, branches, and compaction.
 - Release checks for packed npm-bin execution, hostile shell values, trace
   concurrency, daemon lifecycle, Codex pipe failures, and native Claude argv.
+- Linux checks for a self-contained global install, sourced Bash hooks, and
+  shell-rc mode preservation.
 
 ### Changed
 
@@ -46,3 +48,8 @@
 - Trace files are private, bounded, rotated under a cross-process lock, recover
   abandoned locks, and reject unsafe existing directories without chmod side
   effects.
+- GNU/Linux shell-rc mode detection no longer depends on BSD `stat` behavior.
+  WSL state and trace paths fail closed when their filesystem cannot enforce
+  Unix permissions, and manager-owned paths must be absolute.
+- Executable scripts retain LF line endings in Windows/WSL checkouts, and test
+  subprocess paths handle spaces and non-ASCII characters correctly.

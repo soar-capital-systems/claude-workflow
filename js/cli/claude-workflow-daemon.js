@@ -55,11 +55,19 @@ export function daemonPort() {
 }
 
 function envFilePath() {
+  const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
+  if (configuredTarget) {
+    if (!path.isAbsolute(configuredTarget)) {
+      throw new Error('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be an absolute path');
+    }
+    return configuredTarget;
+  }
+
   const stateHome = envString('XDG_STATE_HOME') || path.join(os.homedir(), '.cache');
-  return (
-    envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE') ||
-    path.join(stateHome, 'claude-workflow', 'claude-workflow-gateway.env')
-  );
+  if (!path.isAbsolute(stateHome)) {
+    throw new Error('XDG_STATE_HOME must be an absolute path');
+  }
+  return path.join(stateHome, 'claude-workflow', 'claude-workflow-gateway.env');
 }
 
 export function quotePosixShellValue(value) {
@@ -85,12 +93,19 @@ export function serializeWorkflowEnvironment(clientEnv) {
 function ensureEnvironmentDirectory(directory, hardenExistingDirectory) {
   const existed = fs.existsSync(directory);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const stats = fs.lstatSync(directory);
+  let stats = fs.lstatSync(directory);
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
     throw new Error(`workflow environment directory must be a real directory: ${directory}`);
   }
   if (!existed || hardenExistingDirectory) {
     fs.chmodSync(directory, 0o700);
+    stats = fs.lstatSync(directory);
+    if ((stats.mode & 0o077) !== 0) {
+      throw new Error(
+        `workflow environment directory does not enforce owner-only permissions: ${directory}. ` +
+          'On WSL, use the Linux filesystem or enable DrvFS metadata.'
+      );
+    }
   } else if ((stats.mode & 0o077) !== 0) {
     throw new Error(
       `custom workflow environment directory must not be accessible by group or other users: ${directory}`
@@ -112,6 +127,7 @@ export function writeWorkflowEnvironmentFile(
     `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
   );
   let descriptor = null;
+  let published = false;
   try {
     descriptor = fs.openSync(tempPath, 'wx', 0o600);
     fs.writeFileSync(descriptor, serializeWorkflowEnvironment(clientEnv), 'utf8');
@@ -120,7 +136,15 @@ export function writeWorkflowEnvironmentFile(
     fs.closeSync(descriptor);
     descriptor = null;
     fs.renameSync(tempPath, target);
+    published = true;
     fs.chmodSync(target, 0o600);
+    const targetStats = fs.lstatSync(target);
+    if (!targetStats.isFile() || targetStats.isSymbolicLink() || (targetStats.mode & 0o077) !== 0) {
+      throw new Error(
+        `workflow environment file does not enforce owner-only permissions: ${target}. ` +
+          'On WSL, use the Linux filesystem or enable DrvFS metadata.'
+      );
+    }
     return target;
   } catch (error) {
     if (descriptor !== null) {
@@ -131,7 +155,7 @@ export function writeWorkflowEnvironmentFile(
       }
     }
     try {
-      fs.unlinkSync(tempPath);
+      fs.unlinkSync(published ? target : tempPath);
     } catch (cleanupError) {
       if (cleanupError?.code !== 'ENOENT') {
         // Preserve the original write error.

@@ -45,6 +45,15 @@ function traceFileAtIndex(traceDir, index) {
   return path.join(traceDir, index === 0 ? TRACE_FILE_NAME : `${TRACE_FILE_NAME}.${index}`);
 }
 
+function assertOwnerOnlyMode(stats, description, targetPath) {
+  if ((stats.mode & 0o077) !== 0) {
+    throw new Error(
+      `${description} does not enforce owner-only permissions: ${targetPath}. ` +
+        'On WSL, use the Linux filesystem or enable DrvFS metadata.'
+    );
+  }
+}
+
 async function regularFileStats(filePath) {
   try {
     const stats = await fs.lstat(filePath);
@@ -147,12 +156,14 @@ export function createGatewayTracer(config = {}) {
       existed = false;
     }
     await fs.mkdir(traceDir, { recursive: true, mode: 0o700 });
-    const stats = await fs.lstat(traceDir);
+    let stats = await fs.lstat(traceDir);
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw new Error(`gateway trace directory must be a real directory: ${traceDir}`);
     }
     if (!existed) {
       await fs.chmod(traceDir, 0o700);
+      stats = await fs.lstat(traceDir);
+      assertOwnerOnlyMode(stats, 'gateway trace directory', traceDir);
     } else if ((stats.mode & 0o077) !== 0) {
       throw new Error(
         `gateway trace directory must not be accessible by group or other users: ${traceDir}`
@@ -181,10 +192,20 @@ export function createGatewayTracer(config = {}) {
         continue;
       }
       await fs.chmod(backupPath, 0o600);
+      assertOwnerOnlyMode(
+        await fs.lstat(backupPath),
+        'gateway trace file',
+        backupPath
+      );
     }
     const activeStats = await regularFileStats(traceFilePath);
     if (activeStats) {
       await fs.chmod(traceFilePath, 0o600);
+      assertOwnerOnlyMode(
+        await fs.lstat(traceFilePath),
+        'gateway trace file',
+        traceFilePath
+      );
     }
     existingFilesHardened = true;
   }
@@ -248,6 +269,11 @@ export function createGatewayTracer(config = {}) {
         await fs.rm(destinationPath, { force: true });
       } else if (rotatedStats) {
         await fs.chmod(destinationPath, 0o600);
+        assertOwnerOnlyMode(
+          await fs.lstat(destinationPath),
+          'gateway trace file',
+          destinationPath
+        );
       }
     }
   }
@@ -268,6 +294,11 @@ export function createGatewayTracer(config = {}) {
         mode: 0o600,
       });
       await fs.chmod(traceFilePath, 0o600);
+      assertOwnerOnlyMode(
+        await fs.lstat(traceFilePath),
+        'gateway trace file',
+        traceFilePath
+      );
     } finally {
       await releaseTraceLock();
     }

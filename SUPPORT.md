@@ -3,15 +3,18 @@
 ## Supported environment
 
 - Node.js 20 or newer.
-- Current native Claude Code CLI; release validation used 2.1.204.
+- Current native Claude Code CLI.
 - Codex CLI 0.144.1 or newer for the shared daemon.
 - macOS, Linux, or WSL with Bash; managed shell hooks support zsh and Bash.
 - A Codex workspace whose live model catalog includes the configured model.
 
-The default `gpt-5.6-terra` route is part of an
-[OpenAI limited preview](https://help.openai.com/en/articles/20001325-a-preview-of-gpt-5-6-sol-terra-and-luna).
-If it is absent
-from your workspace, set `ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL` and
+On WSL, install Node.js, Claude Code, and Codex in the same distribution. Keep
+the project and gateway state on the Linux filesystem unless the Windows mount
+is configured to preserve Unix permissions and symlinks.
+
+The configured Codex model must appear in your workspace model catalog. If the
+default `gpt-5.6-terra` route is absent, set
+`ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL` and
 `ULTRATHINK_GATEWAY_CODEX_MODEL` to a model returned by your Codex installation.
 
 ## Before opening an issue

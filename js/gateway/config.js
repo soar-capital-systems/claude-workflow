@@ -14,6 +14,7 @@ const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*'])
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
 const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 const DISABLED_FLAG_VALUES = new Set(['0', 'false', 'no', 'off']);
 const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]']);
@@ -234,7 +235,7 @@ export function loadGatewayConfig() {
         ['ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY'],
         DEFAULT_CODEX_APPROVAL_POLICY
       ),
-      model: codexProfileValue('model', 'gpt-5.6-terra'),
+      model: codexProfileValue('model', DEFAULT_CODEX_MODEL),
       reasoningEffort: codexProfileValue('reasoningEffort', 'max'),
       verbosity: codexProfileValue('verbosity', 'low'),
       inputMaxTokens: clampNumber(
@@ -298,7 +299,7 @@ export function loadGatewayConfig() {
         process.env.ULTRATHINK_GATEWAY_OPENAI_BASE_URL,
         'https://api.openai.com/v1'
       ),
-      model: codexProfileValue('model', 'gpt-5.6-terra'),
+      model: codexProfileValue('model', DEFAULT_CODEX_MODEL),
       reasoningEffort: codexProfileValue('reasoningEffort', 'low'),
       verbosity: codexProfileValue('verbosity', 'low'),
     },

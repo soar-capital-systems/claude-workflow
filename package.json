@@ -1,9 +1,8 @@
 {
-  "name": "claude-workflow",
+  "name": "@onetool/claude-workflow",
   "version": "0.1.0",
   "description": "Claude Code launcher with a local Anthropic-compatible gateway for Codex-backed workflow subagents.",
   "type": "module",
-  "private": true,
   "bin": {
     "claude-workflow": "js/cli/claude-workflow.js",
     "claude-workflow-gateway": "scripts/claude-workflow-daemon.sh"
@@ -16,10 +15,12 @@
     "daemon:stop": "bash scripts/claude-workflow-daemon.sh stop",
     "daemon:log": "bash scripts/claude-workflow-daemon.sh log",
     "check": "node scripts/check-syntax.mjs",
-    "test": "npm run -s check && npm run -s test:gateway",
+    "test": "npm run -s check && npm run -s test:gateway && npm run -s test:onboarding",
     "test:gateway": "node test/gateway.test.js && node test/codex-provider-hardening.test.js && node test/daemon-observability.test.js && node --test test/security-hardening.test.js",
+    "test:onboarding": "node --test test/onboarding.test.js",
     "test:package": "node test/package-install-smoke.test.js",
     "prepack": "npm run -s check",
+    "prepublishOnly": "npm test && npm run test:package",
     "test:live:glm": "node test/glm/live-glm-gateway.js"
   },
   "keywords": [
@@ -33,8 +34,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yshaaban/claude-workflow.git"
+    "url": "git+https://github.com/yshaaban/claude-workflow.git"
   },
+  "homepage": "https://github.com/yshaaban/claude-workflow#readme",
   "bugs": {
     "url": "https://github.com/yshaaban/claude-workflow/issues"
   },
@@ -45,6 +47,14 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "files": [
     "js",

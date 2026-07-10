@@ -14,47 +14,51 @@ Claude Code -> local gateway -> Anthropic        (main session)
 > [!WARNING]
 > `claude-workflow` starts Claude Code with `--dangerously-skip-permissions` by default. Run it only in repositories and machine environments you trust. Use `--no-yolo` to restore normal permission prompts.
 
-## Requirements
+## Getting started
 
-- Node.js 20 or newer.
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started), installed and authenticated.
-- [Codex CLI](https://github.com/openai/codex) 0.144.1 or newer, installed and authenticated.
-- macOS, Linux, or WSL with Bash. The managed shell hook supports zsh and Bash.
+Claude Workflow supports macOS, Linux, and WSL. Native Windows is not supported. You need Node.js 20 or newer, [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started), and [Codex CLI](https://github.com/openai/codex) 0.144.1 or newer.
 
-On WSL, install Node.js, Claude Code, and Codex inside the same Linux distribution. Keep the project and gateway state under its Linux filesystem, such as `/home/<user>`, unless the mounted Windows filesystem is configured to preserve Unix permissions and symlinks.
+Install Claude Code and Codex first if they are not already available:
 
 ```bash
-node --version
-claude --version
-codex --version
-codex login status
+npm install --global @anthropic-ai/claude-code
+npm install --global @openai/codex
 ```
 
-## Installation
+Install the package, check the local tools, then start it inside a trusted repository:
 
 ```bash
-git clone https://github.com/yshaaban/claude-workflow.git
-cd claude-workflow
-npm install --global --install-links .
-```
+npm install --global @onetool/claude-workflow
+claude-workflow setup
 
-`--install-links` copies the package into npm's global prefix instead of linking it to the checkout. The installation provides two commands:
-
-- `claude-workflow` starts Claude Code with a gateway dedicated to that session.
-- `claude-workflow-gateway` manages an optional shared gateway for shells and sessions started outside the wrapper.
-
-Use a user-owned Node.js installation or npm prefix. The commands do not require a root-owned global installation.
-
-## Quick start
-
-```bash
 cd /path/to/project
+claude-workflow
+```
 
+`setup` verifies the supported platform, installed CLI versions, authentication, Linux-native WSL paths, and the effective routing configuration. It does not make a model request or verify live model availability. Without `--shared`, it creates no files and changes no shell settings.
+
+If a login check fails:
+
+```bash
+claude auth login
+codex login
+claude-workflow setup
+```
+
+Use a user-owned Node.js installation or npm prefix. Do not work around global-install permission errors with `sudo`; correct the Node.js installation or npm prefix instead.
+
+On WSL, install Node.js, Claude Code, Codex, and Claude Workflow inside the same Linux distribution. `command -v node claude codex claude-workflow` should return Linux paths, not `/mnt/...` paths or Windows executables. Keep configuration and shared-gateway state under `/home/<user>`.
+
+Most users only need the `claude-workflow` command. Enable [shared mode](#shared) only when ordinary `claude` commands should also use the gateway.
+
+## Usage
+
+```bash
 # Start an interactive session
 claude-workflow
 
 # Run one prompt and exit
-claude-workflow "Review the current diff and delegate focused checks to workflow agents."
+claude-workflow "Review the current diff and delegate focused checks."
 
 # Resume an existing session
 claude-workflow --resume <session-id>
@@ -69,6 +73,12 @@ claude-workflow "Review the current diff." -- --output-format json
 ```
 
 Wrapper options must appear before `--`. Unknown wrapper options are rejected. Set `ULTRATHINK_GATEWAY_MAIN_MODEL_ID` instead of passing Claude's native `--model` option.
+
+`setup`, `doctor`, `config`, and `run` are command names. Use `run` when prompt text starts with one of them:
+
+```bash
+claude-workflow run "setup the repository and verify the result"
+```
 
 Run `claude-workflow --help` for the complete command reference.
 
@@ -85,15 +95,13 @@ The default routes are:
 
 In the workflow profile, Fable requests go to Anthropic by default. Every other model request goes to Codex. Use a custom route map or Anthropic passthrough list to add exceptions.
 
-`codex-terra` is the Claude-facing alias for the configured Codex model. To select a different model, add trusted user-wide overrides to `~/.claude-workflow.env`:
+`codex-terra` is the short Claude-facing alias for the configured Codex model. Use the configuration command to change the agent tier or reasoning effort:
 
 ```bash
-ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.6-sol
-ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max
-CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=codex-sol
+claude-workflow config --agents sol --effort max
 ```
 
-The selected model must be available to the authenticated Codex account or workspace.
+The aliases `sol`, `terra`, and `luna` keep the configured tiered GPT family when possible; otherwise they use the package default family. A full model ID is also accepted. The model must be available to the authenticated Codex account or workspace.
 
 ## Permissions
 
@@ -103,8 +111,8 @@ Restore Claude Code's permission flow for one command or set a persistent defaul
 claude-workflow --no-yolo
 claude-workflow -- --permission-mode plan
 
-# Add to ~/.claude-workflow.env for a persistent default
-CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false
+# Make permission prompts the persistent default
+claude-workflow config --permissions prompt
 ```
 
 `--yolo` and `--dangerously-skip-permissions` explicitly enable the bypass. A native `--permission-mode` prevents the wrapper from adding the bypass flag.
@@ -119,6 +127,14 @@ CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false
 
 Plain `claude` commands do not use the per-session gateway. Start the shared gateway and install its shell hook when direct Claude invocations should use the workflow routes:
 
+Shared mode requires Bash. Its managed shell hook supports Bash and zsh.
+
+```bash
+claude-workflow setup --shared
+```
+
+Open a new shell after setup. Manage the gateway directly when needed:
+
 ```bash
 claude-workflow-gateway start
 claude-workflow-gateway status
@@ -126,7 +142,7 @@ claude-workflow-gateway restart
 claude-workflow-gateway log 100
 ```
 
-Install the hook once to configure future shells:
+Install or refresh the hook manually with:
 
 ```bash
 claude-workflow-gateway install-shell
@@ -138,11 +154,19 @@ Remove it with:
 claude-workflow-gateway uninstall-shell
 ```
 
-After installation, open a new shell or source the updated shell rc file. After removal, close affected terminals and start a clean terminal session. Sourcing the rc file cannot unset gateway variables that are already present in the current shell.
+After removal, close affected terminals and start a clean shell. Sourcing the rc file cannot unset gateway variables that are already present in the current process.
 
 The daemon binds to `127.0.0.1:4318`. Its state directory is owner-only (`0700`), and its state files, logs, and traces are owner-readable and writable (`0600`). The default location is `${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow`.
 
 Shared Codex threads disable native shell and patch execution. They use only the tools supplied by Claude Code, so the daemon's startup directory cannot become the working directory for unrelated repositories.
+
+Before uninstalling the package, remove the hook and stop the daemon:
+
+```bash
+claude-workflow-gateway uninstall-shell
+claude-workflow-gateway stop
+npm uninstall --global @onetool/claude-workflow
+```
 
 ## Large repositories
 
@@ -152,7 +176,20 @@ See [Large files and diffs](docs/LARGE_FILES_AND_DIFFS.md) for practical limits 
 
 ## Configuration
 
-Put trusted user-wide routing defaults in `~/.claude-workflow.env`. Values exported by the parent process take precedence. Project `.env` files are ignored unless the parent process sets `CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true`. A repository cannot enable itself.
+Inspect or change the common settings without editing environment variables:
+
+```bash
+claude-workflow config
+claude-workflow config --main fable --agents terra --effort max
+claude-workflow config --permissions prompt
+claude-workflow config --reset
+```
+
+The command writes only requested settings to `~/.claude-workflow.env`, preserves unrelated entries, and keeps the file owner-only. `--reset` removes the settings managed by the command so package defaults apply again.
+
+Exported environment variables override the saved file. Custom route-map entries can override the common agent settings. `--reset` removes every key managed by the command, including matching keys added manually, while preserving comments and unrelated entries. Legacy `~/.ultrathink.env` values can still override package defaults after a reset.
+
+For advanced routes, put trusted user-wide values in `~/.claude-workflow.env`. Values exported by the parent process take precedence. Project `.env` files are ignored unless the parent process sets `CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true`; a repository cannot enable itself.
 
 Shell-manager settings such as `CLAUDE_WORKFLOW_GATEWAY_STATE_DIR`, `CLAUDE_WORKFLOW_SHELL_RC`, `ULTRATHINK_GATEWAY_DAEMON_PORT`, and `ULTRATHINK_GATEWAY_TRACE_DIR` must be exported by the parent shell. Manager-owned path values must be absolute. Gateway settings use the `ULTRATHINK_GATEWAY_` namespace.
 
@@ -181,6 +218,7 @@ See [SECURITY.md](SECURITY.md) for the full security model and vulnerability-rep
 For shared-gateway problems, start with its status, recent logs, and health response:
 
 ```bash
+claude-workflow doctor
 claude-workflow-gateway status
 claude-workflow-gateway log 100
 curl -s http://127.0.0.1:4318/healthz
@@ -189,7 +227,7 @@ curl -s http://127.0.0.1:4318/healthz
 | Problem | Resolution |
 | --- | --- |
 | Codex is not logged in | Run `codex login`, then `codex login status`. |
-| The configured Codex model is unavailable | Choose a model listed by your Codex installation. |
+| The configured Codex model is unavailable | Choose a model offered by the interactive Codex `/model` picker. |
 | The shared daemon requires a newer Codex version | Update Codex and run `claude-workflow-gateway restart`. |
 | A routed model reaches Anthropic and returns 404 | Launch through `claude-workflow`, or install the shared-gateway hook and open a new shell or source the updated shell rc file. |
 | A per-session gateway port is already in use | Unset `ULTRATHINK_GATEWAY_PORT` or set it to `0`. |
@@ -201,13 +239,15 @@ See [SUPPORT.md](SUPPORT.md) for issue-reporting guidance and known boundaries.
 ## Development
 
 ```bash
+git clone https://github.com/yshaaban/claude-workflow.git
+cd claude-workflow
 npm ci
 npm run check
 npm test
 npm run test:package
 ```
 
-For local development, use `npm link` after installing dependencies. The default test suite does not call model APIs.
+For a self-contained global install from a checkout, run `npm install --global --install-links .`. For active development, use `npm link`. The default test suite does not call model APIs.
 
 Run `npm run start:gateway` to start the raw protocol-testing gateway on `127.0.0.1:4319`.
 

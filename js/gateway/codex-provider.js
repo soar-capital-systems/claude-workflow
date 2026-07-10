@@ -1912,7 +1912,6 @@ class CodexAppServerConnection extends EventEmitter {
           )
         );
       }, this.rpcTimeoutMs);
-      timeout.unref?.();
 
       this.pendingRequests.set(requestId, { resolve, reject, timeout });
       try {
@@ -1992,6 +1991,13 @@ class CodexAppServerConnection extends EventEmitter {
           finish();
         }
       }, this.closeKillTimeoutMs);
+      const hardStopTimer = setTimeout(
+        function finishAfterHardStopDeadline() {
+          signalChildProcessTree(child, 'SIGKILL');
+          finish();
+        },
+        Math.max(this.closeKillTimeoutMs + 100, this.closeKillTimeoutMs * 2)
+      );
 
       function finish() {
         if (settled) {
@@ -1999,6 +2005,7 @@ class CodexAppServerConnection extends EventEmitter {
         }
         settled = true;
         clearTimeout(killTimer);
+        clearTimeout(hardStopTimer);
         child.off('close', finishWhenProcessTreeExited);
         resolve();
       }
@@ -2876,6 +2883,7 @@ export class CodexSessionManager {
   constructor(config, options = {}) {
     this.config = config;
     this.sessions = new Map();
+    this.pendingSessionClosures = new Set();
     this.tracer = options.tracer || null;
     this.learnedContextWindows = new Map();
     this.createSession =
@@ -2907,6 +2915,16 @@ export class CodexSessionManager {
           session.baseSessionKey.startsWith(`${identityKey}:`))
       );
     });
+  }
+
+  trackSessionClosure(promise) {
+    const tracked = Promise.resolve(promise);
+    this.pendingSessionClosures.add(tracked);
+    const remove = () => {
+      this.pendingSessionClosures.delete(tracked);
+    };
+    tracked.then(remove, remove);
+    return tracked;
   }
 
   familyEntries(baseSessionKey) {
@@ -3061,13 +3079,14 @@ export class CodexSessionManager {
         expected_fingerprint: divergedSession.transcriptAnchor?.fingerprint || null,
       });
       this.sessions.delete(selection.sessionKey);
-      void Promise.resolve()
+      void this.trackSessionClosure(
+        Promise.resolve()
         .then(function closeDivergedSession() {
           return divergedSession.close(
             new Error('Claude transcript diverged from the live Codex thread')
           );
         })
-        .catch(function ignoreDivergedSessionCloseFailure() {});
+      ).catch(function ignoreDivergedSessionCloseFailure() {});
       session = null;
       // The current Claude request is authoritative after a rewind, branch, or
       // compaction. Seed a clean Codex thread from its bounded transcript.
@@ -3090,7 +3109,9 @@ export class CodexSessionManager {
         read_context: readRequestDiagnostics(requestBody, session.pendingToolCall),
       });
       this.sessions.delete(selection.sessionKey);
-      void session.close(new Error('recycled before Codex context window overflow'));
+      void this.trackSessionClosure(
+        session.close(new Error('recycled before Codex context window overflow'))
+      ).catch(function ignoreRecycledSessionCloseFailure() {});
       session = null;
       // The replacement must replay the bounded transcript even under a fork
       // session key, whose default bootstrap mode ('latest') would silently
@@ -3427,7 +3448,7 @@ export class CodexSessionManager {
         max_sessions: maxSessions,
         admission_eviction: true,
       });
-      void Promise.resolve(
+      void this.trackSessionClosure(
         session.close(
           new GatewayError(
             499,
@@ -3599,7 +3620,7 @@ export class CodexSessionManager {
       session_key: sessionKey,
       reason: reason?.message || 'gateway request aborted',
     });
-    await session.close(reason);
+    await this.trackSessionClosure(session.close(reason));
   }
 
   async expireSession(sessionKey, reason = 'idle_timeout') {
@@ -3613,14 +3634,16 @@ export class CodexSessionManager {
       session_key: sessionKey,
       reason,
     });
-    await session.close(
-      reason === 'pending_tool_timeout'
-        ? new GatewayError(
-            504,
-            'api_error',
-            `Codex session expired while waiting for tool_result after ${this.pendingToolTimeoutMs()}ms`
-          )
-        : null
+    await this.trackSessionClosure(
+      session.close(
+        reason === 'pending_tool_timeout'
+          ? new GatewayError(
+              504,
+              'api_error',
+              `Codex session expired while waiting for tool_result after ${this.pendingToolTimeoutMs()}ms`
+            )
+          : null
+      )
     );
   }
 
@@ -3648,11 +3671,13 @@ export class CodexSessionManager {
         session_key: sessionKey,
         max_sessions: maxSessions,
       });
-      await session.close(
-        new GatewayError(
-          499,
-          'api_error',
-          `Codex session pool exceeded max_sessions=${maxSessions}`
+      await this.trackSessionClosure(
+        session.close(
+          new GatewayError(
+            499,
+            'api_error',
+            `Codex session pool exceeded max_sessions=${maxSessions}`
+          )
         )
       );
     }
@@ -3664,10 +3689,9 @@ export class CodexSessionManager {
     traceLog(this.tracer, 'codex.session_manager.closed', {
       session_count: sessions.length,
     });
-    await Promise.all(
-      sessions.map(function closeSession(session) {
-        return session.close();
-      })
+    const currentClosures = sessions.map((session) =>
+      this.trackSessionClosure(session.close())
     );
+    await Promise.all([...this.pendingSessionClosures, ...currentClosures]);
   }
 }

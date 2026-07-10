@@ -3,31 +3,38 @@
 ## Supported environment
 
 - Node.js 20 or newer.
-- Current native Claude Code CLI.
-- Codex CLI 0.144.1 or newer for the shared daemon.
-- macOS, Linux, or WSL with Bash; managed shell hooks support zsh and Bash.
+- Current Claude Code CLI.
+- Codex CLI 0.144.1 or newer.
+- macOS, Linux, or WSL. Shared mode requires Bash; its managed hook supports
+  Bash and zsh.
 - A Codex workspace whose live model catalog includes the configured model.
 
-On WSL, install Node.js, Claude Code, and Codex in the same distribution. Keep
-the project and gateway state on the Linux filesystem unless the Windows mount
-is configured to preserve Unix permissions and symlinks.
+On WSL, install Node.js, Claude Code, Codex, and Claude Workflow in the same
+distribution. Their commands, user configuration, and gateway state must use
+the Linux filesystem rather than `/mnt/...` paths or Windows executables.
 
 The configured Codex model must appear in your workspace model catalog. If the
-default `gpt-5.6-terra` route is absent, set
-`ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL` and
-`ULTRATHINK_GATEWAY_CODEX_MODEL` to a model returned by your Codex installation.
+default `gpt-5.6-terra` route is absent, run
+`claude-workflow config --agents <model-id>` with a full model ID available to
+your Codex workspace. The interactive Codex `/model` picker shows available
+choices.
 
 ## Before opening an issue
 
 Run:
 
 ```bash
-claude --version
-codex --version
-codex login status
+claude-workflow --version
+claude-workflow doctor
+claude-workflow config
+```
+
+For shared-mode problems, also run:
+
+```bash
 claude-workflow-gateway status
 claude-workflow-gateway log 100
-npm test
+curl -s http://127.0.0.1:4318/healthz
 ```
 
 Include the failing command, OS/shell, sanitized health response, and the first

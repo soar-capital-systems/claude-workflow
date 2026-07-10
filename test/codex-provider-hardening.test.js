@@ -8,6 +8,47 @@ import { fileURLToPath } from 'node:url';
 import { CodexSessionManager } from '../js/gateway/codex-provider.js';
 
 const MODEL = 'claude-sonnet-4-7';
+const activeSessions = new Set();
+let currentStage = 'bootstrap';
+
+function beginStage(name) {
+  currentStage = name;
+  if (process.env.CODEX_HARDENING_DEBUG === '1') {
+    process.stderr.write(`Codex hardening stage: ${name}\n`);
+  }
+}
+
+function trackManager(manager) {
+  const createSession = manager.createSession;
+  manager.createSession = function createTrackedSession(...args) {
+    const session = createSession(...args);
+    activeSessions.add(session);
+    return session;
+  };
+  return manager;
+}
+
+function forceKillTrackedAppServers() {
+  for (const session of activeSessions) {
+    const child = session.connection?.child;
+    if (!Number.isInteger(child?.pid)) {
+      continue;
+    }
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+        continue;
+      } catch {
+        // Fall back to the direct child.
+      }
+    }
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Best-effort watchdog cleanup.
+    }
+  }
+}
 
 function request(sessionId) {
   const headers = {
@@ -110,6 +151,15 @@ async function readJsonLines(filePath) {
       return [];
     }
     throw error;
+  }
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
   }
 }
 
@@ -220,11 +270,11 @@ async function testDynamicToolsOnlyThreadMode() {
   const logPath = path.join(tempDir, 'app-server.jsonl');
   await makeExecutable(command, finalAppServer(logPath));
 
-  const configuredManager = new CodexSessionManager(
-    managerConfig(command, tempDir, { dynamicToolsOnly: false })
+  const configuredManager = trackManager(
+    new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: false }))
   );
-  const dynamicOnlyManager = new CodexSessionManager(
-    managerConfig(command, tempDir, { dynamicToolsOnly: true })
+  const dynamicOnlyManager = trackManager(
+    new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: true }))
   );
   try {
     await configuredManager.processRequest(request('configured-cwd'), body('Configured cwd.'), route());
@@ -255,8 +305,8 @@ async function testDynamicToolsOnlyVersionGate() {
   const command = path.join(tempDir, 'fake-codex-old');
   const logPath = path.join(tempDir, 'app-server.jsonl');
   await makeExecutable(command, finalAppServer(logPath, 'codex_cli_rs/0.143.0'));
-  const manager = new CodexSessionManager(
-    managerConfig(command, tempDir, { dynamicToolsOnly: true })
+  const manager = trackManager(
+    new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: true }))
   );
   try {
     await assert.rejects(
@@ -281,13 +331,15 @@ async function testPendingToolRetentionAndHardCapacity() {
       input_schema: { type: 'object', properties: { command: { type: 'string' } } },
     },
   ];
-  const manager = new CodexSessionManager(
-    managerConfig(command, tempDir, {
-      idleTimeoutMs: 15,
-      forkIdleTimeoutMs: 15,
-      pendingToolTimeoutMs: 500,
-      maxSessions: 1,
-    })
+  const manager = trackManager(
+    new CodexSessionManager(
+      managerConfig(command, tempDir, {
+        idleTimeoutMs: 15,
+        forkIdleTimeoutMs: 15,
+        pendingToolTimeoutMs: 500,
+        maxSessions: 1,
+      })
+    )
   );
 
   try {
@@ -339,12 +391,14 @@ async function testPendingToolTimeout() {
   const logPath = path.join(tempDir, 'app-server.jsonl');
   await makeExecutable(command, toolAppServer(logPath));
   const tools = [{ name: 'Bash', description: 'Run.', input_schema: { type: 'object' } }];
-  const manager = new CodexSessionManager(
-    managerConfig(command, tempDir, {
-      idleTimeoutMs: 5,
-      pendingToolTimeoutMs: 50,
-      maxSessions: 1,
-    })
+  const manager = trackManager(
+    new CodexSessionManager(
+      managerConfig(command, tempDir, {
+        idleTimeoutMs: 5,
+        pendingToolTimeoutMs: 50,
+        maxSessions: 1,
+      })
+    )
   );
 
   try {
@@ -360,6 +414,15 @@ async function testPendingToolTimeout() {
       },
       'pending tool timeout'
     );
+    await manager.close();
+    const processes = (await readJsonLines(logPath)).filter((entry) => entry.event === 'process');
+    assert.equal(processes.length, 1);
+    await waitFor(
+      function appServerExited() {
+        return !processExists(processes[0].pid);
+      },
+      'pending-timeout app-server exit'
+    );
   } finally {
     await manager.close();
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -370,7 +433,7 @@ async function testStdinEpipeDoesNotCrashGateway() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-epipe-'));
   const command = path.join(tempDir, 'fake-codex');
   await makeExecutable(command, closedStdinAppServer());
-  const manager = new CodexSessionManager(managerConfig(command, tempDir));
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
 
   try {
     await assert.rejects(
@@ -412,11 +475,37 @@ async function testProviderInChildProcess() {
   return false;
 }
 
-const epipeChild = await testProviderInChildProcess();
-if (!epipeChild) {
-  await testDynamicToolsOnlyThreadMode();
-  await testDynamicToolsOnlyVersionGate();
-  await testPendingToolRetentionAndHardCapacity();
-  await testPendingToolTimeout();
-  process.stdout.write('PASS Codex provider environment, capacity, pending-tool, and EPIPE hardening\n');
+const watchdog = setTimeout(function hardeningWatchdogExpired() {
+  const diagnostics = Array.from(activeSessions, (session) => ({
+    disposed: session.disposed,
+    pendingToolCall: Boolean(session.pendingToolCall),
+    childPid: session.connection?.child?.pid || null,
+    childExitCode: session.connection?.child?.exitCode ?? null,
+    childSignalCode: session.connection?.child?.signalCode ?? null,
+    pendingRequests: session.connection?.pendingRequests?.size ?? null,
+  }));
+  forceKillTrackedAppServers();
+  process.stderr.write(
+    `FAIL Codex provider hardening exceeded its 20-second watchdog during ${currentStage}: ` +
+      `${JSON.stringify(diagnostics)}\n`
+  );
+  process.exit(1);
+}, 20_000);
+
+try {
+  beginStage('EPIPE child process');
+  const epipeChild = await testProviderInChildProcess();
+  if (!epipeChild) {
+    beginStage('dynamic-tools thread mode');
+    await testDynamicToolsOnlyThreadMode();
+    beginStage('dynamic-tools version gate');
+    await testDynamicToolsOnlyVersionGate();
+    beginStage('pending-tool retention and capacity');
+    await testPendingToolRetentionAndHardCapacity();
+    beginStage('pending-tool timeout');
+    await testPendingToolTimeout();
+    process.stdout.write('PASS Codex provider environment, capacity, pending-tool, and EPIPE hardening\n');
+  }
+} finally {
+  clearTimeout(watchdog);
 }

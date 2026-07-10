@@ -29,7 +29,8 @@ const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
 const WORKFLOW_CODEX_TOOL_RESULT_MAX_BYTES = 0;
 const WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES = 0;
 const GLM_AUTO_COMPACT_WINDOW = '1000000';
-const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
+export const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
+export const DEFAULT_SUBAGENT_REASONING_EFFORT = 'max';
 const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
 
 export function envString(name, fallback = '') {
@@ -260,7 +261,7 @@ export function buildWorkflowGatewayConfig({
   );
   const subagentReasoningEffort = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT',
-    'max'
+    DEFAULT_SUBAGENT_REASONING_EFFORT
   );
   const subagentVerbosity = envString('ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY', 'high');
   const defaultMainRoute = {

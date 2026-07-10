@@ -811,6 +811,10 @@ install_shell() {
   shell_rc="$(resolve_shell_rc_target "$shell_rc")" || return 1
   mkdir -p "$(dirname "$shell_rc")" || return 1
   touch "$shell_rc" || return 1
+  if [ ! -f "$shell_rc" ]; then
+    echo "claude-workflow-gateway: shell rc must be a regular file: $shell_rc" >&2
+    return 1
+  fi
   rewrite_shell_blocks "$shell_rc" install || return 1
   echo "claude-workflow-gateway: installed or refreshed shell hook in $shell_rc"
 }

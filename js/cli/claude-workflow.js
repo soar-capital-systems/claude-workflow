@@ -14,6 +14,7 @@ import {
   routeProvider,
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
+import { runConfigCommand, runDoctorCommand, runSetupCommand } from './onboarding.js';
 
 const SIGNAL_NUMBERS = {
   SIGINT: 2,
@@ -39,36 +40,27 @@ function usage() {
   return [
     'Usage:',
     '  claude-workflow',
-    '  claude-workflow "Use a workflow to delegate a tiny subagent task."',
-    '  claude-workflow --resume <session-id>',
-    '  claude-workflow --continue',
+    '  claude-workflow "Review the current diff."',
+    '  claude-workflow run "setup the repository"',
+    '  claude-workflow setup [--shared]',
+    '  claude-workflow doctor [--json]',
+    '  claude-workflow config [options]',
     '  claude-workflow -- <claude options or command>',
     '',
-    'Behavior:',
-    '  - no arguments: starts normal interactive Claude Code on the configured main/frontier model through a local gateway',
-    '  - each launch uses an OS-assigned localhost port unless ULTRATHINK_GATEWAY_PORT is set',
-    '  - Workflow subagents default to a Codex/GPT-labeled model id mapped to a Codex route',
-    '  - routed subagent responses also report Codex/GPT metadata in Claude Code UI by default',
-    '  - sonnet/haiku/opus alias slots remap to the routed subagent model id, so alias-pinned agents display and use the Codex-backed id (override with ANTHROPIC_DEFAULT_SONNET_MODEL etc.)',
-    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), Codex auto-compaction uses body-after-prefix scope, upstream Codex owns token-aware dynamic-tool truncation by default, and live sessions recycle before the window can overflow',
-    '  - workflows launched or resumed outside claude-workflow need the shared gateway daemon (claude-workflow-gateway) or routed model ids will 404 at Anthropic',
-    '  - other non-frontier Claude model ids also route to Codex by default',
-    '  - with prompt text: runs a one-shot "claude -p" prompt through the same gateway',
-    '  - --resume, -r, --continue, -c, --fork-session, --from-pr, and --session-id pass through to interactive Claude',
-    '  - use -- before any other Claude option or command; unknown wrapper flags fail instead of becoming prompt text',
-    '  - interactive and one-shot launches intentionally default to --dangerously-skip-permissions',
-    '  - --yolo and --dangerously-skip-permissions keep permission bypass explicit',
-    '  - --no-yolo or CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false restores permission prompts',
-    '  - an explicit Claude --permission-mode after -- also disables the default bypass flag',
-    '  - claude-workflow owns --model; configure ULTRATHINK_GATEWAY_MAIN_MODEL_ID instead',
-    '  - permission bypass is unsafe in untrusted repositories or on machines that are not otherwise isolated',
+    'Commands:',
+    '  setup    Check requirements and authentication; optionally enable shared mode',
+    '  doctor   Re-run the read-only prerequisite and routing checks',
+    '  config   Show or update main model, agent model, reasoning, and permissions',
+    '  run      Launch a prompt whose first word is a command name',
     '',
-    'Requirements:',
-    '  - claude CLI on PATH',
-    '  - codex CLI on PATH and already logged in (for Codex-backed routed models)',
-    '  - Claude Code local auth or gateway-compatible Anthropic auth for Anthropic passthrough',
-    '  - trusted overrides can live in ~/.claude-workflow.env (legacy ~/.ultrathink.env is also read)',
-    '  - project .env is ignored unless CLAUDE_WORKFLOW_LOAD_PROJECT_ENV=true is set in the parent shell',
+    'Wrapper options:',
+    '  --no-yolo  Restore Claude Code permission prompts for this launch',
+    '  --yolo     Explicitly keep the default permission bypass',
+    '  --help     Show this help',
+    '  --version  Show the installed package version',
+    '',
+    'Use -- before native Claude options. Resume flags may be passed directly.',
+    'Run only in trusted repositories: permission bypass is enabled by default.',
   ].join('\n');
 }
 
@@ -235,6 +227,15 @@ function isHelpRequest(rawArgs) {
   return rawArgs.length === 1 && (rawArgs[0] === '--help' || rawArgs[0] === '-h');
 }
 
+function isVersionRequest(rawArgs) {
+  return rawArgs.length === 1 && (rawArgs[0] === '--version' || rawArgs[0] === '-V');
+}
+
+function packageVersion() {
+  const packagePath = new URL('../../package.json', import.meta.url);
+  return JSON.parse(fs.readFileSync(packagePath, 'utf8')).version;
+}
+
 function waitForServer(server) {
   if (server.listening) {
     return Promise.resolve();
@@ -372,11 +373,32 @@ async function closeGateway(runtime) {
 }
 
 async function main() {
-  const rawArgs = process.argv.slice(2);
+  let rawArgs = process.argv.slice(2);
 
   if (isHelpRequest(rawArgs)) {
     process.stdout.write(`${usage()}\n`);
     return;
+  }
+  if (isVersionRequest(rawArgs)) {
+    process.stdout.write(`${packageVersion()}\n`);
+    return;
+  }
+
+  const command = rawArgs[0];
+  if (command === 'setup') {
+    runSetupCommand(rawArgs.slice(1));
+    return;
+  }
+  if (command === 'doctor') {
+    runDoctorCommand(rawArgs.slice(1));
+    return;
+  }
+  if (command === 'config') {
+    runConfigCommand(rawArgs.slice(1));
+    return;
+  }
+  if (command === 'run') {
+    rawArgs = rawArgs.slice(1);
   }
 
   const { claudeArgs, interactiveSession, promptArgs, skipPermissions } = parseCliArgs(rawArgs);

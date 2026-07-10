@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 - 2026-07-10
 
 ### Added
 
+- Zero-config `setup` and read-only `doctor` checks for native tools,
+  authentication, routing, and WSL path safety.
+- A friendly `config` command for Fable/Codex models, reasoning effort, and
+  permission behavior, backed by atomic owner-only user configuration.
 - Shared `claude-workflow-gateway` daemon manager with revision-aware health,
   safe shell-hook install/uninstall, exact PID ownership, and upgrade-compatible
   state discovery.
@@ -43,6 +47,8 @@
 - Child stdin `EPIPE`, duplicate replay cancellation, hard pool pressure, and
   blank/false-like configuration values are handled without daemon crashes or
   unbounded growth.
+- Session expiry and forced shutdown await bounded app-server cleanup, avoiding
+  orphaned Codex processes during timeouts and test interruption.
 - Daemon env publication is shell-injection-safe, atomic, and private; health
   checks verify service/PID/revision rather than accepting an arbitrary 2xx.
 - Trace files are private, bounded, rotated under a cross-process lock, recover

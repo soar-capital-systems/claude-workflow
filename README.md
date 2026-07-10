@@ -25,15 +25,19 @@ npm install --global @anthropic-ai/claude-code
 npm install --global @openai/codex
 ```
 
-Install the package, check the local tools, then start it inside a trusted repository:
+Install Claude Workflow from its repository, check the local tools, then start it inside a trusted repository:
 
 ```bash
-npm install --global @onetool/claude-workflow
+git clone https://github.com/yshaaban/claude-workflow.git
+cd claude-workflow
+npm install --global --install-links .
 claude-workflow setup
 
 cd /path/to/project
 claude-workflow
 ```
+
+`--install-links` copies the package into npm's global prefix, so the command does not depend on the source checkout after installation.
 
 `setup` verifies the supported platform, installed CLI versions, authentication, Linux-native WSL paths, and the effective routing configuration. It does not make a model request or verify live model availability. Without `--shared`, it creates no files and changes no shell settings.
 
@@ -239,8 +243,6 @@ See [SUPPORT.md](SUPPORT.md) for issue-reporting guidance and known boundaries.
 ## Development
 
 ```bash
-git clone https://github.com/yshaaban/claude-workflow.git
-cd claude-workflow
 npm ci
 npm run check
 npm test

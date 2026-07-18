@@ -8,6 +8,8 @@
 - macOS, Linux, or WSL. Shared mode requires Bash; its managed hook supports
   Bash and zsh.
 - A Codex workspace whose live model catalog includes the configured model.
+- For the built-in Kimi 1M preset, a Kimi Code API key and an Allegretto plan or
+  higher. Moderato can select the 256K profile with `config --main k3`.
 
 On WSL, install Node.js, Claude Code, Codex, and Claude Workflow in the same
 distribution. Their commands, user configuration, and gateway state must use
@@ -18,6 +20,23 @@ default `gpt-5.6-terra` route is absent, run
 `claude-workflow config --agents <model-id>` with a full model ID available to
 your Codex workspace. The interactive Codex `/model` picker shows available
 choices.
+
+Kimi uses its own provider route and does not need to appear in the Codex or
+Claude Code `/model` picker. Select the 1M profile with `claude-workflow config
+--main kimi` or the Moderato 256K profile with `claude-workflow config --main
+k3`, then add `ULTRATHINK_GATEWAY_KIMI_API_KEY` to the owner-only
+`~/.claude-workflow.env` file, and verify a new session with Claude Code's
+`/status` command. On a clean Claude Code installation, first run
+`claude-workflow setup --prepare-claude`; it preserves the existing Claude
+state and makes a private backup before enabling third-party-model support.
+Kimi Code keys and Kimi Open Platform keys are not
+interchangeable. For shared mode, restart the gateway and open a new shell
+after changing the route.
+
+The per-session `claude-workflow` launcher overrides user, project, and local
+routing settings without modifying them. Organization-managed Claude settings
+remain authoritative. Shared mode relies on environment exports, so use the
+launcher in repositories whose settings conflict with those exports.
 
 ## Before opening an issue
 
@@ -51,3 +70,12 @@ relevant error. Never attach credentials or an unredacted gateway env file.
   to `max` because Claude already owns subagent orchestration.
 - Large-output truncation is never proof of complete review. Follow
   `docs/LARGE_FILES_AND_DIFFS.md` for coverage accounting.
+- Kimi's 1M context window does not raise its 2,097,152-byte total
+  message-content ceiling. Large files and diffs still require bounded reads
+  and explicit coverage tracking.
+- Kimi Code does not document an Anthropic-compatible token-count endpoint.
+  The gateway uses a conservative UTF-8 byte estimate for Claude Code's local
+  compaction signal; it is not an exact provider token count.
+- Shared mode is user-wide. It rejects project `.env` loading and cannot
+  override organization policy or conflicting Claude settings introduced by a
+  repository entered after setup. Use the per-session launcher for those cases.

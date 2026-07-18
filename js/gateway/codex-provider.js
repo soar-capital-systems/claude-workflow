@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
+import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
 import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
@@ -19,6 +20,7 @@ const DEFAULT_INPUT_MAX_TOKENS = 192_000;
 // is headroom for the model's reasoning and output.
 const CODEX_WINDOW_INPUT_FRACTION = 0.8;
 const DEFAULT_MAX_SESSIONS = 16;
+const MAX_PENDING_INBOUND_EVENTS = 1_024;
 const SUPPORTS_PROCESS_GROUP_SIGNALS = process.platform !== 'win32';
 const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
 const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';
@@ -1701,6 +1703,9 @@ class CodexAppServerConnection extends EventEmitter {
     this.buffer = '';
     this.nextRequestId = 1;
     this.pendingRequests = new Map();
+    this.inboundMessages = [];
+    this.pendingInboundEvents = [];
+    this.drainingInboundMessages = false;
     this.initialized = false;
     this.closed = false;
     this.closing = false;
@@ -1721,9 +1726,7 @@ class CodexAppServerConnection extends EventEmitter {
     this.child = spawn(this.config.codex.command, ['app-server'], {
       cwd: this.config.codex.cwd,
       detached: SUPPORTS_PROCESS_GROUP_SIGNALS,
-      env: {
-        ...process.env,
-      },
+      env: environmentWithoutGatewayAndAnthropicCredentials(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -1777,7 +1780,34 @@ class CodexAppServerConnection extends EventEmitter {
         continue;
       }
 
-      this.handleMessage(message);
+      this.inboundMessages.push(message);
+    }
+    void this.drainInboundMessages();
+  }
+
+  async drainInboundMessages() {
+    if (this.drainingInboundMessages) {
+      return;
+    }
+    this.drainingInboundMessages = true;
+    try {
+      while (this.inboundMessages.length > 0) {
+        const message = this.inboundMessages.shift();
+        try {
+          this.handleMessage(message);
+        } catch (error) {
+          this.handleExit(error);
+        }
+        // A response may resolve an awaited RPC that installs listeners for
+        // the next notification or server request. Let that continuation run
+        // before dispatching another line from the same stdout chunk.
+        await Promise.resolve();
+      }
+    } finally {
+      this.drainingInboundMessages = false;
+      if (this.inboundMessages.length > 0) {
+        void this.drainInboundMessages();
+      }
     }
   }
 
@@ -1867,12 +1897,47 @@ class CodexAppServerConnection extends EventEmitter {
     }
 
     if (message.method && message.id !== undefined) {
-      this.emit('server-request', message);
+      this.dispatchInboundEvent('server-request', message);
       return;
     }
 
     if (message.method) {
-      this.emit('notification', message);
+      this.dispatchInboundEvent('notification', message);
+    }
+  }
+
+  dispatchInboundEvent(eventName, message) {
+    if (this.listenerCount(eventName) > 0) {
+      this.emit(eventName, message);
+      return;
+    }
+
+    if (this.pendingInboundEvents.length >= MAX_PENDING_INBOUND_EVENTS) {
+      throw new GatewayError(
+        502,
+        'api_error',
+        `Codex app-server exceeded ${MAX_PENDING_INBOUND_EVENTS} queued inbound events before the turn was ready`
+      );
+    }
+    this.pendingInboundEvents.push({ eventName, message });
+  }
+
+  subscribeToTurn(onNotification, onServerRequest, onError) {
+    this.on('notification', onNotification);
+    this.on('server-request', onServerRequest);
+    this.on('error', onError);
+
+    const queuedEvents = this.pendingInboundEvents.splice(0);
+    for (const event of queuedEvents) {
+      if (this.closed) {
+        break;
+      }
+      try {
+        this.emit(event.eventName, event.message);
+      } catch (error) {
+        this.handleExit(error);
+        break;
+      }
     }
   }
 
@@ -2796,9 +2861,7 @@ class CodexGatewaySession {
       scheduleDeferredToolUseFallback();
     };
 
-    this.connection.on('notification', onNotification);
-    this.connection.on('server-request', onServerRequest);
-    this.connection.on('error', onError);
+    this.connection.subscribeToTurn(onNotification, onServerRequest, onError);
 
     return boundary;
   }

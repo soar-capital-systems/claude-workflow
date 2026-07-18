@@ -20,6 +20,16 @@ const TOOL_REASONING_CACHE_MAX_ENTRIES = 2_048;
 
 export function assertGatewayBindIsSafe(config) {
   const host = config.host || '127.0.0.1';
+  const hasKimiRoute = Object.values(config.routeMap || {}).some(function usesKimi(route) {
+    return String(route?.provider || '').trim().toLowerCase() === 'kimi';
+  });
+  if (hasKimiRoute && !config.sharedSecret) {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Kimi routes require gateway authentication, including on loopback. Set ULTRATHINK_GATEWAY_SHARED_SECRET or use a managed workflow profile.'
+    );
+  }
   if (isGatewayLoopbackHost(host) || config.sharedSecret) {
     return;
   }
@@ -129,6 +139,40 @@ async function safeJson(response) {
     return JSON.parse(text);
   } catch {
     return { raw: text };
+  }
+}
+
+function estimateKimiInputTokens(requestBody) {
+  const serialized = JSON.stringify({
+    model: requestBody?.model,
+    system: requestBody?.system,
+    messages: requestBody?.messages,
+    tools: requestBody?.tools,
+    tool_choice: requestBody?.tool_choice,
+  });
+  // Kimi Code does not document an Anthropic count_tokens endpoint. A
+  // byte-aware 2:1 estimate is intentionally conservative for source code and
+  // Unicode while still approaching Kimi's separate 2 MiB message ceiling.
+  return Math.max(1, Math.ceil(Buffer.byteLength(serialized, 'utf8') / 2));
+}
+
+function copyAnthropicCompatibleResponseHeaders(upstream, res) {
+  const exactHeaders = new Set([
+    'content-type',
+    'request-id',
+    'retry-after',
+    'x-request-id',
+  ]);
+
+  for (const [name, value] of upstream.headers) {
+    if (
+      !exactHeaders.has(name) &&
+      !name.startsWith('anthropic-ratelimit-') &&
+      !name.startsWith('x-ratelimit-')
+    ) {
+      continue;
+    }
+    res.setHeader(name, value);
   }
 }
 
@@ -291,6 +335,26 @@ function matchesGatewaySharedSecret(value, config) {
   return Boolean(config.sharedSecret) && value === config.sharedSecret;
 }
 
+function copyAnthropicClientIdentityHeaders(req, headers) {
+  const exactHeaders = new Set([
+    'anthropic-dangerous-direct-browser-access',
+    'user-agent',
+    'x-app',
+  ]);
+
+  for (const [name, value] of Object.entries(req.headers || {})) {
+    if (
+      typeof value !== 'string' ||
+      (!exactHeaders.has(name) &&
+        !name.startsWith('x-claude-code-') &&
+        !name.startsWith('x-stainless-'))
+    ) {
+      continue;
+    }
+    headers[name] = value;
+  }
+}
+
 function forwardedAnthropicCredential(req, config) {
   const authorization = req.get('authorization');
   if (authorization?.startsWith('Bearer ')) {
@@ -318,22 +382,29 @@ function forwardedAnthropicCredential(req, config) {
   return null;
 }
 
-function createAnthropicHeaders(config, req) {
+function createAnthropicCompatibleHeaders(config, req, route) {
+  const providerConfig = route.provider === 'kimi' ? config.kimi : config.anthropic;
   const headers = upstreamHeaders({
-    'anthropic-version': req.get('anthropic-version') || config.anthropic.version,
+    'anthropic-version': req.get('anthropic-version') || providerConfig.version,
   });
 
-  const forwardedCredential = forwardedAnthropicCredential(req, config);
-  if (forwardedCredential) {
-    headers[forwardedCredential.headerName] = forwardedCredential.headerValue;
-  } else if (config.anthropic.apiKey) {
-    headers['x-api-key'] = config.anthropic.apiKey;
+  copyAnthropicClientIdentityHeaders(req, headers);
+
+  if (route.provider === 'kimi') {
+    headers['x-api-key'] = providerConfig.apiKey;
   } else {
-    throw new GatewayError(
-      401,
-      'authentication_error',
-      'Anthropic passthrough requires inbound Claude credentials or ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY / ANTHROPIC_API_KEY'
-    );
+    const forwardedCredential = forwardedAnthropicCredential(req, config);
+    if (forwardedCredential) {
+      headers[forwardedCredential.headerName] = forwardedCredential.headerValue;
+    } else if (config.anthropic.apiKey) {
+      headers['x-api-key'] = config.anthropic.apiKey;
+    } else {
+      throw new GatewayError(
+        401,
+        'authentication_error',
+        'Anthropic passthrough requires inbound Claude credentials or ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY / ANTHROPIC_API_KEY'
+      );
+    }
   }
 
   const anthropicBeta = req.get('anthropic-beta');
@@ -344,33 +415,81 @@ function createAnthropicHeaders(config, req) {
   return headers;
 }
 
-async function proxyAnthropicJson(req, res, config, route, signal) {
-  const url = gatewayUrl(config.anthropic.baseUrl, 'v1/messages');
+function anthropicCompatibleRequestUrl(baseUrl, relativePath, req) {
+  const url = gatewayUrl(baseUrl, relativePath);
+  const inboundUrl = new URL(req.originalUrl || req.url || '/', 'http://gateway.local');
+  url.search = inboundUrl.search;
+  return url;
+}
+
+function anthropicCompatibleRequestBody(requestBody, route, stream) {
+  const body = {
+    ...requestBody,
+    model: route.upstreamModel,
+    ...(stream ? { stream: true } : {}),
+  };
+
+  if (route.provider === 'kimi') {
+    const outputConfig =
+      requestBody?.output_config &&
+      typeof requestBody.output_config === 'object' &&
+      !Array.isArray(requestBody.output_config)
+        ? requestBody.output_config
+        : {};
+    const thinking =
+      requestBody?.thinking &&
+      typeof requestBody.thinking === 'object' &&
+      !Array.isArray(requestBody.thinking)
+        ? requestBody.thinking
+        : null;
+    // Stock Claude Code sends adaptive thinking to K3. Preserve that known
+    // compatible shape (and any explicit enabled budget); only replace a
+    // missing/disabled value so the route cannot silently fall back from K3.
+    body.thinking =
+      thinking && thinking.type !== 'disabled' ? { ...thinking } : { type: 'adaptive' };
+    body.output_config = {
+      ...outputConfig,
+      effort: route.reasoningEffort || 'max',
+    };
+  }
+
+  return body;
+}
+
+function anthropicCompatibleProviderConfig(config, route) {
+  return route.provider === 'kimi' ? config.kimi : config.anthropic;
+}
+
+async function proxyAnthropicCompatibleJson(req, res, config, route, signal) {
+  const providerConfig = anthropicCompatibleProviderConfig(config, route);
+  const url = anthropicCompatibleRequestUrl(providerConfig.baseUrl, 'v1/messages', req);
   const upstream = await postJson(
     url,
-    createAnthropicHeaders(config, req),
-    { ...req.body, model: route.upstreamModel },
+    createAnthropicCompatibleHeaders(config, req, route),
+    anthropicCompatibleRequestBody(req.body, route, false),
     signal
   );
 
   const body = await safeJson(upstream);
+  copyAnthropicCompatibleResponseHeaders(upstream, res);
   res.status(upstream.status).json(body);
 }
 
-async function proxyAnthropicStream(req, res, config, route, signal) {
-  const url = gatewayUrl(config.anthropic.baseUrl, 'v1/messages');
+async function proxyAnthropicCompatibleStream(req, res, config, route, signal) {
+  const providerConfig = anthropicCompatibleProviderConfig(config, route);
+  const url = anthropicCompatibleRequestUrl(providerConfig.baseUrl, 'v1/messages', req);
   const upstream = await postJson(
     url,
-    createAnthropicHeaders(config, req),
-    { ...req.body, model: route.upstreamModel, stream: true },
+    createAnthropicCompatibleHeaders(config, req, route),
+    anthropicCompatibleRequestBody(req.body, route, true),
     signal
   );
 
   res.status(upstream.status);
-  res.setHeader(
-    'content-type',
-    upstream.headers.get('content-type') || 'text/event-stream; charset=utf-8'
-  );
+  copyAnthropicCompatibleResponseHeaders(upstream, res);
+  if (!upstream.headers.get('content-type')) {
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+  }
   res.setHeader('cache-control', 'no-cache');
   res.setHeader('connection', 'keep-alive');
 
@@ -1205,10 +1324,14 @@ async function handleCountTokens(req, res, config, signal) {
   const route = resolveModelRoute(req.body?.model, config);
   switch (route.provider) {
     case 'anthropic': {
-      const url = gatewayUrl(config.anthropic.baseUrl, 'v1/messages/count_tokens');
+      const url = anthropicCompatibleRequestUrl(
+        config.anthropic.baseUrl,
+        'v1/messages/count_tokens',
+        req
+      );
       const upstream = await postJson(
         url,
-        createAnthropicHeaders(config, req),
+        createAnthropicCompatibleHeaders(config, req, route),
         { ...req.body, model: route.upstreamModel },
         signal
       );
@@ -1222,6 +1345,11 @@ async function handleCountTokens(req, res, config, signal) {
     case 'openai':
       res.json({
         input_tokens: estimateAnthropicInputTokens(req.body),
+      });
+      return;
+    case 'kimi':
+      res.json({
+        input_tokens: estimateKimiInputTokens(req.body),
       });
       return;
     default:
@@ -1244,11 +1372,12 @@ async function handleMessages(
 
   switch (route.provider) {
     case 'anthropic':
+    case 'kimi':
       if (req.body?.stream === true) {
-        await proxyAnthropicStream(req, res, config, route, signal);
+        await proxyAnthropicCompatibleStream(req, res, config, route, signal);
         return route;
       }
-      await proxyAnthropicJson(req, res, config, route, signal);
+      await proxyAnthropicCompatibleJson(req, res, config, route, signal);
       return route;
     case 'codex':
       if (!codexSessions) {
@@ -1324,7 +1453,13 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       glm_model: config.glm?.model || null,
       glm_reasoning_effort: config.glm?.reasoningEffort || null,
       glm_thinking: config.glm?.thinking?.type || null,
-      anthropic_passthrough_enabled: true,
+      kimi_model: config.kimi?.model || null,
+      kimi_reasoning_effort: config.kimi?.reasoningEffort || null,
+      kimi_context_tokens: config.kimi?.contextTokens ?? null,
+      kimi_key_configured: Boolean(config.kimi?.apiKey),
+      anthropic_passthrough_enabled:
+        Array.isArray(config.anthropicPassthroughModels) &&
+        config.anthropicPassthroughModels.length > 0,
       anthropic_passthrough_models: config.anthropicPassthroughModels || [],
       exposed_models: config.exposedModels || [],
       display_routed_model: Boolean(config.displayRoutedModel),

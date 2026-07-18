@@ -3,9 +3,10 @@
  *
  * Builds the routing config used by both the per-session `claude-workflow`
  * launcher and the shared `claude-workflow-gateway` daemon: the frontier main
- * model stays on Anthropic passthrough while workflow/subagent traffic and
+ * model uses the selected main provider while workflow/subagent traffic and
  * every other Claude model id route to Codex-backed profiles.
  */
+import crypto from 'node:crypto';
 import process from 'node:process';
 
 import { envFlag, loadGatewayConfig } from './config.js';
@@ -13,9 +14,11 @@ import {
   ROUTE_ENTRY_REASONING_KEYS,
   ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
   modelIdWithoutBracketQualifiers,
+  resolveModelRoute,
   routeEntryValue,
 } from './model-routing.js';
 import { proxyExclusionEnvForHost } from './proxy.js';
+import { MANAGED_GATEWAY_AUTH_ENV_NAME } from '../utils/child-env.js';
 
 const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
 // Workflow-profile ceiling for the Codex input budget. The codex provider also
@@ -29,8 +32,14 @@ const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
 const WORKFLOW_CODEX_TOOL_RESULT_MAX_BYTES = 0;
 const WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES = 0;
 const GLM_AUTO_COMPACT_WINDOW = '1000000';
+const MANAGED_PROVIDER_CLIENT_ENV_NAMES = Object.freeze([
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+]);
 export const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
 export const DEFAULT_SUBAGENT_REASONING_EFFORT = 'max';
+export const KIMI_MAIN_MODEL_ID = 'k3[1m]';
 const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
 
 export function envString(name, fallback = '') {
@@ -124,7 +133,7 @@ function modelIdPart(value) {
 }
 
 export function routeProvider(route, fallback = 'codex') {
-  return routeEntryValue(route, ['provider'], fallback);
+  return String(routeEntryValue(route, ['provider'], fallback)).trim().toLowerCase();
 }
 
 function routeUpstreamModel(route, fallback) {
@@ -150,6 +159,8 @@ function mainRouteDefaultModel(provider, mainModelId, baseConfig) {
       return baseConfig.deepseek.model;
     case 'glm':
       return baseConfig.glm.model;
+    case 'kimi':
+      return baseConfig.kimi.model;
     case 'openai':
       return baseConfig.openai.model;
     default:
@@ -165,6 +176,8 @@ function mainRouteDefaultReasoningEffort(provider, baseConfig) {
       return baseConfig.deepseek.reasoningEffort;
     case 'glm':
       return baseConfig.glm.reasoningEffort;
+    case 'kimi':
+      return baseConfig.kimi.reasoningEffort;
     case 'openai':
       return baseConfig.openai.reasoningEffort;
     default:
@@ -182,6 +195,8 @@ function mainRouteDisplayName(provider) {
       return 'DeepSeek Main Route';
     case 'glm':
       return 'GLM Main Route';
+    case 'kimi':
+      return 'Kimi K3 Main Route';
     case 'openai':
       return 'OpenAI-Compatible Main Route';
     default:
@@ -320,20 +335,53 @@ export function buildWorkflowGatewayConfig({
     ...mainRouteMap,
     ...baseRouteMap,
   };
-  // Keep only the frontier main model family on Anthropic. Every other Claude id
-  // (Opus, Sonnet, Haiku, ...) falls through to the configured Codex route unless
-  // the operator pins their own passthrough list. Frontier dated variants
-  // (e.g. claude-fable-5[1m]-20260601) stay on Anthropic via the trailing wildcard.
+  const hasKimiRoute = Object.values(routeMap).some(function usesKimi(route) {
+    return routeProvider(route, '') === 'kimi';
+  });
+  // Keep only an Anthropic-backed main model family on Anthropic. Every other
+  // Claude id (Opus, Sonnet, Haiku, ...) falls through to the configured Codex
+  // route unless the operator pins a passthrough list. Dated Fable variants
+  // (e.g. claude-fable-5[1m]-20260601) stay on Anthropic via the wildcard.
   const passthroughEnvProvided =
     envString('ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS') !== '' ||
     envString('ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS') !== '';
   const anthropicPassthroughModels = passthroughEnvProvided
     ? baseConfig.anthropicPassthroughModels
-    : [defaultAnthropicPassthroughPattern(mainModelId)];
+    : mainProvider === 'anthropic'
+      ? [defaultAnthropicPassthroughPattern(mainModelId)]
+      : [];
+  const hasAnthropicRoute =
+    anthropicPassthroughModels.length > 0 ||
+    Object.values(routeMap).some(function usesAnthropic(route) {
+      return routeProvider(route, '') === 'anthropic';
+    });
+  const sharedSecret =
+    baseConfig.sharedSecret ||
+    (hasKimiRoute ? crypto.randomBytes(32).toString('base64url') : '');
+  if (
+    sharedSecret &&
+    hasKimiRoute &&
+    hasAnthropicRoute &&
+    !envString('ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY')
+  ) {
+    throw new Error(
+      'A Kimi route combined with an Anthropic route requires a dedicated gateway-side Anthropic API key. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY so the upstream credential remains gateway-only.'
+    );
+  }
+  if (
+    sharedSecret &&
+    hasAnthropicRoute &&
+    !envString('ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY')
+  ) {
+    throw new Error(
+      'A gateway shared secret with an Anthropic route requires a dedicated gateway-side credential. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY; a generic ANTHROPIC_API_KEY is not accepted because the local gateway credential must remain distinct from upstream authentication.'
+    );
+  }
 
   return {
     config: {
       ...baseConfig,
+      sharedSecret,
       host: host ?? envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
       port: port ?? parseRequestedPort(defaultPort),
       displayRoutedModel: displayModels,
@@ -364,19 +412,41 @@ export function buildWorkflowGatewayConfig({
   };
 }
 
-export function buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId) {
+export function buildWorkflowClientEnv(
+  config,
+  gatewayBaseUrl,
+  subagentModelId,
+  mainModelId = DEFAULT_MAIN_MODEL_ID
+) {
   const clientEnv = {
     ...proxyExclusionEnvForHost(config.host),
-    ...buildWorkflowClaudeEnv(gatewayBaseUrl, subagentModelId),
+    ...buildWorkflowClaudeEnv(gatewayBaseUrl, subagentModelId, mainModelId),
   };
 
-  if (routeMapUsesProvider(config, 'glm') && !envString('CLAUDE_CODE_AUTO_COMPACT_WINDOW')) {
+  // These values depend on the selected provider. Null is an explicit unset
+  // instruction for both per-session child environments and shared shell env
+  // files, preventing Kimi settings from surviving a later route switch.
+  for (const name of MANAGED_PROVIDER_CLIENT_ENV_NAMES) {
+    clientEnv[name] = null;
+  }
+  clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME] = null;
+
+  if (routeMapUsesProvider(config, 'glm')) {
     clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = GLM_AUTO_COMPACT_WINDOW;
+  }
+
+  const mainRoute = resolveModelRoute(mainModelId, config);
+  if (routeProvider(mainRoute, '') === 'kimi') {
+    const contextTokens = String(mainRoute.contextTokens || 1_048_576);
+    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;
+    clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = contextTokens;
+    clientEnv.CLAUDE_CODE_EFFORT_LEVEL = routeReasoningEffort(mainRoute, 'max');
   }
 
   if (config.sharedSecret) {
     clientEnv.ANTHROPIC_AUTH_TOKEN = config.sharedSecret;
     clientEnv.ANTHROPIC_API_KEY = config.sharedSecret;
+    clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME] = config.sharedSecret;
   }
 
   return clientEnv;
@@ -388,30 +458,27 @@ function routeMapUsesProvider(config, provider) {
   });
 }
 
-export function buildWorkflowClaudeEnv(gatewayBaseUrl, subagentModelId) {
+export function buildWorkflowClaudeEnv(
+  gatewayBaseUrl,
+  subagentModelId,
+  mainModelId = DEFAULT_MAIN_MODEL_ID
+) {
   return {
     ANTHROPIC_BASE_URL: gatewayBaseUrl,
+    // The managed main-route setting must win over stale exports from a
+    // previously configured shared daemon.
+    ANTHROPIC_MODEL: mainModelId,
     CLAUDE_CODE_SUBAGENT_MODEL: subagentModelId,
     // Newer Claude Code resolves agent-definition models through the
     // sonnet/haiku/opus alias slots and shows those labels in the TUI.
     // Remap the slots to the routed subagent model id so alias-pinned
     // agents display and request the Codex-backed id instead of raw
-    // Anthropic sonnet/haiku ids. User-provided values win.
-    ANTHROPIC_DEFAULT_SONNET_MODEL: envString(
-      'ANTHROPIC_DEFAULT_SONNET_MODEL',
-      subagentModelId
-    ),
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: envString(
-      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-      subagentModelId
-    ),
-    ANTHROPIC_DEFAULT_OPUS_MODEL: envString(
-      'ANTHROPIC_DEFAULT_OPUS_MODEL',
-      subagentModelId
-    ),
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: envString(
-      'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
-      '0'
-    ),
+    // Anthropic sonnet/haiku ids. These are managed outputs, so a value
+    // exported by an older shared daemon cannot override a route change.
+    ANTHROPIC_DEFAULT_SONNET_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: mainModelId,
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '0',
   };
 }

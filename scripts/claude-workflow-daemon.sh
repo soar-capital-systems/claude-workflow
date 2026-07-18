@@ -167,6 +167,17 @@ validate_manager_paths() {
   fi
 }
 
+validate_shared_project_env() {
+  local normalized
+  normalized="$(printf '%s' "${CLAUDE_WORKFLOW_LOAD_PROJECT_ENV:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$normalized" in
+    1|true|yes|on)
+      echo "claude-workflow-gateway: shared mode cannot load a repository .env; use the per-session claude-workflow launcher when CLAUDE_WORKFLOW_LOAD_PROJECT_ENV is enabled" >&2
+      return 1
+      ;;
+  esac
+}
+
 # Hash the runtime source tree, including uncommitted edits, so a healthy
 # daemon can still be recognized as stale after a pull or local code change.
 # Node is already a hard runtime dependency and gives us one portable digest
@@ -227,11 +238,157 @@ for (const configName of ['.claude-workflow.env', '.ultrathink.env']) {
   if (!configPath || !fs.existsSync(configPath)) {
     continue;
   }
-  const stats = fs.statSync(configPath, { bigint: true });
-  hash.update(`user-config-stat:${configName}\0`);
-  hash.update(String(stats.size));
+  const stats = fs.lstatSync(configPath, { bigint: true });
+  hash.update(`user-config:${configName}\0`);
+  hash.update(crypto.createHash('sha256').update(fs.readFileSync(configPath)).digest());
   hash.update('\0');
-  hash.update(String(stats.mtimeNs));
+  hash.update(String(stats.mode));
+  hash.update('\0');
+}
+
+const revisionEnvPrefixes = ['CLAUDE_WORKFLOW_', 'ULTRATHINK_'];
+const revisionEnvNames = new Set([
+  'ANTHROPIC_API_KEY',
+  'CODEX_HOME',
+  'DEEPSEEK_API_KEY',
+  'DEEPSEEK_BASE_URL',
+  'DEEPSEEK_DEFAULT_MODEL_ID',
+  'GLM_API_KEY',
+  'GLM_BASE_URL',
+  'GLM_DEFAULT_MODEL_ID',
+  'KIMI_API_KEY',
+  'OPENAI_API_KEY',
+  'PATH',
+  'ZAI_API_KEY',
+  'ZAI_BASE_URL',
+  'ZAI_DEFAULT_MODEL_ID',
+  'ZAI_REASONING_EFFORT',
+  'ALL_PROXY',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'all_proxy',
+  'https_proxy',
+  'http_proxy',
+]);
+const projectEnvOptIn = new Set(['1', 'true', 'yes', 'on']).has(
+  String(process.env.CLAUDE_WORKFLOW_LOAD_PROJECT_ENV || '').trim().toLowerCase()
+);
+if (projectEnvOptIn) {
+  const projectRoot = process.cwd();
+  const projectEnvPath = path.join(projectRoot, '.env');
+  hash.update('project-root\0');
+  hash.update(projectRoot);
+  hash.update('\0');
+  if (fs.existsSync(projectEnvPath)) {
+    const stats = fs.lstatSync(projectEnvPath, { bigint: true });
+    hash.update('project-config:.env\0');
+    hash.update(crypto.createHash('sha256').update(fs.readFileSync(projectEnvPath)).digest());
+    hash.update('\0');
+    hash.update(String(stats.mode));
+    hash.update('\0');
+  }
+}
+const noProxyEntries = [process.env.no_proxy, process.env.NO_PROXY]
+  .filter((value) => typeof value === 'string' && value.trim() !== '')
+  .join(',')
+  .split(/[,\s]+/u)
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const seenNoProxyEntries = new Set();
+const canonicalNoProxyEntries = noProxyEntries.filter((entry) => {
+  const normalized = entry.toLowerCase();
+  if (seenNoProxyEntries.has(normalized)) {
+    return false;
+  }
+  seenNoProxyEntries.add(normalized);
+  return true;
+});
+const proxyConfigured = [
+  'ALL_PROXY',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'all_proxy',
+  'https_proxy',
+  'http_proxy',
+].some((name) => String(process.env[name] || '').trim() !== '');
+const gatewayHost = String(process.env.ULTRATHINK_GATEWAY_HOST || '127.0.0.1')
+  .trim()
+  .replace(/^\[/u, '')
+  .replace(/\]$/u, '')
+  .replace(/\.$/u, '')
+  .toLowerCase();
+if (proxyConfigured && gatewayHost && !seenNoProxyEntries.has(gatewayHost)) {
+  canonicalNoProxyEntries.push(gatewayHost);
+}
+const canonicalNoProxy = canonicalNoProxyEntries.join(',');
+if (canonicalNoProxy) {
+  hash.update('environment:NO_PROXY\0');
+  hash.update(crypto.createHash('sha256').update(canonicalNoProxy).digest());
+  hash.update('\0');
+}
+function ambientAnthropicApiKeyIsEffective() {
+  if (String(process.env.ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY || '').trim()) {
+    return false;
+  }
+  try {
+    const routeMap = JSON.parse(process.env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON || '{}');
+    if (
+      routeMap &&
+      typeof routeMap === 'object' &&
+      !Array.isArray(routeMap) &&
+      Object.values(routeMap).some((route) =>
+        String(route?.provider || route?.target?.provider || '').trim().toLowerCase() ===
+        'anthropic'
+      )
+    ) {
+      return true;
+    }
+  } catch {
+    // Hash conservatively; the daemon will report the malformed route map.
+    return true;
+  }
+  const passthrough = String(
+    process.env.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS ||
+      process.env.ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS ||
+      ''
+  ).trim();
+  if (passthrough) {
+    return passthrough.toLowerCase() !== 'none';
+  }
+  return String(
+    process.env.ULTRATHINK_GATEWAY_MAIN_PROVIDER ||
+      process.env.CLAUDE_WORKFLOW_MAIN_PROVIDER ||
+      'anthropic'
+  ).trim().toLowerCase() === 'anthropic';
+}
+const includeAmbientAnthropicApiKey = ambientAnthropicApiKeyIsEffective();
+for (const name of Object.keys(process.env).sort()) {
+  if (
+    !revisionEnvNames.has(name) &&
+    !revisionEnvPrefixes.some((prefix) => name.startsWith(prefix))
+  ) {
+    continue;
+  }
+  if (name === 'ULTRATHINK_GATEWAY_RUNTIME_REVISION' ||
+      name === 'ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT') {
+    continue;
+  }
+  if (name === 'CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN') {
+    continue;
+  }
+  if (
+    name === 'ANTHROPIC_API_KEY' &&
+    (!includeAmbientAnthropicApiKey ||
+      (process.env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN &&
+        process.env.ANTHROPIC_API_KEY ===
+          process.env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN))
+  ) {
+    continue;
+  }
+  hash.update(`environment:${name}\0`);
+  hash.update(
+    crypto.createHash('sha256').update(String(process.env[name] || '')).digest()
+  );
   hash.update('\0');
 }
 process.stdout.write(`${hash.digest('hex')}\n`);
@@ -543,6 +700,7 @@ release_start_lock() {
 
 start_daemon() {
   validate_managed_port || return 1
+  validate_shared_project_env || return 1
   ensure_private_state_dir || return 1
 
   if ! acquire_start_lock; then
@@ -742,6 +900,15 @@ rewrite_shell_blocks() {
       cat <<'EOF'
 if command -v claude-workflow-gateway >/dev/null 2>&1; then
   _CLAUDE_WORKFLOW_GATEWAY_MANAGER="$(command -v claude-workflow-gateway)"
+  if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN:-}" ]; then
+    if [ "${ANTHROPIC_AUTH_TOKEN-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN" ]; then
+      unset ANTHROPIC_AUTH_TOKEN
+    fi
+    if [ "${ANTHROPIC_API_KEY-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN" ]; then
+      unset ANTHROPIC_API_KEY
+    fi
+  fi
+  unset CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN
   "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" ensure >/dev/null 2>&1
   _CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR="${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow"
   _CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR="$HOME/.cache/ultrathink"

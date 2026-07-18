@@ -18,7 +18,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import { MANAGED_GATEWAY_AUTH_ENV_NAME } from '../utils/child-env.js';
 import { createGatewayServer } from '../gateway/server.js';
+import { resolveModelRoute } from '../gateway/model-routing.js';
 import {
   buildWorkflowClientEnv,
   buildWorkflowGatewayConfig,
@@ -80,10 +82,23 @@ export function quotePosixShellValue(value) {
 }
 
 export function serializeWorkflowEnvironment(clientEnv) {
-  return `${Object.entries(clientEnv)
+  // Remove only credentials installed by a previous workflow environment.
+  // Equality with the marker preserves any real credential the user has set
+  // since that environment was sourced.
+  const managedAuthCleanup = [
+    `if [ -n "\${${MANAGED_GATEWAY_AUTH_ENV_NAME}:-}" ]; then`,
+    `  if [ "\${ANTHROPIC_AUTH_TOKEN-}" = "\$${MANAGED_GATEWAY_AUTH_ENV_NAME}" ]; then unset ANTHROPIC_AUTH_TOKEN; fi`,
+    `  if [ "\${ANTHROPIC_API_KEY-}" = "\$${MANAGED_GATEWAY_AUTH_ENV_NAME}" ]; then unset ANTHROPIC_API_KEY; fi`,
+    'fi',
+    `unset ${MANAGED_GATEWAY_AUTH_ENV_NAME}`,
+  ];
+  return `${managedAuthCleanup.join('\n')}\n${Object.entries(clientEnv)
     .map(function toExport([key, value]) {
       if (!ENV_KEY_PATTERN.test(key)) {
         throw new Error(`invalid workflow environment variable name: ${key}`);
+      }
+      if (value === null || value === undefined) {
+        return `unset ${key}`;
       }
       return `export ${key}=${quotePosixShellValue(value)}`;
     })
@@ -165,10 +180,15 @@ export function writeWorkflowEnvironmentFile(
   }
 }
 
-function writeEnvFile(config, gatewayBaseUrl, subagentModelId) {
+function writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId) {
   const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
   const target = envFilePath();
-  const clientEnv = buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId);
+  const clientEnv = buildWorkflowClientEnv(
+    config,
+    gatewayBaseUrl,
+    subagentModelId,
+    mainModelId
+  );
   return writeWorkflowEnvironmentFile(target, clientEnv, {
     // The default cache directory belongs exclusively to this daemon. An
     // explicit custom path may live in a broader user-managed directory, so
@@ -184,6 +204,12 @@ async function main() {
       host: '127.0.0.1',
       dynamicToolsOnly: true,
     });
+
+  resolveModelRoute(mainModelId, config);
+  resolveModelRoute(rawSubagentModelId, config);
+  if (subagentModelId !== rawSubagentModelId) {
+    resolveModelRoute(subagentModelId, config);
+  }
 
   const runtime = createGatewayServer(config);
 
@@ -204,14 +230,14 @@ async function main() {
     const port = typeof address === 'object' && address ? address.port : config.port;
     const gatewayBaseUrl = `http://${config.host}:${port}`;
     log(`listening at ${gatewayBaseUrl}`);
-    log(`main model ${mainModelId} (anthropic passthrough: ${config.anthropicPassthroughModels.join(', ')})`);
+    log(`main model ${mainModelId}`);
     log(`subagent model ${subagentModelId}`);
     if (subagentModelId !== rawSubagentModelId) {
       log(`subagent route ${rawSubagentModelId} -> ${routeTargetSummary(subagentRoute)}`);
     }
 
     try {
-      const target = writeEnvFile(config, gatewayBaseUrl, subagentModelId);
+      const target = writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId);
       log(`env exports written to ${target}`);
     } catch (error) {
       // The env file is the daemon's contract with shell sessions; serving

@@ -15,6 +15,12 @@ import {
   writeWorkflowEnvironmentFile,
 } from '../js/cli/claude-workflow-daemon.js';
 import { createGatewayTracer } from '../js/gateway/trace.js';
+import { assertSafeUserEnvironmentFile } from '../js/utils/env-loader.js';
+import {
+  MANAGED_GATEWAY_AUTH_ENV_NAME,
+  environmentWithoutGatewayAndAnthropicCredentials,
+  environmentWithoutGatewayCredentials,
+} from '../js/utils/child-env.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ENV_LOADER_URL = pathToFileURL(path.join(REPO_ROOT, 'js', 'utils', 'env-loader.js')).href;
@@ -57,6 +63,85 @@ function probeEnvironmentLoader(cwd, home, entrypoint, extraEnv = {}) {
   return JSON.parse(result.stdout);
 }
 
+test('child credential cleanup removes gateway upstream keys and only workflow-owned auth tokens', function () {
+  const managed = 'test-managed-gateway-token';
+  const cleaned = environmentWithoutGatewayCredentials({
+    [MANAGED_GATEWAY_AUTH_ENV_NAME]: managed,
+    ANTHROPIC_AUTH_TOKEN: managed,
+    ANTHROPIC_API_KEY: 'user-anthropic-key',
+    DEEPSEEK_API_KEY: 'gateway-deepseek-key',
+    GLM_API_KEY: 'gateway-glm-key',
+    OPENAI_API_KEY: 'gateway-openai-key',
+    ZAI_API_KEY: 'gateway-zai-key',
+    ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'gateway-anthropic-key',
+    KIMI_API_KEY: 'gateway-only-kimi-key',
+    ULTRATHINK_GATEWAY_KIMI_API_KEY: 'preferred-gateway-only-kimi-key',
+    ULTRATHINK_GATEWAY_SHARED_SECRET: 'gateway-only-shared-secret',
+    PRESERVED_VALUE: 'yes',
+  });
+
+  assert.equal(Object.hasOwn(cleaned, MANAGED_GATEWAY_AUTH_ENV_NAME), false);
+  assert.equal(Object.hasOwn(cleaned, 'ANTHROPIC_AUTH_TOKEN'), false);
+  assert.equal(cleaned.ANTHROPIC_API_KEY, 'user-anthropic-key');
+  for (const name of ['DEEPSEEK_API_KEY', 'GLM_API_KEY', 'OPENAI_API_KEY', 'ZAI_API_KEY']) {
+    assert.equal(Object.hasOwn(cleaned, name), false);
+  }
+  assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY'), false);
+  assert.equal(Object.hasOwn(cleaned, 'KIMI_API_KEY'), false);
+  assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_KIMI_API_KEY'), false);
+  assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_SHARED_SECRET'), false);
+  assert.equal(cleaned.PRESERVED_VALUE, 'yes');
+
+  const userAuth = environmentWithoutGatewayCredentials({
+    [MANAGED_GATEWAY_AUTH_ENV_NAME]: managed,
+    ANTHROPIC_AUTH_TOKEN: 'user-auth-token',
+  });
+  assert.equal(userAuth.ANTHROPIC_AUTH_TOKEN, 'user-auth-token');
+
+  const nativeChild = environmentWithoutGatewayAndAnthropicCredentials({
+    ANTHROPIC_AUTH_TOKEN: 'user-auth-token',
+    ANTHROPIC_API_KEY: 'user-api-key',
+    ANTHROPIC_BETAS: 'unsupported-beta',
+    ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: unsafe',
+    PRESERVED_VALUE: 'yes',
+  });
+  assert.equal(Object.hasOwn(nativeChild, 'ANTHROPIC_AUTH_TOKEN'), false);
+  assert.equal(Object.hasOwn(nativeChild, 'ANTHROPIC_API_KEY'), false);
+  assert.equal(Object.hasOwn(nativeChild, 'ANTHROPIC_BETAS'), false);
+  assert.equal(Object.hasOwn(nativeChild, 'ANTHROPIC_CUSTOM_HEADERS'), false);
+  assert.equal(nativeChild.PRESERVED_VALUE, 'yes');
+});
+
+test('documented user credential files are ignored by Git', async function () {
+  const patterns = new Set(
+    (await fsp.readFile(path.join(REPO_ROOT, '.gitignore'), 'utf8'))
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter(Boolean)
+  );
+  assert.equal(patterns.has('.claude-workflow.env'), true);
+  assert.equal(patterns.has('.ultrathink.env'), true);
+});
+
+test(
+  'user environment files must be private regular files',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-user-env-security-');
+    const safe = path.join(root, 'safe.env');
+    const shared = path.join(root, 'shared.env');
+    const link = path.join(root, 'linked.env');
+    await fsp.writeFile(safe, 'SAFE=value\n', { mode: 0o600 });
+    await fsp.writeFile(shared, 'UNSAFE=value\n', { mode: 0o644 });
+    await fsp.symlink(safe, link);
+
+    assert.equal(assertSafeUserEnvironmentFile(path.join(root, 'missing.env')), false);
+    assert.equal(assertSafeUserEnvironmentFile(safe), true);
+    assert.throws(() => assertSafeUserEnvironmentFile(shared), /owner-only/u);
+    assert.throws(() => assertSafeUserEnvironmentFile(link), /regular, non-symlink/u);
+  }
+);
+
 test('workflow entrypoints ignore a repository .env unless the parent opts in', async function (t) {
   const root = await temporaryDirectory(t, 'claude-workflow-env-security-');
   const project = path.join(root, 'project');
@@ -91,12 +176,12 @@ test('workflow entrypoints ignore a repository .env unless the parent opts in', 
   await fsp.writeFile(
     path.join(home, '.ultrathink.env'),
     `${PROJECT_MARKER}=from-legacy-home\n`,
-    'utf8'
+    { encoding: 'utf8', mode: 0o600 }
   );
   await fsp.writeFile(
     path.join(home, '.claude-workflow.env'),
     `${PROJECT_MARKER}=from-workflow-home\n`,
-    'utf8'
+    { encoding: 'utf8', mode: 0o600 }
   );
   assert.deepEqual(probeEnvironmentLoader(project, home, '/usr/local/bin/claude-workflow'), {
     marker: 'from-workflow-home',
@@ -134,6 +219,7 @@ test(
     const writtenPath = writeWorkflowEnvironmentFile(target, {
       DANGEROUS_VALUE: dangerousValue,
       EMPTY_VALUE: '',
+      REMOVED_VALUE: null,
       SIMPLE_VALUE: 'safe',
     });
     assert.equal(writtenPath, path.resolve(target));
@@ -149,7 +235,7 @@ test(
       'bash',
       [
         '-c',
-        `. "$1"; "$2" -e 'process.stdout.write(JSON.stringify({ dangerous: process.env.DANGEROUS_VALUE, empty: process.env.EMPTY_VALUE, simple: process.env.SIMPLE_VALUE }))'`,
+        `export REMOVED_VALUE=stale; export ${MANAGED_GATEWAY_AUTH_ENV_NAME}=owned-token; export ANTHROPIC_AUTH_TOKEN=owned-token; export ANTHROPIC_API_KEY=user-key; . "$1"; "$2" -e 'process.stdout.write(JSON.stringify({ dangerous: process.env.DANGEROUS_VALUE, empty: process.env.EMPTY_VALUE, removed: process.env.REMOVED_VALUE || null, simple: process.env.SIMPLE_VALUE, marker: process.env.${MANAGED_GATEWAY_AUTH_ENV_NAME} || null, authToken: process.env.ANTHROPIC_AUTH_TOKEN || null, apiKey: process.env.ANTHROPIC_API_KEY || null }))'`,
         '_',
         target,
         process.execPath,
@@ -160,7 +246,11 @@ test(
     assert.deepEqual(JSON.parse(shellResult.stdout), {
       dangerous: dangerousValue,
       empty: '',
+      removed: null,
       simple: 'safe',
+      marker: null,
+      authToken: null,
+      apiKey: 'user-key',
     });
     assert.equal(fs.existsSync(commandSubstitutionMarker), false);
     assert.equal(fs.existsSync(backtickMarker), false);

@@ -170,7 +170,20 @@ const readline = require('node:readline');
 const logPath = ${JSON.stringify(logPath)};
 function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
 function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
-log({ event: 'process', cwd: process.cwd(), pid: process.pid });
+log({
+  event: 'process',
+  cwd: process.cwd(),
+  pid: process.pid,
+  hasKimiApiKey: Object.hasOwn(process.env, 'KIMI_API_KEY'),
+  hasDeepSeekApiKey: Object.hasOwn(process.env, 'DEEPSEEK_API_KEY'),
+  hasGlmApiKey: Object.hasOwn(process.env, 'GLM_API_KEY'),
+  hasOpenAiApiKey: Object.hasOwn(process.env, 'OPENAI_API_KEY'),
+  hasZaiApiKey: Object.hasOwn(process.env, 'ZAI_API_KEY'),
+  hasGatewayKimiApiKey: Object.hasOwn(process.env, 'ULTRATHINK_GATEWAY_KIMI_API_KEY'),
+  hasGatewaySharedSecret: Object.hasOwn(process.env, 'ULTRATHINK_GATEWAY_SHARED_SECRET'),
+  hasAnthropicAuthToken: Object.hasOwn(process.env, 'ANTHROPIC_AUTH_TOKEN'),
+  hasAnthropicApiKey: Object.hasOwn(process.env, 'ANTHROPIC_API_KEY')
+});
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', function onLine(line) {
   const message = JSON.parse(line);
@@ -204,6 +217,7 @@ const readline = require('node:readline');
 const logPath = ${JSON.stringify(logPath)};
 function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
 function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+function sendBatch(values) { process.stdout.write(values.map((value) => JSON.stringify(value) + '\\n').join('')); }
 log({ event: 'process', pid: process.pid });
 let turnId = '';
 const rl = readline.createInterface({ input: process.stdin });
@@ -219,19 +233,19 @@ rl.on('line', function onLine(line) {
   }
   if (message.method === 'turn/start') {
     turnId = 'turn-' + process.pid;
-    send({ id: message.id, result: { turn: { id: turnId } } });
-    setImmediate(function requestTool() {
-      send({ id: 900, method: 'item/tool/call', params: {
+    sendBatch([
+      { id: message.id, result: { turn: { id: turnId } } },
+      { id: 900, method: 'item/tool/call', params: {
         turnId,
         callId: 'call_pending',
         tool: 'ext_tool_001',
         arguments: { command: 'printf hardening' }
-      } });
-      send({ method: 'thread/tokenUsage/updated', params: {
+      } },
+      { method: 'thread/tokenUsage/updated', params: {
         turnId,
         tokenUsage: { last: { inputTokens: 10, outputTokens: 2, totalTokens: 12 } }
-      } });
-    });
+      } },
+    ]);
     return;
   }
   if (message.id === 900 && message.result) {
@@ -264,11 +278,86 @@ setInterval(function keepAlive() {}, 1000);
 `;
 }
 
+function coalescedStreamingAppServer() {
+  return `#!/usr/bin/env node
+const readline = require('node:readline');
+function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+function sendBatch(values) { process.stdout.write(values.map((value) => JSON.stringify(value) + '\\n').join('')); }
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', function onLine(line) {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'codex_cli_rs/0.144.1' } });
+    return;
+  }
+  if (message.method === 'thread/start') {
+    send({ id: message.id, result: { thread: { id: 'thread-coalesced-stream' } } });
+    return;
+  }
+  if (message.method === 'turn/start') {
+    const turnId = 'turn-coalesced-stream';
+    sendBatch([
+      { id: message.id, result: { turn: { id: turnId } } },
+      { method: 'item/agentMessage/delta', params: { turnId, itemId: 'message', delta: 'COALESCED_STREAM' } },
+      { method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 12, outputTokens: 3, totalTokens: 15 } } } },
+      { method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } },
+    ]);
+  }
+});
+setInterval(function keepAlive() {}, 1000);
+`;
+}
+
+async function testCoalescedStreamingEvents() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-coalesced-stream-'));
+  const command = path.join(tempDir, 'fake-codex');
+  await makeExecutable(command, coalescedStreamingAppServer());
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
+  const events = [];
+  try {
+    const outcome = await manager.streamRequest(
+      request('coalesced-stream'),
+      body('Stream an immediate response.'),
+      route(),
+      function collect(event) {
+        events.push(event);
+      }
+    );
+    assert.equal(outcome.type, 'final');
+    assert.equal(outcome.text, 'COALESCED_STREAM');
+    assert.deepEqual(events.map((event) => event.type), ['text_delta', 'usage', 'boundary']);
+    assert.equal(events[0].text, 'COALESCED_STREAM');
+    assert.equal(events.at(-1).outcome.text, 'COALESCED_STREAM');
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function testDynamicToolsOnlyThreadMode() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-environments-'));
   const command = path.join(tempDir, 'fake-codex');
   const logPath = path.join(tempDir, 'app-server.jsonl');
   await makeExecutable(command, finalAppServer(logPath));
+
+  const previousKimiApiKey = process.env.KIMI_API_KEY;
+  const previousGatewayKimiApiKey = process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY;
+  const previousGatewaySharedSecret = process.env.ULTRATHINK_GATEWAY_SHARED_SECRET;
+  const previousAnthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  const previousAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  const previousDeepSeekApiKey = process.env.DEEPSEEK_API_KEY;
+  const previousGlmApiKey = process.env.GLM_API_KEY;
+  const previousOpenAiApiKey = process.env.OPENAI_API_KEY;
+  const previousZaiApiKey = process.env.ZAI_API_KEY;
+  process.env.KIMI_API_KEY = 'test-kimi-app-server-fallback-key';
+  process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY = 'test-kimi-app-server-key';
+  process.env.ULTRATHINK_GATEWAY_SHARED_SECRET = 'test-gateway-shared-secret';
+  process.env.ANTHROPIC_AUTH_TOKEN = 'test-anthropic-app-server-token';
+  process.env.ANTHROPIC_API_KEY = 'test-anthropic-app-server-key';
+  process.env.DEEPSEEK_API_KEY = 'test-deepseek-app-server-key';
+  process.env.GLM_API_KEY = 'test-glm-app-server-key';
+  process.env.OPENAI_API_KEY = 'test-openai-app-server-key';
+  process.env.ZAI_API_KEY = 'test-zai-app-server-key';
 
   const configuredManager = trackManager(
     new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: false }))
@@ -294,8 +383,58 @@ async function testDynamicToolsOnlyThreadMode() {
     assert.equal(turns[1].effort, 'max');
     assert.equal(threadStarts[0].config.model_verbosity, 'low');
     assert.equal(threadStarts[1].config.model_verbosity, 'low');
+    const processes = (await readJsonLines(logPath)).filter(function processEntry(entry) {
+      return entry.event === 'process';
+    });
+    assert.equal(processes.length, 2);
+    assert.equal(processes.every((entry) => entry.hasKimiApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasGatewayKimiApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasGatewaySharedSecret === false), true);
+    assert.equal(processes.every((entry) => entry.hasAnthropicAuthToken === false), true);
+    assert.equal(processes.every((entry) => entry.hasAnthropicApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasDeepSeekApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasGlmApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasOpenAiApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.hasZaiApiKey === false), true);
   } finally {
     await Promise.all([configuredManager.close(), dynamicOnlyManager.close()]);
+    if (previousKimiApiKey === undefined) {
+      delete process.env.KIMI_API_KEY;
+    } else {
+      process.env.KIMI_API_KEY = previousKimiApiKey;
+    }
+    if (previousGatewayKimiApiKey === undefined) {
+      delete process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY;
+    } else {
+      process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY = previousGatewayKimiApiKey;
+    }
+    if (previousGatewaySharedSecret === undefined) {
+      delete process.env.ULTRATHINK_GATEWAY_SHARED_SECRET;
+    } else {
+      process.env.ULTRATHINK_GATEWAY_SHARED_SECRET = previousGatewaySharedSecret;
+    }
+    if (previousAnthropicAuthToken === undefined) {
+      delete process.env.ANTHROPIC_AUTH_TOKEN;
+    } else {
+      process.env.ANTHROPIC_AUTH_TOKEN = previousAnthropicAuthToken;
+    }
+    if (previousAnthropicApiKey === undefined) {
+      delete process.env.ANTHROPIC_API_KEY;
+    } else {
+      process.env.ANTHROPIC_API_KEY = previousAnthropicApiKey;
+    }
+    for (const [name, value] of [
+      ['DEEPSEEK_API_KEY', previousDeepSeekApiKey],
+      ['GLM_API_KEY', previousGlmApiKey],
+      ['OPENAI_API_KEY', previousOpenAiApiKey],
+      ['ZAI_API_KEY', previousZaiApiKey],
+    ]) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 }
@@ -438,7 +577,7 @@ async function testStdinEpipeDoesNotCrashGateway() {
   try {
     await assert.rejects(
       manager.processRequest(request('stdin-epipe'), body('Trigger EPIPE.'), route()),
-      /stdin failed|EPIPE|not available/u
+      /stdin failed|EPIPE|not available|timed out while waiting for thread\/start/u
     );
     await waitFor(
       function evicted() {
@@ -496,6 +635,8 @@ try {
   beginStage('EPIPE child process');
   const epipeChild = await testProviderInChildProcess();
   if (!epipeChild) {
+    beginStage('coalesced streaming events');
+    await testCoalescedStreamingEvents();
     beginStage('dynamic-tools thread mode');
     await testDynamicToolsOnlyThreadMode();
     beginStage('dynamic-tools version gate');

@@ -27,6 +27,7 @@ const ROUTE_PROVIDERS = Object.freeze({
   ANTHROPIC: 'anthropic',
   DEEPSEEK: 'deepseek',
   GLM: 'glm',
+  KIMI: 'kimi',
   OPENAI: 'openai',
   CODEX: 'codex',
 });
@@ -35,6 +36,7 @@ const ROUTE_PROVIDER_BUILDERS = Object.freeze({
   [ROUTE_PROVIDERS.ANTHROPIC]: buildAnthropicRoute,
   [ROUTE_PROVIDERS.DEEPSEEK]: buildDeepSeekRoute,
   [ROUTE_PROVIDERS.GLM]: buildGlmRoute,
+  [ROUTE_PROVIDERS.KIMI]: buildKimiRoute,
   [ROUTE_PROVIDERS.OPENAI]: buildOpenAiRoute,
   [ROUTE_PROVIDERS.CODEX]: buildCodexRoute,
 });
@@ -71,6 +73,16 @@ const VALID_CODEX_APPROVAL_POLICIES = Object.freeze([
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
 const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*']);
+const KIMI_REASONING_EFFORT_MAP = Object.freeze({
+  light: 'low',
+  low: 'low',
+  minimum: 'low',
+  high: 'high',
+  medium: 'high',
+  max: 'max',
+  ultra: 'max',
+  xhigh: 'max',
+});
 
 function routeValue(...values) {
   for (const value of values) {
@@ -258,6 +270,54 @@ function buildGlmRoute(modelId, config, entry = null) {
   });
 }
 
+function normalizedKimiReasoningEffort(modelId, value) {
+  const normalized = routeValue(value, 'max').toLowerCase();
+  const mapped = Object.hasOwn(KIMI_REASONING_EFFORT_MAP, normalized)
+    ? KIMI_REASONING_EFFORT_MAP[normalized]
+    : '';
+  if (mapped) {
+    return mapped;
+  }
+
+  throw new GatewayError(
+    500,
+    'api_error',
+    `Kimi route for ${modelId} must set reasoningEffort to low, high, or max`
+  );
+}
+
+function buildKimiRoute(modelId, config, entry = null) {
+  const providerConfig = config.kimi || {};
+  if (!providerConfig.apiKey) {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Kimi routing is configured but ULTRATHINK_GATEWAY_KIMI_API_KEY or KIMI_API_KEY is missing'
+    );
+  }
+
+  const upstreamModel = modelIdWithoutBracketQualifiers(
+    routeEntryValue(entry, ROUTE_ENTRY_UPSTREAM_MODEL_KEYS, providerConfig.model, 'k3')
+  );
+  const reasoningEffort = normalizedKimiReasoningEffort(
+    modelId,
+    routeEntryValue(entry, ROUTE_ENTRY_REASONING_KEYS, providerConfig.reasoningEffort, 'max')
+  );
+
+  return {
+    provider: ROUTE_PROVIDERS.KIMI,
+    requestedModel: modelId,
+    upstreamModel,
+    reasoningEffort,
+    contextTokens: providerConfig.contextTokens || 1_048_576,
+    displayName: buildDisplayName(
+      modelId,
+      entry,
+      `${formatClaudeFamily(modelId)} via Kimi ${upstreamModel}/${reasoningEffort}`
+    ),
+  };
+}
+
 function buildCodexRoute(modelId, config, entry = null) {
   if (!config.codex?.enabled) {
     throw new GatewayError(
@@ -321,7 +381,7 @@ function configuredProvider(entry, modelId) {
   throw new GatewayError(
     500,
     'api_error',
-    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "glm", "openai", or "anthropic"`
+    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "glm", "kimi", "openai", or "anthropic"`
   );
 }
 
@@ -348,13 +408,9 @@ function matchesModelPattern(modelId, pattern) {
 }
 
 export function isAnthropicPassthroughModel(modelId, config) {
-  const configuredModels = Array.isArray(config?.anthropicPassthroughModels)
+  const passthroughModels = Array.isArray(config?.anthropicPassthroughModels)
     ? config.anthropicPassthroughModels
-    : [];
-  const passthroughModels =
-    configuredModels.length > 0
-      ? configuredModels
-      : DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS;
+    : DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS;
 
   return passthroughModels.some(function matchesPassthroughModel(pattern) {
     return matchesModelPattern(modelId, pattern);

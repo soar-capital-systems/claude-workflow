@@ -187,8 +187,11 @@ async function testDaemonRevisionAndHealth() {
     assert.equal(typeof firstHealth.codex_auto_compact_token_limit, 'number');
     assert.equal(typeof firstHealth.codex_auto_compact_token_limit_scope, 'string');
 
-    await fs.writeFile(revisionFile, 'stale-revision\n', { mode: 0o600 });
-    const restart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
+    const changedEnvironment = {
+      ...env,
+      GLM_BASE_URL: 'https://revision-test.invalid/v1',
+    };
+    const restart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], changedEnvironment);
     assert.equal(restart.code, 0, restart.stderr || restart.stdout);
     assert.match(restart.stdout, /healthy daemon is stale; restarting/u);
     const secondPid = await readPid(pidFile);
@@ -197,16 +200,35 @@ async function testDaemonRevisionAndHealth() {
       return !processExists(firstPid);
     }, `stale daemon process ${firstPid} to exit`);
     const secondRevision = (await fs.readFile(revisionFile, 'utf8')).trim();
+    assert.notEqual(secondRevision, firstRevision);
     const secondHealth = await readHealth(port);
     assert.equal(secondHealth.runtime_revision, secondRevision);
     assert.equal(secondHealth.runtime_pid, secondPid);
 
+    const thinkingEnvironment = {
+      ...changedEnvironment,
+      ULTRATHINK_THINKING_LEVEL: 'OFF',
+    };
+    const thinkingRestart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], thinkingEnvironment);
+    assert.equal(thinkingRestart.code, 0, thinkingRestart.stderr || thinkingRestart.stdout);
+    assert.match(thinkingRestart.stdout, /healthy daemon is stale; restarting/u);
+    const thirdPid = await readPid(pidFile);
+    assert.notEqual(thirdPid, secondPid);
+    await waitForCondition(function secondProcessExitedAfterThinkingChange() {
+      return !processExists(secondPid);
+    }, `stale daemon process ${secondPid} to exit`);
+    const thirdRevision = (await fs.readFile(revisionFile, 'utf8')).trim();
+    assert.notEqual(thirdRevision, secondRevision);
+    const thirdHealth = await readHealth(port);
+    assert.equal(thirdHealth.runtime_revision, thirdRevision);
+    assert.equal(thirdHealth.runtime_pid, thirdPid);
+
     await fs.writeFile(revisionFile, 'stale-again\n', { mode: 0o600 });
-    const ensure = await runProcess('bash', [DAEMON_SCRIPT, 'ensure'], env);
+    const ensure = await runProcess('bash', [DAEMON_SCRIPT, 'ensure'], thinkingEnvironment);
     assert.equal(ensure.code, 0, ensure.stderr || ensure.stdout);
     const ensured = await waitForCondition(async function daemonWasReplaced() {
       const candidate = await readPid(pidFile);
-      if (candidate === secondPid || !processExists(candidate)) {
+      if (candidate === thirdPid || !processExists(candidate)) {
         return null;
       }
       const revision = (await fs.readFile(revisionFile, 'utf8')).trim();
@@ -216,16 +238,16 @@ async function testDaemonRevisionAndHealth() {
       }
       return { health, pid: candidate, revision };
     }, 'ensure to replace a healthy stale daemon');
-    await waitForCondition(function secondProcessExited() {
-      return !processExists(secondPid);
-    }, `second stale daemon process ${secondPid} to exit`);
+    await waitForCondition(function thirdProcessExited() {
+      return !processExists(thirdPid);
+    }, `third stale daemon process ${thirdPid} to exit`);
     assert.equal(ensured.health.runtime_revision, ensured.revision);
     assert.equal(ensured.health.runtime_pid, ensured.pid);
 
-    await stopDaemon(env, pidFile);
+    await stopDaemon(thinkingEnvironment, pidFile);
 
     const traceDisabledEnv = {
-      ...env,
+      ...thinkingEnvironment,
       ULTRATHINK_GATEWAY_TRACE_DIR: 'off',
     };
     const disabledStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], traceDisabledEnv);
@@ -235,6 +257,48 @@ async function testDaemonRevisionAndHealth() {
     assert.equal(disabledHealth.trace_dir, null);
     assert.equal(disabledHealth.trace_file, null);
     await stopDaemon(traceDisabledEnv, pidFile);
+  } finally {
+    try {
+      await stopDaemon(env, pidFile);
+    } catch {
+      // Best-effort cleanup for failed assertions.
+    }
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+}
+
+async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-kimi-auth-'));
+  const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
+  const envFile = path.join(stateDir, 'gateway.env');
+  const env = {
+    ...process.env,
+    CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'none',
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(await freePort()),
+    ULTRATHINK_GATEWAY_KIMI_API_KEY: 'test-kimi-gateway-key',
+    ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'k3[1m]',
+    ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'kimi',
+    ANTHROPIC_API_KEY: 'preexisting-user-anthropic-key',
+    ANTHROPIC_AUTH_TOKEN: 'preexisting-user-anthropic-token',
+  };
+  delete env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN;
+  delete env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON;
+  delete env.ULTRATHINK_GATEWAY_SHARED_SECRET;
+
+  try {
+    const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
+    assert.equal(started.code, 0, started.stderr || started.stdout);
+
+    const sourcedStatus = await runProcess(
+      'bash',
+      ['-c', '. "$1"\n"$2" status', 'managed-auth-status', envFile, DAEMON_SCRIPT],
+      env
+    );
+    assert.equal(sourcedStatus.code, 0, sourcedStatus.stderr || sourcedStatus.stdout);
+    assert.match(sourcedStatus.stdout, /healthy and current/u);
+
   } finally {
     try {
       await stopDaemon(env, pidFile);
@@ -463,4 +527,5 @@ await testStopRejectsUnrelatedPidWithDaemonPathArgument();
 await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();
+await testSourcedManagedAuthKeepsKimiDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

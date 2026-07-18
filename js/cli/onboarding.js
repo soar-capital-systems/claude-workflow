@@ -9,9 +9,19 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_CODEX_MODEL, envFlag, isGatewayLoopbackHost } from '../gateway/config.js';
 import { resolveModelRoute } from '../gateway/model-routing.js';
 import {
+  environmentWithoutGatewayAndAnthropicCredentials,
+  environmentWithoutGatewayCredentials,
+} from '../utils/child-env.js';
+import {
+  inspectClaudeRoutingSettingsConflicts,
+  inspectClaudeThirdPartyModelSupport,
+  prepareClaudeThirdPartyModelSupport,
+} from '../utils/claude-config.js';
+import {
   buildWorkflowGatewayConfig,
   DEFAULT_MAIN_MODEL_ID,
   DEFAULT_SUBAGENT_REASONING_EFFORT,
+  KIMI_MAIN_MODEL_ID,
   routeProvider,
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
@@ -42,6 +52,7 @@ const MANAGED_CONFIG_KEYS = Object.freeze([
   'CLAUDE_WORKFLOW_MAIN_PROVIDER',
   'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL',
   'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT',
+  'ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS',
   'ULTRATHINK_GATEWAY_CODEX_MODEL',
   'ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT',
   'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL',
@@ -78,9 +89,12 @@ function withProcessEnvironment(env, callback) {
 }
 
 function commandResult(command, args, options = {}) {
+  const childEnv = options.preserveAnthropicCredentials
+    ? environmentWithoutGatewayCredentials(options.env || process.env)
+    : environmentWithoutGatewayAndAnthropicCredentials(options.env || process.env);
   return spawnSync(command, args, {
     cwd: options.cwd || process.cwd(),
-    env: options.env || process.env,
+    env: childEnv,
     encoding: 'utf8',
     timeout: options.timeout || COMMAND_TIMEOUT_MS,
     shell: process.platform === 'win32',
@@ -236,7 +250,7 @@ function versionAtLeast(actual, required) {
   return true;
 }
 
-function claudeCheck(run = commandResult, env = process.env) {
+function claudeCheck(run = commandResult, env = process.env, requireAuthentication = true) {
   if (!findExecutable('claude', env)) {
     return {
       ok: false,
@@ -245,7 +259,10 @@ function claudeCheck(run = commandResult, env = process.env) {
     };
   }
 
-  const versionResult = run('claude', ['--version'], { env });
+  const versionResult = run('claude', ['--version'], {
+    env,
+    preserveAnthropicCredentials: true,
+  });
   if (versionResult.status !== 0 || versionResult.error) {
     return {
       ok: false,
@@ -257,7 +274,13 @@ function claudeCheck(run = commandResult, env = process.env) {
   const version = (commandOutput(versionResult).split(/\r?\n/u)[0] || 'installed')
     .replace(/\s*\(Claude Code\)\s*$/iu, '')
     .trim();
-  const authResult = run('claude', ['auth', 'status', '--json'], { env });
+  if (!requireAuthentication) {
+    return { ok: true, label: `Claude Code ${version} (provider authentication via gateway)` };
+  }
+  const authResult = run('claude', ['auth', 'status', '--json'], {
+    env,
+    preserveAnthropicCredentials: true,
+  });
   if (authResult.status !== 0 || authResult.error) {
     return {
       ok: false,
@@ -281,6 +304,34 @@ function claudeCheck(run = commandResult, env = process.env) {
       ok: false,
       label: `Claude Code ${version}`,
       detail: 'Authentication status was not valid JSON. Update Claude Code and try again.',
+    };
+  }
+}
+
+function claudeThirdPartyModelCheck(env = process.env, prepareRequested = false) {
+  try {
+    const state = inspectClaudeThirdPartyModelSupport(env);
+    if (state.enabled) {
+      return { ok: true, label: 'Claude Code third-party model support enabled' };
+    }
+    if (prepareRequested) {
+      return {
+        ok: true,
+        label: 'Claude Code third-party model support will be prepared',
+      };
+    }
+    return {
+      ok: false,
+      label: 'Claude Code third-party model support',
+      detail:
+        `Not ready in ${state.path}. Run ` +
+        '`claude-workflow setup --prepare-claude` before starting Kimi.',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      label: 'Claude Code third-party model support',
+      detail: error.message,
     };
   }
 }
@@ -334,6 +385,9 @@ function friendlyMainName(modelId) {
   if (/^claude-fable-5(?:\[|$)/u.test(modelId)) {
     return 'Fable 5';
   }
+  if (/^k3(?:\[|$)/u.test(modelId)) {
+    return 'Kimi K3';
+  }
   return modelId;
 }
 
@@ -374,7 +428,7 @@ export function effectiveConfigurationSummary(env = process.env) {
     ) {
       throw new Error(
         'Anthropic passthrough with a gateway shared secret requires ' +
-          'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY.'
+          'the dedicated ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY.'
       );
     }
     const agentModel =
@@ -717,10 +771,11 @@ function configUsage() {
     '  claude-workflow config',
     '  claude-workflow config --agents terra --effort max',
     '  claude-workflow config --main fable --permissions bypass',
+    '  claude-workflow config --main kimi',
     '  claude-workflow config --reset',
     '',
     'Options:',
-    '  --main <fable|model-id>       Main Anthropic model',
+    '  --main <fable|kimi|k3|model-id>  Main model (kimi: 1M; k3: 256K)',
     '  --agents <sol|terra|luna|id>  Codex model for workflow agents',
     '  --effort <level>              minimal, low, medium, high, xhigh, max, or ultra',
     '  --permissions <mode>          bypass or prompt',
@@ -761,6 +816,12 @@ export function runConfigCommand(args, options = {}) {
   }
 
   const writeOptions = ['main', 'agents', 'effort', 'permissions'].filter((name) => parsed[name]);
+  const selectsKimiMain = ['kimi', 'k3', 'k3[1m]'].includes(
+    String(parsed.main || '').trim().toLowerCase()
+  );
+  const selectsKimiOneMillion = ['kimi', 'k3[1m]'].includes(
+    String(parsed.main || '').trim().toLowerCase()
+  );
   if (parsed.reset && writeOptions.length > 0) {
     throw new Error('--reset cannot be combined with configuration values');
   }
@@ -789,17 +850,25 @@ export function runConfigCommand(args, options = {}) {
   } else {
     const current = parsed.agents ? effectiveConfigurationSummary() : null;
     if (parsed.main) {
-      updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID =
-        parsed.main.trim().toLowerCase() === 'fable'
+      const mainChoice = parsed.main.trim().toLowerCase();
+      updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = selectsKimiMain
+        ? selectsKimiOneMillion
+          ? KIMI_MAIN_MODEL_ID
+          : 'k3'
+        : mainChoice === 'fable'
           ? DEFAULT_MAIN_MODEL_ID
           : normalizeModel(parsed.main, '--main');
-      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = 'anthropic';
-      for (const key of [
-        'CLAUDE_WORKFLOW_MAIN_PROVIDER',
-        'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL',
-        'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT',
-      ]) {
-        removals.add(key);
+      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectsKimiMain ? 'kimi' : 'anthropic';
+      removals.add('CLAUDE_WORKFLOW_MAIN_PROVIDER');
+      // Provider profile defaults supply Kimi's k3/max settings. Removing
+      // stale main-route overrides keeps the documented Kimi profile knobs
+      // effective after switching providers.
+      removals.add('ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL');
+      removals.add('ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT');
+      if (selectsKimiMain && !selectsKimiOneMillion) {
+        updates.ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS = '262144';
+      } else {
+        removals.add('ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS');
       }
     }
     if (parsed.agents) {
@@ -838,6 +907,16 @@ export function runConfigCommand(args, options = {}) {
       const value = parsed[name];
       writeLine(stdout, `${name[0].toUpperCase()}${name.slice(1)}: ${value}`);
     }
+    if (
+      selectsKimiMain &&
+      !process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY &&
+      !process.env.KIMI_API_KEY
+    ) {
+      writeLine(
+        stdout,
+        `Next: add ULTRATHINK_GATEWAY_KIMI_API_KEY to ${configurationPath()} and keep that file owner-only.`
+      );
+    }
     writeLine(stdout, 'These settings apply to new commands. Exported environment variables take precedence.');
     writeLine(stdout, 'Custom route-map entries can override the common agent settings.');
     writeLine(stdout, 'Shared mode picks up changes in a new shell or after `claude-workflow-gateway restart`.');
@@ -848,8 +927,9 @@ function diagnosticReport(options = {}) {
   const env = options.env || process.env;
   return withProcessEnvironment(env, function buildDiagnosticReport() {
     let routeCheck;
+    let summary = null;
     try {
-      const summary = effectiveConfigurationSummary(process.env);
+      summary = effectiveConfigurationSummary(process.env);
       routeCheck = {
         ok: true,
         label: `Routing ${summary.main.name} main; ${summary.agents.name}/${summary.agents.effort} agents`,
@@ -873,10 +953,13 @@ function diagnosticReport(options = {}) {
     const checks = [
       platformCheck(env, codexCommand),
       nodeCheck(),
-      claudeCheck(run, env),
+      claudeCheck(run, env, summary?.main?.provider !== 'kimi'),
       codexCheck(codexCommand, run, env),
       routeCheck,
     ];
+    if (summary?.main?.provider === 'kimi') {
+      checks.splice(3, 0, claudeThirdPartyModelCheck(env, options.prepareClaude === true));
+    }
     return { checks, ok: checks.every((check) => check.ok) };
   });
 }
@@ -894,14 +977,16 @@ function setupUsage() {
   return [
     'Usage:',
     '  claude-workflow setup',
+    '  claude-workflow setup --prepare-claude',
     '  claude-workflow setup --shared',
     '',
     'Checks Node.js, Claude Code, Codex, authentication, platform paths, and routing.',
-    'Without --shared, setup is read-only and creates no configuration file.',
+    'Setup is read-only unless --prepare-claude or --shared is supplied.',
     '',
     'Options:',
+    '  --prepare-claude  Back up and safely enable Claude Code third-party-model support for Kimi',
     '  --shared  Start the shared gateway and install its zsh/Bash hook',
-    '  --json    Print diagnostics as JSON (cannot be combined with --shared)',
+    '  --json    Print diagnostics as JSON (cannot be combined with --shared or --prepare-claude)',
     '  --help, -h Show this help',
   ].join('\n');
 }
@@ -1015,11 +1100,29 @@ function sharedShellHookPath(env) {
   );
 }
 
-function validateSharedSetup(env = process.env) {
+function validateSharedSetup(env = process.env, cwd = process.cwd()) {
   if (!findExecutable('bash', env)) {
     throw new Error('shared setup requires bash on PATH');
   }
   fs.accessSync(GATEWAY_MANAGER, fs.constants.R_OK);
+  if (new Set(['1', 'true', 'yes', 'on']).has(
+    String(env.CLAUDE_WORKFLOW_LOAD_PROJECT_ENV || '').trim().toLowerCase()
+  )) {
+    throw new Error(
+      'shared mode cannot load a repository .env; use the per-session `claude-workflow` launcher when CLAUDE_WORKFLOW_LOAD_PROJECT_ENV is enabled'
+    );
+  }
+
+  const routingConflicts = inspectClaudeRoutingSettingsConflicts(env, cwd);
+  if (routingConflicts.length > 0) {
+    const details = routingConflicts
+      .map((conflict) => `${conflict.path} (${conflict.names.join(', ')})`)
+      .join('; ');
+    throw new Error(
+      `shared mode cannot safely override Claude routing settings in ${details}. ` +
+        'Use the `claude-workflow` launcher, or update those settings explicitly before enabling plain `claude` routing'
+    );
+  }
 
   managerPathSetting(env, 'CLAUDE_WORKFLOW_GATEWAY_STATE_DIR');
   managerPathSetting(env, 'CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
@@ -1076,6 +1179,7 @@ export function runSetupCommand(args, options = {}) {
     args,
     new Map([
       ['shared', false],
+      ['prepare-claude', false],
       ['json', false],
       ['help', false],
     ])
@@ -1084,11 +1188,14 @@ export function runSetupCommand(args, options = {}) {
     writeLine(stdout, setupUsage());
     return;
   }
-  if (parsed.shared && parsed.json) {
-    throw new Error('--json cannot be combined with --shared');
+  if (parsed.json && (parsed.shared || parsed['prepare-claude'])) {
+    throw new Error('--json cannot be combined with --shared or --prepare-claude');
   }
 
-  const report = diagnosticReport(options);
+  const report = diagnosticReport({
+    ...options,
+    prepareClaude: parsed['prepare-claude'] === true,
+  });
   if (parsed.json) {
     writeLine(stdout, JSON.stringify(report, null, 2));
   } else {
@@ -1101,8 +1208,32 @@ export function runSetupCommand(args, options = {}) {
   }
 
   if (parsed.shared) {
+    validateSharedSetup(options.env || process.env, options.cwd || process.cwd());
+  }
+
+  if (parsed['prepare-claude']) {
+    const env = options.env || process.env;
+    const summary = withProcessEnvironment(env, () => effectiveConfigurationSummary(process.env));
+    if (summary.main.provider !== 'kimi') {
+      throw new Error('--prepare-claude is only needed when the selected main provider is Kimi');
+    }
+    const prepared = prepareClaudeThirdPartyModelSupport(env);
+    if (prepared.stateChanged) {
+      writeLine(stdout, `Claude Code third-party model support enabled in ${prepared.path}.`);
+      if (prepared.backupPath) {
+        writeLine(stdout, `Previous Claude state backed up to ${prepared.backupPath}.`);
+      }
+    }
+    if (!prepared.changed) {
+      writeLine(
+        stdout,
+        `Claude Code third-party model support is already prepared.`
+      );
+    }
+  }
+
+  if (parsed.shared) {
     const gatewayAction = options.runGatewayAction || runGatewayAction;
-    validateSharedSetup(options.env || process.env);
     gatewayAction('start', options);
     try {
       gatewayAction('install-shell', options);

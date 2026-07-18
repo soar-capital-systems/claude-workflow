@@ -1,148 +1,122 @@
-# Large files and diffs through the Claude-to-Codex gateway
+# Reviewing large files and diffs
 
-This note records the July 10, 2026 investigation and the operating contract
-for repository work where a file or diff can exceed 12,000 lines.
+Large artifacts need a review procedure, not a larger prompt. A 12,000-line
+file can fit within a model's context window and still exceed a client, tool,
+transport, or provider limit. Claude Workflow keeps those failures visible and
+supports bounded inspection without treating truncated output as complete.
 
-## Upstream baseline inspected
+## Limits that matter
 
-- Repository: [`openai/codex`](https://github.com/openai/codex)
-- Exact `main` snapshot used for the code-path audit:
-  [`6ad0e943cc727dc836d7c671f3377db30107f4d9`](https://github.com/openai/codex/commit/6ad0e943cc727dc836d7c671f3377db30107f4d9)
-- `main` re-fetched before final validation:
-  [`54c44b9ed4c7d6d1ec9bf7897bb76f6411d8e033`](https://github.com/openai/codex/commit/54c44b9ed4c7d6d1ec9bf7897bb76f6411d8e033).
-  Changes after the audited snapshot affect bounded exec-server response and
-  tracing paths; they do not change the app-server dynamic-tool/history paths
-  cited below.
-- Latest stable release at investigation time:
-  [`rust-v0.144.1`](https://github.com/openai/codex/releases/tag/rust-v0.144.1)
-- Locally installed CLI at final validation: `codex-cli 0.144.1`
+Several independent limits apply to one review:
 
-The public workflow default was subsequently moved from the audited GPT-5.5
-route to `gpt-5.6-terra` with `max` reasoning. The gateway learns the selected
-model's real context window at runtime, so the large-output protocol below is
-not tied to the older model's window size.
+- Claude Code can reject an oversized Read result before the gateway receives
+  it. Line count, token count, and a dense single line can each trigger this.
+- Codex and the gateway may shorten tool output before it enters model history.
+  An omission marker identifies an unseen gap; it is not a continuation cursor.
+- A context window counts the complete conversation, including system
+  instructions, tool schemas, prior turns, tool results, reasoning, and output
+  headroom. The source or diff gets only part of that budget.
+- Kimi K3 supports up to 1,048,576 context tokens on Allegretto and higher
+  plans. Kimi Code separately rejects total message content above 2,097,152
+  bytes, so the byte limit can bind first. See Kimi's
+  [model reference](https://www.kimi.com/code/docs/en/kimi-code/models.html) and
+  [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
 
-Relevant upstream behavior:
+Kimi Code does not document an Anthropic-compatible token-count endpoint. For
+Kimi routes, the gateway answers Claude Code's count request locally with a
+conservative UTF-8 byte estimate. This is a compaction signal, not an exact
+provider token count.
 
-- Dynamic tool results are accepted in full and then token-truncated when
-  copied into model history. At the audited snapshot, the GPT-5.5 policy was
-  10,000 tokens;
-  history uses additional serialization headroom. This protects context, not
-  app-server ingress memory or the completeness of a review.
-- Native unified-exec output also defaults to 10,000 model-visible tokens and
-  a bounded process buffer. Its pressure fallback retains head and tail, so a
-  middle diff hunk can still disappear.
-- Turn-diff tracking caches by file/revision, gives exact diffing a per-file
-  time budget, and falls back to a coarse content-exact diff. Upstream has a
-  48,000-line near-total-rewrite regression. The aggregate diff is nevertheless
-  fully materialized; it is not a paged review API.
-- Syntax highlighting is skipped above 512 KiB or 10,000 lines. That improves
-  rendering cost but does not reduce the underlying diff payload.
-- Newer exec-server file reads use open/read-block/close with explicit offsets
-  and blocks up to 1 MiB. There is no generic durable, content-addressed result
-  store or general diff cursor exposed by app-server.
+## Gateway guarantees
 
-Primary source pointers:
+Claude Workflow applies the following rules:
 
-- [Dynamic result history truncation](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/core/src/context_manager/history.rs#L370-L395)
-- [Turn diff tracker](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/core/src/turn_diff_tracker.rs#L123-L182)
-- [48,000-line diff regression](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/core/src/turn_diff_tracker_tests.rs#L431-L495)
-- [Paged file-read server](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/exec-server/src/file_read.rs#L46-L70)
+1. A tool result that matches a pending Codex tool call continues that call. A
+   large raw result does not silently move to an unrelated thread.
+2. Omitted content is marked as an unreviewed gap. The gateway never presents a
+   head-and-tail preview as full coverage.
+3. Read arguments retain Claude Code's 1-based source-line semantics. The
+   gateway does not rewrite a large offset or invent a cursor beyond omitted
+   content.
+4. The routed agent receives guidance to inventory large diffs, index hunks,
+   inspect bounded ranges, and report gaps.
+5. A shared daemon records its loaded revision and restarts when its installed
+   code or user configuration changes.
+6. Per-session Codex threads use the caller's repository. Shared-daemon Codex
+   threads disable native shell and patch access and use Claude-provided tools,
+   preventing the daemon's startup directory from leaking into another
+   repository.
 
-## What actually failed here
+These guarantees prevent silent loss. They do not prove that every line was
+reviewed; coverage still has to be recorded.
 
-Three independent problems had been conflated as “large context”:
+## Review a large diff
 
-1. The shared gateway process predated all of the attempted fixes. Its health
-   check proved only that a process answered HTTP; it never proved which source
-   revision was loaded.
-2. A matching Claude `tool_result` was evaluated for context pressure in its
-   raw, potentially hundreds-of-kilobytes form before the gateway prepared it.
-   The gateway then destroyed the paused dynamic-tool call and replayed the raw
-   result as lossy transcript text on a new thread. The nominal byte cap ran
-   only on the path that had just been bypassed.
-3. The Read workaround invented the wrong contract. Claude Code 2.1.206 uses
-   1-based source-line offsets, but the gateway documented a zero-based cursor,
-   silently removed large offsets, and derived a next cursor from output whose
-   middle it had omitted.
+1. Define the review scope and inventory it before reading. For all tracked
+   staged and unstaged changes relative to `HEAD`, plus untracked paths:
 
-Claude Read can also reject a result before the gateway receives it. Production
-records included a 12,299-line, 414,673-byte JSON file: a whole read exceeded
-256 KiB, 2,000 lines exceeded 25,000 tokens, and even tiny line ranges failed
-when a selected line was extremely dense. Post-result truncation cannot prevent
-that class of error.
+   ```bash
+   git status --short
+   git diff HEAD --stat
+   git diff HEAD --numstat
+   git diff HEAD --name-status
+   git ls-files --others --exclude-standard
+   ```
 
-## Current contract
+   A path list does not cover an untracked file's contents. Add each untracked
+   file to the manifest and inspect it directly. In a repository without a
+   `HEAD` commit, inventory `git diff --cached` and `git diff` separately.
+   For a committed branch or pull request, record immutable base and head SHAs,
+   then use one documented comparison consistently, such as
+   `<merge-base>..HEAD`.
 
-The gateway now follows these rules:
+2. Create a stable `git diff HEAD` snapshot when the worktree may change during
+   review. Record its digest, then index its `diff --git` and `@@` lines with
+   `rg -n`. Snapshot and hash each untracked file separately. Keep the full
+   artifacts outside the conversation.
+3. Maintain a coverage manifest with the snapshot digest, every hunk in scope,
+   the ranges inspected, checks run, and any explicit exclusions or gaps.
+4. Read bounded context around each hunk. If output is truncated, narrow the
+   range and repeat; never advance across an omission marker.
+5. Make localized changes with the edit or patch tool available in the current
+   mode. For a mechanical near-total rewrite, use an idempotent transform or
+   formatter, then inspect the resulting diff again.
+6. Re-run the inventory after editing. Review new or changed hunks, run scoped
+   tests, and record the results in the manifest.
 
-1. A matching tool result always continues the live pending app-server call.
-   It is never recycled based on the raw Claude replay payload.
-2. Workflow sessions let current Codex own token-aware model-history
-   truncation. Optional gateway byte caps remain available for compatibility,
-   are hard bounds including metadata, and explicitly mark an unseen gap.
-3. Read arguments pass through unchanged. Its schema and failure feedback use
-   1-based source lines, warn about Claude's pre-result limits, and prescribe
-   structured/byte-range queries for dense single-line data.
-4. Bash and Grep descriptions tell the routed model to inventory large diffs,
-   snapshot/index hunks, retrieve bounded ranges, and treat truncation as
-   incomplete evidence.
-5. The shared daemon records a source digest, restarts when stale, enables a
-   default trace, and exposes its loaded revision and budgets on `/healthz`.
-6. Per-session launchers retain Codex's native environment because their cwd
-   is the caller's repository. Shared-daemon threads send `environments: []`,
-   disabling Codex-native shell/patch access and relying on Claude-provided
-   dynamic tools instead. This prevents a daemon started from one folder from
-   reading or editing another session through the wrong native cwd.
+A head-and-tail preview, summary, digest, or passing test can support a review.
+None of them proves that an uninspected middle section is correct.
 
-## Review protocol
+## Review a large file
 
-For a large diff:
+1. Locate symbols or facts with `rg -n` or Grep before reading.
+2. Use explicit, bounded 1-based Read ranges and verify the returned source-line
+   numbers.
+3. Track reviewed ranges and merge overlaps. Do not claim whole-file coverage
+   while any in-scope interval remains unreviewed.
+4. For minified or generated single-line content, query the structure instead
+   of paginating by line. Use `jq` for JSON, an appropriate parser for tabular
+   or structured data, or exact byte/character ranges for raw text.
+5. Validate findings against the same file revision. If the file changes,
+   invalidate the affected ranges and review them again.
 
-1. Record `git diff --stat`, `git diff --numstat`, and changed path names.
-2. Snapshot a large per-file diff outside the prompt when needed. Index its
-   `diff --git` and `@@` lines with `rg -n`; do not print it wholesale.
-3. Inspect bounded ranges around every relevant hunk and track coverage in a
-   small manifest. A head/tail preview is discovery evidence, not review
-   completion.
-4. Make localized changes with `apply_patch`. For a mechanical near-total
-   rewrite, use an idempotent scripted transform or formatter, then validate
-   scoped diffs and tests.
+## Continue in a new session
 
-For a large file:
+Start a new session before conversation history reaches a provider limit. Carry
+forward only a concise handoff containing:
 
-1. Locate symbols/facts with `rg -n` or Grep before reading.
-2. Use explicit 1-based Read ranges and verify returned source-line numbers.
-3. If a line itself is too large, query JSON with `jq`, columns with a parser,
-   or exact byte/character intervals with Bash tools. Line pagination cannot
-   split a minified one-line artifact.
-4. Never advance a cursor across a truncation marker or claim full coverage of
-   an omitted range.
+- the repository state or snapshot digest;
+- the coverage manifest;
+- decisions and open questions;
+- commands and test results; and
+- stable paths, hunk identifiers, or source ranges for the next step.
 
-## Validation oracle
+Do not paste the omitted artifact into the handoff. Retrieve each remaining
+range from the repository or saved snapshot in the new session.
 
-The regression suite must continue to prove:
+## Completion rule
 
-- a 12,000-line / roughly 500 KiB raw matching result stays on the same
-  app-server process and reaches the pending call within its configured cap;
-- byte caps include warning and omission text, for both per-result and
-  aggregate limits;
-- Read offsets are not silently rewritten and truncation never fabricates a
-  gap-skipping continuation cursor;
-- a healthy daemon with a stale recorded revision is replaced by `start` and
-  by non-blocking `ensure`;
-- `/healthz` identifies the loaded runtime and whether tracing is active.
-- shared-daemon threads disable native environments while per-session threads
-  retain them;
-- a full pool rejects new work with 503 instead of exceeding the process cap,
-  and a pending tool call survives ordinary idle cleanup until its separate
-  pending-result deadline;
-- app-server stdin closure becomes a request failure and cannot crash the
-  gateway process.
-
-The next architectural step, if multi-megabyte MCP/tool results become common,
-is a content-addressed artifact spool: store the complete raw result outside
-model context, return a digest/size/bounded preview, and expose deterministic
-range/search/hunk retrieval with version checks. Upstream history truncation
-alone does not bound ingress allocation, and arbitrary head/tail truncation
-cannot prove complete review.
+A large-file or large-diff review is complete only when every item in scope has
+recorded coverage and every omission is either resolved or reported as a gap.
+If the available tools cannot inspect a range, stop and say so rather than
+inferring what the missing content contains.

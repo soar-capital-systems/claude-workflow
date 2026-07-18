@@ -223,6 +223,8 @@ const CLEAN_PROXY_ENV = Object.freeze({
 });
 const CLEAN_WORKFLOW_ENV = Object.freeze({
   CLAUDE_CODE_AUTO_COMPACT_WINDOW: '',
+  CLAUDE_CODE_EFFORT_LEVEL: '',
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS: '',
   CLAUDE_WORKFLOW_MAIN_PROVIDER: '',
   CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID: '',
   DEEPSEEK_API_KEY: '',
@@ -231,6 +233,7 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   GLM_API_KEY: '',
   GLM_BASE_URL: '',
   GLM_DEFAULT_MODEL_ID: '',
+  KIMI_API_KEY: '',
   ZAI_API_KEY: '',
   ZAI_BASE_URL: '',
   ZAI_DEFAULT_MODEL_ID: '',
@@ -256,6 +259,12 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_MAIN_PROVIDER: '',
   ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL: '',
+  ULTRATHINK_GATEWAY_KIMI_API_KEY: '',
+  ULTRATHINK_GATEWAY_KIMI_BASE_URL: '',
+  ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS: '',
+  ULTRATHINK_GATEWAY_KIMI_MODEL: '',
+  ULTRATHINK_GATEWAY_KIMI_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_KIMI_VERSION: '',
   ULTRATHINK_GATEWAY_OPENAI_MODEL: '',
   ULTRATHINK_GATEWAY_OPENAI_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_OPENAI_VERBOSITY: '',
@@ -6466,7 +6475,7 @@ await runTest(
           ULTRATHINK_GATEWAY_SHARED_SECRET: 'gateway-secret',
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
           ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: '',
-          ANTHROPIC_API_KEY: '',
+          ANTHROPIC_API_KEY: 'test-generic-anthropic-key',
         }
       );
 
@@ -7308,12 +7317,15 @@ await runTest(
     const codexPath = path.join(tempDir, 'codex-wrapper');
     const startedPath = path.join(tempDir, 'claude-started');
     const stoppedPath = path.join(tempDir, 'claude-stopped');
+    const settingsPathMarker = path.join(tempDir, 'claude-settings-path');
 
     try {
       await makeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +
+          "const settingsIndex = process.argv.indexOf('--settings');\n" +
+          "if (settingsIndex >= 0) fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_SETTINGS_PATH, process.argv[settingsIndex + 1], 'utf8');\n" +
           'fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_STARTED_PATH, "started", "utf8");\n' +
           "process.on('SIGTERM', function onSigterm() {\n" +
           '  fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_STOPPED_PATH, "stopped", "utf8");\n' +
@@ -7332,6 +7344,7 @@ await runTest(
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
           ULTRATHINK_TEST_CLAUDE_STARTED_PATH: startedPath,
           ULTRATHINK_TEST_CLAUDE_STOPPED_PATH: stoppedPath,
+          ULTRATHINK_TEST_CLAUDE_SETTINGS_PATH: settingsPathMarker,
           ANTHROPIC_AUTH_TOKEN: '',
           ANTHROPIC_API_KEY: '',
         },
@@ -7346,6 +7359,8 @@ await runTest(
 
       try {
         await waitForFile(startedPath);
+        const privateSettingsPath = (await fs.readFile(settingsPathMarker, 'utf8')).trim();
+        await fs.access(privateSettingsPath);
         child.kill('SIGTERM');
         const result = await new Promise(function waitForExit(resolve, reject) {
           const timeout = setTimeout(function failSignalTest() {
@@ -7361,6 +7376,7 @@ await runTest(
         assert.equal(result.code, 143);
         assert.equal(result.signal, null);
         await waitForFile(stoppedPath);
+        await assert.rejects(fs.access(privateSettingsPath));
         ok('SIGTERM shuts down the gateway wrapper and the child Claude process cleanly');
       } finally {
         if (!child.killed) {

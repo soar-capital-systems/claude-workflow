@@ -2,6 +2,7 @@ import net from 'node:net';
 import path from 'node:path';
 
 import '../utils/env-loader.js';
+import { environmentWithoutManagedGatewayAuth } from '../utils/child-env.js';
 import { expandHomePath } from '../utils/safe-path.js';
 
 const DEFAULT_EXPOSED_MODELS = Object.freeze([
@@ -42,6 +43,10 @@ const GLM_PROFILE_ENV = Object.freeze({
     'ULTRATHINK_GLM_REASONING_EFFORT',
     'ZAI_REASONING_EFFORT',
   ],
+});
+const KIMI_PROFILE_ENV = Object.freeze({
+  model: ['ULTRATHINK_GATEWAY_KIMI_MODEL'],
+  reasoningEffort: ['ULTRATHINK_GATEWAY_KIMI_REASONING_EFFORT'],
 });
 
 function firstDefinedString(...values) {
@@ -97,6 +102,23 @@ function splitCsv(value, fallback) {
     .filter(Boolean);
 }
 
+function csvEnvironmentSetting(envNames, fallback) {
+  for (const name of envNames) {
+    if (!Object.hasOwn(process.env, name)) {
+      continue;
+    }
+    const value = process.env[name];
+    if (typeof value !== 'string' || value.trim() === '') {
+      return fallback.slice();
+    }
+    if (value.trim().toLowerCase() === 'none') {
+      return [];
+    }
+    return splitCsv(value, []);
+  }
+  return fallback.slice();
+}
+
 function parseRouteMap(value) {
   if (typeof value !== 'string' || value.trim() === '') {
     return {};
@@ -149,6 +171,10 @@ function glmProfileValue(key, fallback) {
   return firstEnvString(GLM_PROFILE_ENV[key], fallback);
 }
 
+function kimiProfileValue(key, fallback) {
+  return firstEnvString(KIMI_PROFILE_ENV[key], fallback);
+}
+
 function thinkingForProvider(provider) {
   const thinkingLevel = firstEnvString(['ULTRATHINK_THINKING_LEVEL']).toUpperCase();
   if (thinkingLevel === 'OFF') {
@@ -175,6 +201,10 @@ export function isGatewayLoopbackHost(host) {
 }
 
 export function loadGatewayConfig() {
+  // A Kimi daemon publishes a short-lived local gateway credential to Claude.
+  // Ignore that owned value if a parent shell still holds it after a route
+  // switch; it is not an Anthropic upstream API key.
+  const credentialEnv = environmentWithoutManagedGatewayAuth(process.env);
   const routeMap = parseRouteMap(process.env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON);
   const exactRouteMapModels = Object.keys(routeMap).filter(function isExactRouteKey(modelId) {
     return !modelId.endsWith('*');
@@ -212,11 +242,11 @@ export function loadGatewayConfig() {
     ),
     exposedModels: splitCsv(process.env.ULTRATHINK_GATEWAY_EXPOSED_MODELS, defaultExposedModels),
     routeMap,
-    anthropicPassthroughModels: splitCsv(
-      firstDefinedString(
-        process.env.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS,
-        process.env.ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS
-      ),
+    anthropicPassthroughModels: csvEnvironmentSetting(
+      [
+        'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS',
+        'ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS',
+      ],
       DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS
     ),
     codex: {
@@ -335,10 +365,29 @@ export function loadGatewayConfig() {
       reasoningEffort: glmProfileValue('reasoningEffort', 'max'),
       thinking: thinkingForProvider('glm'),
     },
+    kimi: {
+      apiKey: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY,
+        process.env.KIMI_API_KEY,
+        ''
+      ),
+      baseUrl: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_KIMI_BASE_URL,
+        'https://api.kimi.com/coding/'
+      ),
+      model: kimiProfileValue('model', 'k3'),
+      reasoningEffort: kimiProfileValue('reasoningEffort', 'max'),
+      contextTokens: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS,
+        1_048_576,
+        { min: 1, max: 1_048_576 }
+      ),
+      version: firstEnvString(['ULTRATHINK_GATEWAY_KIMI_VERSION'], '2023-06-01'),
+    },
     anthropic: {
       apiKey: firstDefinedString(
         process.env.ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY,
-        process.env.ANTHROPIC_API_KEY,
+        credentialEnv.ANTHROPIC_API_KEY,
         ''
       ),
       baseUrl: firstDefinedString(

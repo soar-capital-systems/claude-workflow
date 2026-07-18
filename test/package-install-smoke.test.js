@@ -16,6 +16,7 @@ const WORKFLOW_ENV_PREFIXES = [
   'CODEX_',
   'DEEPSEEK_',
   'GLM_',
+  'KIMI_',
   'ULTRATHINK_',
   'ZAI_',
 ];

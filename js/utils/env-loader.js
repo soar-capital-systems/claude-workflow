@@ -14,7 +14,7 @@
  * entrypoint sees a fully resolved process.env.
  */
 import dotenv from 'dotenv';
-import { existsSync } from 'fs';
+import { lstatSync } from 'fs';
 import { homedir } from 'os';
 import { basename, join } from 'path';
 
@@ -46,13 +46,43 @@ export function shouldLoadProjectEnv(argv = process.argv, env = process.env) {
   return TRUE_VALUES.has(explicitOptIn);
 }
 
+export function assertSafeUserEnvironmentFile(filePath) {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(`user environment file must be a regular, non-symlink file: ${filePath}`);
+  }
+  if (
+    typeof process.getuid === 'function' &&
+    Number.isInteger(stats.uid) &&
+    stats.uid !== process.getuid()
+  ) {
+    throw new Error(`user environment file must be owned by the current user: ${filePath}`);
+  }
+  if ((stats.mode & 0o077) !== 0) {
+    throw new Error(
+      `user environment file must be owner-only (run chmod 600): ${filePath}. ` +
+        'On WSL, keep it in the Linux filesystem or enable DrvFS metadata.'
+    );
+  }
+  return true;
+}
+
 if (shouldLoadProjectEnv()) {
   dotenv.config();
 }
 
 for (const envFileName of ['.claude-workflow.env', '.ultrathink.env']) {
   const homeEnvPath = join(homedir(), envFileName);
-  if (existsSync(homeEnvPath)) {
+  if (assertSafeUserEnvironmentFile(homeEnvPath)) {
     dotenv.config({ path: homeEnvPath });
   }
 }

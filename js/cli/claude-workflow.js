@@ -15,6 +15,16 @@ import {
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
 import { runConfigCommand, runDoctorCommand, runSetupCommand } from './onboarding.js';
+import {
+  environmentWithoutGatewayAndAnthropicCredentials,
+  environmentWithoutGatewayCredentials,
+} from '../utils/child-env.js';
+import {
+  CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
+  buildClaudeSettingsOverrideEnvironment,
+  createPrivateClaudeSettingsOverride,
+  inspectClaudeThirdPartyModelSupport,
+} from '../utils/claude-config.js';
 
 const SIGNAL_NUMBERS = {
   SIGINT: 2,
@@ -35,6 +45,8 @@ const CLAUDE_SESSION_FLAGS = new Set([
 ]);
 const CLAUDE_MODEL_FLAGS = new Set(['--model', '-m']);
 const CLAUDE_PERMISSION_MODE_FLAGS = new Set(['--permission-mode']);
+const CLAUDE_SETTINGS_FLAGS = new Set(['--settings']);
+const CLAUDE_EFFORT_FLAGS = new Set(['--effort']);
 
 function usage() {
   return [
@@ -42,7 +54,7 @@ function usage() {
     '  claude-workflow',
     '  claude-workflow "Review the current diff."',
     '  claude-workflow run "setup the repository"',
-    '  claude-workflow setup [--shared]',
+    '  claude-workflow setup [--prepare-claude] [--shared]',
     '  claude-workflow doctor [--json]',
     '  claude-workflow config [options]',
     '  claude-workflow -- <claude options or command>',
@@ -103,7 +115,7 @@ function codexLoginReady(commandName) {
   const isWindows = process.platform === 'win32';
   const result = spawnSync(commandName, ['login', 'status'], {
     cwd: process.cwd(),
-    env: process.env,
+    env: environmentWithoutGatewayAndAnthropicCredentials(),
     encoding: 'utf8',
     timeout: CODEX_LOGIN_STATUS_TIMEOUT_MS,
     shell: isWindows,
@@ -163,6 +175,16 @@ function parseCliArgs(rawArgs) {
       if (CLAUDE_MODEL_FLAGS.has(flagName)) {
         throw new Error(
           `${flagName} is managed by claude-workflow; set ULTRATHINK_GATEWAY_MAIN_MODEL_ID instead`
+        );
+      }
+      if (CLAUDE_SETTINGS_FLAGS.has(flagName)) {
+        throw new Error(
+          `${flagName} is reserved by claude-workflow so repository settings cannot override gateway routing`
+        );
+      }
+      if (CLAUDE_EFFORT_FLAGS.has(flagName)) {
+        throw new Error(
+          `${flagName} is managed by claude-workflow so routed main-model effort stays consistent`
         );
       }
       if (CLAUDE_PERMISSION_MODE_FLAGS.has(flagName)) {
@@ -270,8 +292,8 @@ function resolvedGatewayPort(server) {
   return address.port;
 }
 
-function buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId) {
-  return buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId);
+function buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId, mainModelId) {
+  return buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId, mainModelId);
 }
 
 function buildClaudeArgs(
@@ -279,17 +301,27 @@ function buildClaudeArgs(
   claudeArgs,
   promptArgs,
   skipPermissions,
-  interactiveSession = false
+  interactiveSession = false,
+  managedOptions = []
 ) {
+  // Claude's global --settings option must precede positional subcommands and
+  // the native `--` terminator. Keep the caller's native tail byte-for-byte.
+  const effectiveClaudeArgs = [...managedOptions, ...claudeArgs];
   if (interactiveSession || promptArgs.length === 0) {
-    const nextArgs = ['--model', mainModelId, ...claudeArgs, ...promptArgs];
+    const nextArgs = ['--model', mainModelId, ...effectiveClaudeArgs, ...promptArgs];
     if (skipPermissions) {
       nextArgs.unshift('--dangerously-skip-permissions');
     }
     return nextArgs;
   }
 
-  const nextArgs = ['-p', '--model', mainModelId, ...claudeArgs, promptArgs.join(' ')];
+  const nextArgs = [
+    '-p',
+    '--model',
+    mainModelId,
+    ...effectiveClaudeArgs,
+    promptArgs.join(' '),
+  ];
   if (skipPermissions) {
     nextArgs.splice(1, 0, '--dangerously-skip-permissions');
   }
@@ -325,7 +357,7 @@ function assertPreflight(config, mainRoute) {
 
   if (config.sharedSecret && mainRoute.provider === 'anthropic' && !config.anthropic.apiKey) {
     throw new Error(
-      'ULTRATHINK_GATEWAY_SHARED_SECRET is set, so the gateway cannot forward Claude OAuth upstream for Anthropic passthrough. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY) on the gateway, or unset ULTRATHINK_GATEWAY_SHARED_SECRET for local OAuth usage.'
+      'ULTRATHINK_GATEWAY_SHARED_SECRET is set, so the gateway cannot forward Claude OAuth upstream for Anthropic passthrough. Set the dedicated ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY on the gateway, or unset ULTRATHINK_GATEWAY_SHARED_SECRET for local OAuth usage.'
     );
   }
 }
@@ -334,15 +366,29 @@ function signalExitCode(signal) {
   return 128 + (SIGNAL_NUMBERS[signal] || 0);
 }
 
-function runClaude(args, extraEnv, onChild = null) {
+function buildClaudeChildEnvironment(extraEnv) {
+  const childEnv = environmentWithoutGatewayCredentials();
+  for (const name of CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES) {
+    if (name !== 'ANTHROPIC_API_KEY' && name !== 'ANTHROPIC_AUTH_TOKEN') {
+      delete childEnv[name];
+    }
+  }
+  for (const [name, value] of Object.entries(extraEnv)) {
+    if (value === null || value === undefined) {
+      delete childEnv[name];
+    } else {
+      childEnv[name] = String(value);
+    }
+  }
+  return childEnv;
+}
+
+function runClaude(args, childEnv, onChild = null) {
   return new Promise(function run(resolve, reject) {
     const isWindows = process.platform === 'win32';
     const child = spawn('claude', args, {
       cwd: process.cwd(),
-      env: {
-        ...process.env,
-        ...extraEnv,
-      },
+      env: childEnv,
       stdio: 'inherit',
       shell: isWindows,
     });
@@ -406,6 +452,16 @@ async function main() {
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildWorkflowGatewayConfig();
   const resolvedMainRoute = resolveModelRoute(mainModelId, config);
+  if (routeProvider(resolvedMainRoute) === 'kimi') {
+    const thirdPartyState = inspectClaudeThirdPartyModelSupport();
+    if (!thirdPartyState.enabled) {
+      throw new Error(
+        `Claude Code third-party model support is not ready in ${thirdPartyState.path}.` +
+          ' ' +
+          'Run `claude-workflow setup --prepare-claude` first.'
+      );
+    }
+  }
   // Fail fast on launcher-managed subagent routes before starting Claude.
   resolveModelRoute(rawSubagentModelId, config);
   if (subagentModelId !== rawSubagentModelId) {
@@ -415,6 +471,7 @@ async function main() {
 
   let runtime = null;
   let claudeChild = null;
+  let claudeSettingsOverride = null;
   let signalCleanup = null;
   try {
     runtime = createGatewayServer(config);
@@ -433,6 +490,9 @@ async function main() {
       },
       function currentClaudeChild() {
         return claudeChild;
+      },
+      function cleanupPrivateSettings() {
+        claudeSettingsOverride?.cleanup();
       }
     );
 
@@ -451,15 +511,34 @@ async function main() {
       );
     }
 
+    const claudeEnvironment = buildClaudeEnvironment(
+      config,
+      gatewayBaseUrl,
+      subagentModelId,
+      mainModelId
+    );
+    const claudeChildEnvironment = buildClaudeChildEnvironment(claudeEnvironment);
+    claudeSettingsOverride = createPrivateClaudeSettingsOverride(
+      buildClaudeSettingsOverrideEnvironment(claudeEnvironment, claudeChildEnvironment)
+    );
+    const managedClaudeOptions = ['--settings', claudeSettingsOverride.path];
+    if (routeProvider(resolvedMainRoute) === 'kimi') {
+      managedClaudeOptions.unshift(
+        '--effort',
+        String(resolvedMainRoute.reasoningEffort || 'max')
+      );
+    }
+
     const exitCode = await runClaude(
       buildClaudeArgs(
         mainModelId,
         claudeArgs,
         promptArgs,
         skipPermissions,
-        interactiveSession
+        interactiveSession,
+        managedClaudeOptions
       ),
-      buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId),
+      claudeChildEnvironment,
       function onChild(child) {
         claudeChild = child;
       }
@@ -467,11 +546,12 @@ async function main() {
     process.exitCode = exitCode;
   } finally {
     signalCleanup?.();
+    claudeSettingsOverride?.cleanup();
     await closeGateway(runtime);
   }
 }
 
-function installSignalHandlers(runtimeProvider, childProvider) {
+function installSignalHandlers(runtimeProvider, childProvider, cleanupProvider) {
   let shuttingDown = false;
 
   function handleSignal(signal) {
@@ -486,7 +566,11 @@ function installSignalHandlers(runtimeProvider, childProvider) {
     }
 
     closeGateway(runtimeProvider()).finally(function exitAfterCleanup() {
-      process.exit(signalExitCode(signal));
+      try {
+        cleanupProvider?.();
+      } finally {
+        process.exit(signalExitCode(signal));
+      }
     });
   }
 

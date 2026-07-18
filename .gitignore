@@ -1,5 +1,7 @@
 node_modules/
 .env
+.claude-workflow.env
+.ultrathink.env
 .DS_Store
 npm-debug.log*
 gateway-trace.jsonl

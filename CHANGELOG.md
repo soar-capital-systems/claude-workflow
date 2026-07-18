@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- First-class Kimi K3 main routing through Kimi Code's Anthropic-compatible
+  API. `claude-workflow config --main kimi` selects the `k3[1m]` client alias,
+  sends `k3` upstream with thinking enabled and `max` reasoning, and configures
+  both Claude context variables for 1,048,576 tokens. `config --main k3`
+  provides the Moderato-compatible 262,144-token profile.
+- Kimi-specific setup, entitlement, session-restart, credential, and
+  large-message guidance.
+- An explicit `setup --prepare-claude` step for clean Claude Code homes. It
+  preserves existing state, writes atomically, and creates a private backup
+  before enabling the third-party-model flags required by Kimi.
+
+### Changed
+
+- Large-file guidance now distinguishes a model's context window from Kimi
+  Code's 2,097,152-byte total message-content ceiling.
+- Kimi credentials remain inside the gateway process, Kimi routes require an
+  automatic local gateway secret, and provider-specific Claude settings are
+  cleared when the main route changes.
+- Daemon revision checks distinguish configuration inputs from generated client
+  environment values, including managed auth, provider aliases, executable
+  selection, and normalized proxy exclusions.
+- Gateway bearer secrets and dedicated upstream credentials are removed from
+  Codex app-server children and prerequisite probes.
+- Per-session Claude routing now uses an owner-only temporary CLI settings
+  layer, so user and repository settings remain unchanged while main model,
+  context, max thinking, beta, and backend-selection values stay consistent.
+- Shared setup fails closed on current Claude routing conflicts and rejects
+  project `.env` loading; deterministic routing remains available through the
+  per-session launcher.
+
+### Fixed
+
+- Coalesced Codex app-server responses can no longer race turn listener
+  registration in JSON or streaming requests, including large tool results.
+- Launcher-managed Claude options precede native subcommands, temporary
+  settings are removed on signals, and generic provider credentials do not
+  leak into Claude or Codex child processes.
+
 ## 0.1.0 - 2026-07-10
 
 ### Added

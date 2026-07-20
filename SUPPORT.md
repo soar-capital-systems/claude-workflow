@@ -15,21 +15,22 @@ On WSL, install Node.js, Claude Code, Codex, and Claude Workflow in the same
 distribution. Their commands, user configuration, and gateway state must use
 the Linux filesystem rather than `/mnt/...` paths or Windows executables.
 
-The configured Codex model must appear in your workspace model catalog. If the
+The configured Codex model must appear in your workspace model catalog. This
+profile is shared by workflow agents and the direct Codex main route. If the
 default `gpt-5.6-terra` route is absent, run
 `claude-workflow config --agents <model-id>` with a full model ID available to
 your Codex workspace. The interactive Codex `/model` picker shows available
 choices.
 
-Kimi uses its own provider route and does not need to appear in the Codex or
+Direct Codex and Kimi require Claude Code's third-party-model mode. On a clean
+Claude Code installation, run `claude-workflow setup --prepare-claude`; it
+preserves the existing Claude state and makes a private backup. Kimi uses its
+own provider route and does not need to appear in the Codex or
 Claude Code `/model` picker. Select the 1M profile with `claude-workflow config
 --main kimi` or the Moderato 256K profile with `claude-workflow config --main
 k3`, then add `ULTRATHINK_GATEWAY_KIMI_API_KEY` to the owner-only
 `~/.claude-workflow.env` file, and verify a new session with Claude Code's
-`/status` command. On a clean Claude Code installation, first run
-`claude-workflow setup --prepare-claude`; it preserves the existing Claude
-state and makes a private backup before enabling third-party-model support.
-Kimi Code keys and Kimi Open Platform keys are not
+`/status` command. Kimi Code keys and Kimi Open Platform keys are not
 interchangeable. For shared mode, restart the gateway and open a new shell
 after changing the route.
 

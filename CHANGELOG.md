@@ -4,6 +4,10 @@
 
 ### Added
 
+- Direct Codex main routing through `claude-workflow config --main codex`, using
+  the configured Codex model and reasoning effort without an Anthropic parent
+  or login. Clean-home setup supplies private local gateway authentication and
+  disables Claude Code's extra terminal-title request.
 - First-class Kimi K3 main routing through Kimi Code's Anthropic-compatible
   API. `claude-workflow config --main kimi` selects the `k3[1m]` client alias,
   sends `k3` upstream with thinking enabled and `max` reasoning, and configures
@@ -13,15 +17,19 @@
   large-message guidance.
 - An explicit `setup --prepare-claude` step for clean Claude Code homes. It
   preserves existing state, writes atomically, and creates a private backup
-  before enabling the third-party-model flags required by Kimi.
+  before enabling third-party main routes such as direct Codex and Kimi.
 
 ### Changed
 
+- Codex final-answer selection is local and phase-aware. Commentary and
+  superseded assistant messages are excluded, and dynamic-tool boundaries
+  settle on the next event-loop turn without another inference or fixed delay.
 - Large-file guidance now distinguishes a model's context window from Kimi
   Code's 2,097,152-byte total message-content ceiling.
-- Kimi credentials remain inside the gateway process, Kimi routes require an
-  automatic local gateway secret, and provider-specific Claude settings are
-  cleared when the main route changes.
+- Provider credentials remain inside the gateway process, managed
+  non-Anthropic main routes receive automatic local gateway authentication,
+  and provider-specific Claude settings are cleared when the main route
+  changes.
 - Daemon revision checks distinguish configuration inputs from generated client
   environment values, including managed auth, provider aliases, executable
   selection, and normalized proxy exclusions.
@@ -36,11 +44,22 @@
 
 ### Fixed
 
+- Schema agents retain the exact `StructuredOutput` tool name, avoiding a
+  redundant enforcement inference, while rejected schema results can still be
+  retried on their live Codex turn.
 - Coalesced Codex app-server responses can no longer race turn listener
   registration in JSON or streaming requests, including large tool results.
 - Launcher-managed Claude options precede native subcommands, temporary
   settings are removed on signals, and generic provider credentials do not
   leak into Claude or Codex child processes.
+- Shared shell routing restores its complete owned environment before a
+  profile refresh, preserves later user edits and export attributes, and cannot
+  leave a stale gateway route when the manager or environment file fails. Bash
+  and zsh option state is preserved, credential-bearing updates are hidden from
+  shell xtrace, and hooks remain non-fatal under `set -e`.
+- Current Codex app-server versions are detected from the source-defined
+  `<originator>/<codex-version>` initialize user agent, while the older
+  `codex_cli_rs` form remains supported.
 
 ## 0.1.0 - 2026-07-10
 

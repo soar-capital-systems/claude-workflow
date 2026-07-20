@@ -1,8 +1,9 @@
 # Claude Workflow
 
 Claude Workflow routes Claude Code through a local Anthropic-compatible
-gateway. The main session uses Anthropic Fable by default or Kimi K3 when
-selected; delegated agents use the configured Codex model.
+gateway. The main session uses Anthropic Fable by default. You can also run the
+main session directly on Codex or Kimi K3. Delegated agents use the configured
+Codex model.
 
 The default Fable/Terra route uses your existing Claude Code and Codex CLI
 authentication, so it needs no additional provider API key.
@@ -28,29 +29,40 @@ npm install --global @anthropic-ai/claude-code
 npm install --global @openai/codex
 ```
 
-Install Claude Workflow from its repository, check the local tools, then start it inside a trusted repository:
+Install Claude Workflow from its repository:
 
 ```bash
 git clone https://github.com/yshaaban/claude-workflow.git
 cd claude-workflow
 npm install --global --install-links .
-claude-workflow setup
-
-cd /path/to/project
-claude-workflow
 ```
 
-`--install-links` copies the package into npm's global prefix, so the command does not depend on the source checkout after installation.
-
-`setup` verifies the supported platform, installed CLI versions, required authentication, Linux-native WSL paths, and the effective routing configuration. It does not make a model request or verify live model availability. Without `--shared` or `--prepare-claude`, it creates no files and changes no shell settings. Anthropic authentication is required for an Anthropic main route; a Kimi main route uses its Kimi Code credential instead.
-
-If a login check fails:
+Choose a main route, then run setup. The default uses Fable as the coordinator:
 
 ```bash
 claude auth login
 codex login
 claude-workflow setup
 ```
+
+For direct Codex with no Anthropic login:
+
+```bash
+codex login
+claude-workflow config --main codex
+claude-workflow setup --prepare-claude
+```
+
+Start Claude Workflow inside a trusted repository:
+
+```bash
+cd /path/to/project
+claude-workflow
+```
+
+`--install-links` copies the package into npm's global prefix, so the command does not depend on the source checkout after installation.
+
+`setup` verifies the supported platform, installed CLI versions, required authentication, Linux-native WSL paths, and the effective routing configuration. It does not make a model request or verify live model availability. Without `--shared` or `--prepare-claude`, it creates no files and changes no shell settings. Fable requires Claude authentication. Direct Codex uses `codex login` and does not require an Anthropic login. Kimi uses its Kimi Code credential.
 
 Use a user-owned Node.js installation or npm prefix. Do not work around global-install permission errors with `sudo`; correct the Node.js installation or npm prefix instead.
 
@@ -112,6 +124,55 @@ claude-workflow config --agents sol --effort max
 ```
 
 The aliases `sol`, `terra`, and `luna` keep the configured tiered GPT family when possible; otherwise they use the package default family. A full model ID is also accepted. The model must be available to the authenticated Codex account or workspace.
+
+Terra is the balanced default. Sol is the frontier tier when maximum capability
+matters more than latency or cost.
+
+### Coordinated and direct execution
+
+The default Fable/Terra profile is a coordinator workflow. When Fable starts an
+Agent or Workflow, Claude Code returns the Codex result to Fable as a tool
+result. Claude Code then resumes Fable so it can combine results, handle
+failures, or continue the task. Each resume is another parent model call. A
+background Workflow can resume once for launch and again for completion; the
+exact sequence depends on the Claude Code version and orchestration path.
+
+The gateway converts the Codex app-server response to Anthropic Messages JSON
+locally and deterministically. That conversion performs no model inference.
+For schema-based agents, the gateway preserves Claude Code's `StructuredOutput`
+tool name so Codex can return the requested object without an enforcement
+retry.
+
+Use Codex as the main model when you want a plain Codex answer without a Fable
+parent turn:
+
+```bash
+claude-workflow config --main codex --agents terra --effort max
+claude-workflow setup --prepare-claude
+claude-workflow
+```
+
+The direct profile uses the configured Codex model and reasoning effort. With
+the defaults, that is Terra at `max`. It also disables Claude Code's automatic
+terminal-title request. A plain prompt that needs no tool continuation therefore
+makes one provider request and returns the Codex response directly. If Codex
+calls a Claude Code tool, Codex must resume after the tool result to finish the
+task.
+
+Direct mode does not use the Fable coordinator. Return to the default profile
+with the command below. If direct Codex starts an Agent or Workflow, Claude Code
+still resumes that Codex parent; direct mode removes Fable from the path, not
+Claude Code's delegation lifecycle.
+
+```bash
+claude-workflow config --main fable
+```
+
+An explicit Anthropic passthrough or route remains active when you select
+Codex. Mixed Codex/Anthropic routing requires
+`ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`. For a Codex-only profile, remove that
+Anthropic route-map entry and set any explicit passthrough list to
+`ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=none`.
 
 ### Kimi K3 as the main model
 
@@ -236,7 +297,8 @@ Remove it with:
 claude-workflow-gateway uninstall-shell
 ```
 
-After removal, close affected terminals and start a clean shell. Sourcing the rc file cannot unset gateway variables that are already present in the current process.
+Uninstalling the hook cannot mutate the shell process that ran the command.
+Close affected parent terminals and start a clean shell after removal.
 
 The daemon binds to `127.0.0.1:4318`. Its state directory is owner-only (`0700`), and its state files, logs, and traces are owner-readable and writable (`0600`). The default location is `${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow`.
 
@@ -248,6 +310,14 @@ mode also rejects `CLAUDE_WORKFLOW_LOAD_PROJECT_ENV`; repository-specific
 environment loading belongs to the per-session launcher.
 
 Shared Codex threads disable native shell and patch execution. They use only the tools supplied by Claude Code, so the daemon's startup directory cannot become the working directory for unrelated repositories.
+
+The hook applies Claude routing as an owned environment overlay. Before a
+refresh it restores the values that were present when the overlay was applied,
+while preserving values and export attributes changed later by the user. If the
+manager or generated environment is unavailable, the shell keeps the restored
+environment instead of retaining a dead gateway URL. The hook preserves Bash
+and zsh option state, suppresses credential-bearing commands while xtrace is
+enabled, and remains non-fatal under `set -e`.
 
 Before uninstalling the package, remove the hook and stop the daemon:
 
@@ -277,6 +347,7 @@ Inspect or change the common settings without editing environment variables:
 ```bash
 claude-workflow config
 claude-workflow config --main fable --agents terra --effort max
+claude-workflow config --main codex
 claude-workflow config --main kimi
 claude-workflow config --permissions prompt
 claude-workflow config --reset
@@ -284,7 +355,12 @@ claude-workflow config --reset
 
 The command writes only requested settings to `~/.claude-workflow.env`, preserves unrelated entries, and keeps the file owner-only. `--reset` removes the settings managed by the command so package defaults apply again.
 
-Exported environment variables override the saved file. Custom route-map entries can override the common agent settings. `--reset` removes every key managed by the command, including matching keys added manually, while preserving comments and unrelated entries. Legacy `~/.ultrathink.env` values can still override package defaults after a reset.
+Exported environment variables override the saved file. `--agents` and
+`--effort` update the shared Codex profile used by workflow agents and by the
+direct Codex main route. Custom route-map entries can override that profile.
+`--reset` removes every key managed by the command, including matching keys
+added manually, while preserving comments and unrelated entries. Legacy
+`~/.ultrathink.env` values can still override package defaults after a reset.
 
 The launcher owns the main model, model aliases, context, effort, thinking and
 beta controls, provider-selection flags, and gateway discovery setting. It
@@ -306,8 +382,10 @@ Common settings:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ULTRATHINK_GATEWAY_MAIN_MODEL_ID` | `claude-fable-5[1m]` | Claude-facing main model |
-| `ULTRATHINK_GATEWAY_MAIN_PROVIDER` | `anthropic` | Main-route provider; `kimi` selects Kimi Code |
+| `ULTRATHINK_GATEWAY_MAIN_PROVIDER` | `anthropic` | Main-route provider; `codex` selects direct Codex and `kimi` selects Kimi Code |
 | `ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL` | Provider default | Upstream model used for the main route |
+| `ULTRATHINK_GATEWAY_CODEX_MODEL` | `gpt-5.6-terra` | Shared Codex model for agents and the direct main route |
+| `ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT` | `max` | Shared Codex reasoning effort |
 | `ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL` | `gpt-5.6-terra` | Codex model used for workflow agents |
 | `ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT` | `max` | Codex reasoning effort |
 | `CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID` | `codex-terra` | Model label shown to Claude Code |
@@ -316,7 +394,7 @@ See [.env.example](.env.example) for route maps, context limits, traces, proxies
 
 ## Security
 
-- The gateway binds to loopback by default. Managed workflow configuration gives any Kimi route an automatic per-process gateway secret, so `/v1` rejects local callers that do not have it. Raw gateway configuration must set one explicitly.
+- The gateway binds to loopback by default. Managed workflow configuration gives a non-Anthropic main route an automatic per-process gateway secret, so `/v1` rejects local callers that do not have it. Equivalent raw gateway routes must set one explicitly.
 - Non-loopback binds require `ULTRATHINK_GATEWAY_SHARED_SECRET`. Any shared-secret configuration with an Anthropic route also requires the dedicated `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`; a generic `ANTHROPIC_API_KEY` is not accepted for that role.
 - Gateway state, logs, and traces use owner-only permissions.
 
@@ -338,9 +416,10 @@ curl -s http://127.0.0.1:4318/healthz
 | Codex is not logged in | Run `codex login`, then `codex login status`. |
 | The configured Codex model is unavailable | Choose a model offered by the interactive Codex `/model` picker. |
 | Kimi reports a missing key | Add `ULTRATHINK_GATEWAY_KIMI_API_KEY` to `~/.claude-workflow.env`, keep the file mode `0600`, and start a new session. |
-| Kimi opens Claude onboarding or reports third-party support is disabled | Run `claude-workflow setup --prepare-claude`, then start a new session. |
+| Direct Codex or Kimi opens Claude onboarding or reports third-party support is disabled | Run `claude-workflow setup --prepare-claude`, then start a new session. |
 | Kimi returns 401 or full 1M context is unavailable | Confirm that the key is from Kimi Code, the account can use K3, and the plan is Allegretto or higher for 1M context. Then start a new session; restart shared mode first. |
 | The shared daemon requires a newer Codex version | Update Codex and run `claude-workflow-gateway restart`. |
+| The Codex TUI shows “Dismiss and keep waiting” during a security review | Claude Workflow uses `codex app-server` and does not render that TUI notice. No supported setting disables the provider-side safety buffer. |
 | Shared setup reports conflicting Claude settings | Use `claude-workflow` for deterministic routing, or explicitly update the named user/project/local settings before enabling plain `claude` routing. Organization-managed settings cannot be overridden. |
 | A routed model reaches Anthropic and returns 404 | Launch through `claude-workflow`, or install the shared-gateway hook and open a new shell or source the updated shell rc file. |
 | A per-session gateway port is already in use | Unset `ULTRATHINK_GATEWAY_PORT` or set it to `0`. |

@@ -325,7 +325,7 @@ function claudeThirdPartyModelCheck(env = process.env, prepareRequested = false)
       label: 'Claude Code third-party model support',
       detail:
         `Not ready in ${state.path}. Run ` +
-        '`claude-workflow setup --prepare-claude` before starting Kimi.',
+        '`claude-workflow setup --prepare-claude` before starting a third-party main route.',
     };
   } catch (error) {
     return {
@@ -387,6 +387,9 @@ function friendlyMainName(modelId) {
   }
   if (/^k3(?:\[|$)/u.test(modelId)) {
     return 'Kimi K3';
+  }
+  if (modelId === 'codex') {
+    return 'Codex direct';
   }
   return modelId;
 }
@@ -771,13 +774,14 @@ function configUsage() {
     '  claude-workflow config',
     '  claude-workflow config --agents terra --effort max',
     '  claude-workflow config --main fable --permissions bypass',
+    '  claude-workflow config --main codex',
     '  claude-workflow config --main kimi',
     '  claude-workflow config --reset',
     '',
     'Options:',
-    '  --main <fable|kimi|k3|model-id>  Main model (kimi: 1M; k3: 256K)',
-    '  --agents <sol|terra|luna|id>  Codex model for workflow agents',
-    '  --effort <level>              minimal, low, medium, high, xhigh, max, or ultra',
+    '  --main <fable|codex|kimi|k3|id>  Main route (codex: direct; kimi: 1M; k3: 256K)',
+    '  --agents <sol|terra|luna|id>  Shared Codex model for agents and direct main',
+    '  --effort <level>              Shared Codex effort: minimal through ultra',
     '  --permissions <mode>          bypass or prompt',
     '  --reset                       Remove settings managed by this command',
     '  --json                        Print the effective configuration as JSON',
@@ -819,6 +823,7 @@ export function runConfigCommand(args, options = {}) {
   const selectsKimiMain = ['kimi', 'k3', 'k3[1m]'].includes(
     String(parsed.main || '').trim().toLowerCase()
   );
+  const selectsCodexMain = String(parsed.main || '').trim().toLowerCase() === 'codex';
   const selectsKimiOneMillion = ['kimi', 'k3[1m]'].includes(
     String(parsed.main || '').trim().toLowerCase()
   );
@@ -849,20 +854,29 @@ export function runConfigCommand(args, options = {}) {
     }
   } else {
     const current = parsed.agents ? effectiveConfigurationSummary() : null;
+    const selectedAgentModel = parsed.agents
+      ? agentModel(parsed.agents, current.agents.model)
+      : null;
     if (parsed.main) {
       const mainChoice = parsed.main.trim().toLowerCase();
       updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = selectsKimiMain
         ? selectsKimiOneMillion
           ? KIMI_MAIN_MODEL_ID
           : 'k3'
-        : mainChoice === 'fable'
-          ? DEFAULT_MAIN_MODEL_ID
-          : normalizeModel(parsed.main, '--main');
-      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectsKimiMain ? 'kimi' : 'anthropic';
+        : selectsCodexMain
+          ? 'codex'
+          : mainChoice === 'fable'
+            ? DEFAULT_MAIN_MODEL_ID
+            : normalizeModel(parsed.main, '--main');
+      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectsKimiMain
+        ? 'kimi'
+        : selectsCodexMain
+          ? 'codex'
+          : 'anthropic';
       removals.add('CLAUDE_WORKFLOW_MAIN_PROVIDER');
-      // Provider profile defaults supply Kimi's k3/max settings. Removing
-      // stale main-route overrides keeps the documented Kimi profile knobs
-      // effective after switching providers.
+      // The provider profile supplies its model and effort. Removing stale
+      // route-specific overrides keeps later agent-profile changes effective
+      // for a direct Codex main route.
       removals.add('ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL');
       removals.add('ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT');
       if (selectsKimiMain && !selectsKimiOneMillion) {
@@ -872,9 +886,8 @@ export function runConfigCommand(args, options = {}) {
       }
     }
     if (parsed.agents) {
-      const model = agentModel(parsed.agents, current.agents.model);
-      updates.ULTRATHINK_GATEWAY_CODEX_MODEL = model;
-      updates.ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL = model;
+      updates.ULTRATHINK_GATEWAY_CODEX_MODEL = selectedAgentModel;
+      updates.ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL = selectedAgentModel;
       removals.add('CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID');
     }
     if (parsed.effort) {
@@ -917,6 +930,12 @@ export function runConfigCommand(args, options = {}) {
         `Next: add ULTRATHINK_GATEWAY_KIMI_API_KEY to ${configurationPath()} and keep that file owner-only.`
       );
     }
+    if (selectsKimiMain || selectsCodexMain) {
+      writeLine(
+        stdout,
+        'Next: run `claude-workflow setup --prepare-claude`, then start a new `claude-workflow` session.'
+      );
+    }
     writeLine(stdout, 'These settings apply to new commands. Exported environment variables take precedence.');
     writeLine(stdout, 'Custom route-map entries can override the common agent settings.');
     writeLine(stdout, 'Shared mode picks up changes in a new shell or after `claude-workflow-gateway restart`.');
@@ -953,11 +972,11 @@ function diagnosticReport(options = {}) {
     const checks = [
       platformCheck(env, codexCommand),
       nodeCheck(),
-      claudeCheck(run, env, summary?.main?.provider !== 'kimi'),
+      claudeCheck(run, env, summary?.main?.provider === 'anthropic'),
       codexCheck(codexCommand, run, env),
       routeCheck,
     ];
-    if (summary?.main?.provider === 'kimi') {
+    if (summary?.main?.provider && summary.main.provider !== 'anthropic') {
       checks.splice(3, 0, claudeThirdPartyModelCheck(env, options.prepareClaude === true));
     }
     return { checks, ok: checks.every((check) => check.ok) };
@@ -984,7 +1003,7 @@ function setupUsage() {
     'Setup is read-only unless --prepare-claude or --shared is supplied.',
     '',
     'Options:',
-    '  --prepare-claude  Back up and safely enable Claude Code third-party-model support for Kimi',
+    '  --prepare-claude  Back up and safely enable Claude Code third-party-model support',
     '  --shared  Start the shared gateway and install its zsh/Bash hook',
     '  --json    Print diagnostics as JSON (cannot be combined with --shared or --prepare-claude)',
     '  --help, -h Show this help',
@@ -1214,8 +1233,10 @@ export function runSetupCommand(args, options = {}) {
   if (parsed['prepare-claude']) {
     const env = options.env || process.env;
     const summary = withProcessEnvironment(env, () => effectiveConfigurationSummary(process.env));
-    if (summary.main.provider !== 'kimi') {
-      throw new Error('--prepare-claude is only needed when the selected main provider is Kimi');
+    if (summary.main.provider === 'anthropic') {
+      throw new Error(
+        '--prepare-claude is only needed when the selected main provider is not Anthropic'
+      );
     }
     const prepared = prepareClaudeThirdPartyModelSupport(env);
     if (prepared.stateChanged) {

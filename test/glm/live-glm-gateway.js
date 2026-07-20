@@ -74,10 +74,10 @@ function gatewayConfig(port, key) {
       enabled: false,
       command: 'codex',
       cwd: process.cwd(),
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-terra',
       sandbox: 'workspace-write',
       approvalPolicy: 'never',
-      reasoningEffort: 'low',
+      reasoningEffort: 'max',
       verbosity: 'low',
       inputMaxTokens: 0,
       toolResultMaxBytes: 0,
@@ -92,8 +92,8 @@ function gatewayConfig(port, key) {
     openai: {
       apiKey: '',
       baseUrl: 'http://127.0.0.1:1',
-      model: 'gpt-5.5',
-      reasoningEffort: 'low',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'max',
       verbosity: 'low',
     },
     deepseek: {

@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-import { GATEWAY_ONLY_CREDENTIAL_ENV_NAMES } from './child-env.js';
+import {
+  CLAUDE_TERMINAL_TITLE_ENV_NAME,
+  GATEWAY_ONLY_CREDENTIAL_ENV_NAMES,
+} from './child-env.js';
 
 const BACKUP_SUFFIX = '.claude-workflow.bak';
 
@@ -51,6 +54,18 @@ export function buildClaudeSettingsOverrideEnvironment(extraEnv, childEnv) {
     }
     const value = extraEnv[name];
     settingsEnv[name] = value === null || value === undefined ? '' : String(value);
+  }
+  // Terminal-title suppression belongs only to the direct Codex preset. Do
+  // not publish a blank value for other routes: their parent environment and
+  // persistent Claude settings remain the user's preference.
+  if (
+    Object.hasOwn(extraEnv, CLAUDE_TERMINAL_TITLE_ENV_NAME) &&
+    extraEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] !== null &&
+    extraEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] !== undefined
+  ) {
+    settingsEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] = String(
+      extraEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME]
+    );
   }
   settingsEnv.ANTHROPIC_SMALL_FAST_MODEL = String(
     extraEnv.CLAUDE_CODE_SUBAGENT_MODEL || ''

@@ -9,9 +9,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { translateAnthropicMessagesRequestWithOptions } from '../js/gateway/anthropic-format.js';
+import { serializeWorkflowEnvironment } from '../js/cli/claude-workflow-daemon.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 import { buildCodexDynamicToolRegistry, CodexSessionManager } from '../js/gateway/codex-provider.js';
-import { buildWorkflowGatewayConfig } from '../js/gateway/workflow-config.js';
+import {
+  buildWorkflowClientEnv,
+  buildWorkflowGatewayConfig,
+} from '../js/gateway/workflow-config.js';
 import { GatewayError, resolveModelRoute } from '../js/gateway/model-routing.js';
 import {
   noProxyMatchesUrl,
@@ -223,8 +227,12 @@ const CLEAN_PROXY_ENV = Object.freeze({
 });
 const CLEAN_WORKFLOW_ENV = Object.freeze({
   CLAUDE_CODE_AUTO_COMPACT_WINDOW: '',
+  CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '',
   CLAUDE_CODE_EFFORT_LEVEL: '',
   CLAUDE_CODE_MAX_CONTEXT_TOKENS: '',
+  CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE: '',
+  CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE: '',
+  CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET: '',
   CLAUDE_WORKFLOW_MAIN_PROVIDER: '',
   CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID: '',
   DEEPSEEK_API_KEY: '',
@@ -864,7 +872,7 @@ await runTest('gateway config prefers Codex-profile aliases for the OpenAI remap
   try {
     process.env.ULTRATHINK_GATEWAY_CODEX_API_KEY = 'codex-key';
     process.env.ULTRATHINK_GATEWAY_OPENAI_API_KEY = 'legacy-openai-key';
-    process.env.ULTRATHINK_GATEWAY_CODEX_MODEL = 'gpt-5.5';
+    process.env.ULTRATHINK_GATEWAY_CODEX_MODEL = 'gpt-5.6-sol';
     process.env.ULTRATHINK_GATEWAY_OPENAI_MODEL = 'should-not-win';
     process.env.ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT = 'low';
     process.env.ULTRATHINK_GATEWAY_OPENAI_REASONING_EFFORT = 'high';
@@ -873,7 +881,7 @@ await runTest('gateway config prefers Codex-profile aliases for the OpenAI remap
 
     const config = loadGatewayConfig();
     assert.equal(config.openai.apiKey, 'codex-key');
-    assert.equal(config.openai.model, 'gpt-5.5');
+    assert.equal(config.openai.model, 'gpt-5.6-sol');
     assert.equal(config.openai.reasoningEffort, 'low');
     assert.equal(config.openai.verbosity, 'low');
     ok('Codex-profile aliases override legacy OpenAI-prefixed env vars');
@@ -998,7 +1006,7 @@ await runTest('gateway defaults Codex-backed routes to writable never-approval s
     process.env.ULTRATHINK_GATEWAY_CODEX_ENABLED = 'true';
     process.env.ULTRATHINK_GATEWAY_CODEX_SANDBOX = 'workspace-write';
     process.env.ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY = 'never';
-    process.env.ULTRATHINK_GATEWAY_CODEX_MODEL = 'gpt-5.5';
+    process.env.ULTRATHINK_GATEWAY_CODEX_MODEL = 'gpt-5.6-sol';
     delete process.env.ULTRATHINK_GATEWAY_CODEX_CLOSE_KILL_TIMEOUT_MS;
 
     const config = loadGatewayConfig();
@@ -1251,6 +1259,84 @@ await runTest(
         assert.equal(config.codex.toolResultMaxBytes, 0);
         assert.equal(config.codex.toolResultWindowMaxBytes, 0);
         ok('workflow Codex sessions use upstream token-aware tool-output truncation by default');
+      }
+    );
+  }
+);
+
+await runTest(
+  'claude-workflow direct Codex main uses a private client credential',
+  async function testWorkflowDirectCodexClientCredential() {
+    await withTemporaryEnv(
+      {
+        ...CLEAN_WORKFLOW_ENV,
+        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'codex',
+        ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
+        ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: '',
+        ULTRATHINK_GATEWAY_SHARED_SECRET: '',
+      },
+      async function assertDirectCodexClientCredential() {
+        const workflow = buildWorkflowGatewayConfig();
+        const clientEnv = buildWorkflowClientEnv(
+          workflow.config,
+          'http://127.0.0.1:4318',
+          workflow.subagentModelId,
+          workflow.mainModelId
+        );
+
+        assert.equal(workflow.config.routeMap.codex.provider, 'codex');
+        assert.equal(workflow.config.anthropicPassthroughModels.length, 0);
+        assert.equal(workflow.config.sharedSecret.length > 0, true);
+        assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
+        assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
+        assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+        ok('direct Codex main satisfies Claude client authentication without an Anthropic login');
+      }
+    );
+
+    await withTemporaryEnv(
+      {
+        ...CLEAN_WORKFLOW_ENV,
+        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'route-overridden-main',
+        ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'anthropic',
+        ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
+          'route-overridden-main': { provider: 'codex' },
+        }),
+        ULTRATHINK_GATEWAY_SHARED_SECRET: '',
+      },
+      async function assertResolvedProviderOwnsClientAuthentication() {
+        const workflow = buildWorkflowGatewayConfig();
+
+        assert.equal(workflow.config.routeMap['route-overridden-main'].provider, 'codex');
+        assert.equal(workflow.config.anthropicPassthroughModels.length, 0);
+        assert.equal(workflow.config.sharedSecret.length > 0, true);
+        const clientEnv = buildWorkflowClientEnv(
+          workflow.config,
+          'http://127.0.0.1:4318',
+          workflow.subagentModelId,
+          workflow.mainModelId
+        );
+        assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+        ok('client authentication follows the resolved main route instead of the provider hint');
+      }
+    );
+
+    await withTemporaryEnv(
+      CLEAN_WORKFLOW_ENV,
+      async function assertFableClearsDirectOnlyClientSettings() {
+        const workflow = buildWorkflowGatewayConfig();
+        const clientEnv = buildWorkflowClientEnv(
+          workflow.config,
+          'http://127.0.0.1:4318',
+          workflow.subagentModelId,
+          workflow.mainModelId
+        );
+
+        assert.equal(
+          Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
+          false
+        );
+        ok('Fable leaves the user-owned Claude Code terminal-title preference unchanged');
       }
     );
   }
@@ -1595,7 +1681,7 @@ await runTest('gateway can expose routed Codex response model metadata', async f
       routeMap: {
         'claude-sonnet-4-7': {
           provider: 'codex',
-          model: 'gpt-5.5',
+          model: 'gpt-5.6-sol',
           reasoningEffort: 'medium',
           verbosity: 'high',
         },
@@ -1704,43 +1790,217 @@ await runTest('gateway request summaries cap historical tool_result ids while ke
   ok('long workflow traces keep recent tool results without dumping every historical id');
 });
 
-await runTest('Codex dynamic tool registry aliases reserved Claude tool names', async function testCodexToolAliasing() {
-  const registry = buildCodexDynamicToolRegistry([
-    {
-      name: 'mcp__claude_ai_Gmail__authenticate',
-      description: 'OAuth bootstrap tool',
-      input_schema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'Workflow',
-      description: 'Workflow launcher',
-      input_schema: {
-        type: 'object',
-        properties: {
-          script: {
-            type: 'string',
-          },
+await runTest(
+  'Codex dynamic tool registry preserves StructuredOutput and annotates collision-safe aliases',
+  async function testCodexToolAliasing() {
+    const registry = buildCodexDynamicToolRegistry([
+      {
+        name: 'mcp__claude_ai_Gmail__authenticate',
+        description: 'OAuth bootstrap tool',
+        input_schema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
         },
-        required: ['script'],
-        additionalProperties: false,
       },
-    },
-  ]);
+      {
+        name: 'Workflow',
+        description: 'Workflow launcher',
+        input_schema: {
+          type: 'object',
+          properties: {
+            script: {
+              type: 'string',
+            },
+          },
+          required: ['script'],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: 'StructuredOutput',
+        description: 'Return structured output in the requested format',
+        input_schema: {
+          type: 'object',
+          properties: {
+            answer: {
+              type: 'string',
+            },
+          },
+          required: ['answer'],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: 'StructuredOutput',
+        description: 'Duplicate names must still remain collision-safe',
+        input_schema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ]);
 
-  assert.equal(registry.dynamicTools.length, 2);
-  assert.equal(registry.dynamicTools[0].name, 'ext_tool_001');
-  assert.equal(registry.dynamicTools[1].name, 'ext_tool_002');
-  assert.equal(
-    registry.byInternalName.get('ext_tool_001')?.originalName,
-    'mcp__claude_ai_Gmail__authenticate'
-  );
-  assert.equal(registry.byInternalName.get('ext_tool_002')?.originalName, 'Workflow');
-  ok('reserved Claude tool names are remapped before reaching Codex app-server');
-});
+    assert.equal(registry.dynamicTools.length, 4);
+    assert.equal(registry.dynamicTools[0].name, 'ext_tool_001');
+    assert.equal(registry.dynamicTools[1].name, 'ext_tool_002');
+    assert.equal(registry.dynamicTools[2].name, 'StructuredOutput');
+    assert.equal(registry.dynamicTools[3].name, 'ext_tool_004');
+    assert.match(
+      registry.dynamicTools[0].description,
+      /Claude Code tool name: mcp__claude_ai_Gmail__authenticate\./u
+    );
+    assert.match(registry.dynamicTools[1].description, /Claude Code tool name: Workflow\./u);
+    assert.equal(
+      registry.dynamicTools[2].description,
+      'Return structured output in the requested format'
+    );
+    assert.match(
+      registry.dynamicTools[3].description,
+      /Claude Code tool name: StructuredOutput\./u
+    );
+    assert.equal(
+      registry.byInternalName.get('ext_tool_001')?.originalName,
+      'mcp__claude_ai_Gmail__authenticate'
+    );
+    assert.equal(registry.byInternalName.get('ext_tool_002')?.originalName, 'Workflow');
+    assert.equal(registry.byInternalName.get('StructuredOutput')?.originalName, 'StructuredOutput');
+    assert.equal(registry.byInternalName.get('ext_tool_004')?.originalName, 'StructuredOutput');
+    ok(
+      'StructuredOutput remains directly callable while every other Claude tool stays collision-safe'
+    );
+  }
+);
+
+await runTest(
+  'Codex session manager retains StructuredOutput for schema-rejection follow-up',
+  async function testStructuredOutputSchemaRejectionFollowUp() {
+    const closedSessions = [];
+    let advanceCalls = 0;
+    const manager = stubCodexSessionManager(null, {
+      sessionOverrides: {
+        ephemeralThread: true,
+        async advance(requestBody) {
+          advanceCalls += 1;
+          if (advanceCalls === 1) {
+            this.pendingToolCall = {
+              callId: 'structured_output_1',
+              tool: 'StructuredOutput',
+            };
+            return {
+              type: 'tool_use',
+              text: '',
+              toolCall: {
+                id: 'structured_output_1',
+                name: 'StructuredOutput',
+                input: { answer: 42 },
+              },
+              usage: emptyUsage(),
+            };
+          }
+
+          assert.equal(
+            requestBody.messages.at(-1).content[0].tool_use_id,
+            this.pendingToolCall.callId
+          );
+          this.pendingToolCall = null;
+          return {
+            type: 'final',
+            text: 'corrected',
+            usage: emptyUsage(),
+          };
+        },
+        async close(reason) {
+          closedSessions.push(reason?.message || '');
+        },
+      },
+    });
+
+    const outcome = await manager.processRequest(
+      claudeSessionRequest('structured-output-session', {
+        'x-claude-code-agent-id': 'structured-output-agent',
+      }),
+      {
+        model: CODEX_REQUEST_MODEL,
+        messages: [{ role: 'user', content: 'Return the typed result.' }],
+        tools: [
+          {
+            name: 'StructuredOutput',
+            description: 'Return structured output in the requested format',
+            input_schema: {
+              type: 'object',
+              properties: { answer: { type: 'string' } },
+              required: ['answer'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+      codexRoute()
+    );
+
+    assert.equal(outcome.type, 'tool_use');
+    assert.equal(outcome.toolCall.name, 'StructuredOutput');
+    assert.equal(manager.sessions.size, 1);
+    assert.deepEqual(closedSessions, []);
+
+    const corrected = await manager.processRequest(
+      claudeSessionRequest('structured-output-session', {
+        'x-claude-code-agent-id': 'structured-output-agent',
+      }),
+      {
+        model: CODEX_REQUEST_MODEL,
+        messages: [
+          { role: 'user', content: 'Return the typed result.' },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'structured_output_1',
+                name: 'StructuredOutput',
+                input: { answer: 42 },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'structured_output_1',
+                is_error: true,
+                content: 'answer must be a string',
+              },
+            ],
+          },
+        ],
+        tools: [
+          {
+            name: 'StructuredOutput',
+            description: 'Return structured output in the requested format',
+            input_schema: {
+              type: 'object',
+              properties: { answer: { type: 'string' } },
+              required: ['answer'],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+      codexRoute()
+    );
+
+    assert.equal(corrected.type, 'final');
+    assert.equal(corrected.text, 'corrected');
+    assert.equal(advanceCalls, 2);
+    assert.equal(manager.sessions.size, 1);
+    await manager.close();
+    assert.deepEqual(closedSessions, ['']);
+    ok('schema rejection continues on the live Codex session before eventual cleanup');
+  }
+);
 
 await runTest('Codex dynamic Read tool metadata teaches safe paging', async function testCodexReadToolGuidance() {
   const readSchema = {
@@ -5859,20 +6119,29 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     const fakeBin = path.join(tempDir, 'bin');
     const hookState = path.join(tempDir, 'hook-state');
     await fs.mkdir(fakeBin);
-    await makeExecutable(
-      path.join(fakeBin, 'claude-workflow-gateway'),
+    const fakeGatewayManager =
       '#!/usr/bin/env bash\n' +
         'set -u\n' +
         'env_file="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/claude-workflow-gateway.env"\n' +
         'case "${1:-}" in\n' +
         '  ensure)\n' +
+        '    if [ "${CLAUDE_WORKFLOW_HOOK_FAIL:-}" = 1 ]; then exit 1; fi\n' +
         '    mkdir -p "$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"\n' +
         '    printf "%s\\n" "export CLAUDE_WORKFLOW_HOOK_TEST=loaded" >"$env_file"\n' +
         '    chmod 600 "$env_file"\n' +
         '    ;;\n' +
         '  status) exit 0 ;;\n' +
         '  *) exit 1 ;;\n' +
-        'esac\n'
+        'esac\n';
+    await makeExecutable(
+      path.join(fakeBin, 'claude-workflow-gateway'),
+      fakeGatewayManager
+    );
+    await makeExecutable(path.join(fakeBin, 'claude-workflow-daemon.sh'), fakeGatewayManager);
+    const sourceableHookPath = path.join(fakeBin, 'claude-workflow-gateway.bashrc');
+    await fs.copyFile(
+      path.resolve('scripts/claude-workflow-gateway.bashrc'),
+      sourceableHookPath
     );
     const sourceBashrc = await runProcess(
       'bash',
@@ -5894,8 +6163,187 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     );
     assert.equal(sourceBashrc.code, 0, sourceBashrc.stderr || sourceBashrc.stdout);
 
+    const failedHookState = path.join(tempDir, 'failed-hook-state');
+    const managedOverlayPath = path.join(tempDir, 'managed-overlay.env');
+    await fs.mkdir(failedHookState);
+    await fs.writeFile(
+      path.join(failedHookState, 'claude-workflow-gateway.env'),
+      'return 1\n',
+      'utf8'
+    );
+    await fs.writeFile(
+      managedOverlayPath,
+      serializeWorkflowEnvironment({
+        ANTHROPIC_API_KEY: 'managed-gateway-token',
+        ANTHROPIC_AUTH_TOKEN: 'managed-gateway-token',
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:4318',
+        ANTHROPIC_MODEL: 'codex',
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: null,
+        CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
+        CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN: 'managed-gateway-token',
+        NO_PROXY: 'managed-proxy',
+        no_proxy: 'managed-proxy',
+      }),
+      'utf8'
+    );
+    const restoreManagedTitleCommand = [
+      '. "$1"',
+      'test -z "${ANTHROPIC_AUTH_TOKEN+x}"',
+      'test -z "${ANTHROPIC_API_KEY+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN+x}"',
+      'test "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-}" = user-preference',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET+x}"',
+    ].join('; ');
+    const managedTitleEnvironment = {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/bash',
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: failedHookState,
+      CLAUDE_WORKFLOW_HOOK_FAIL: '1',
+      ANTHROPIC_AUTH_TOKEN: 'managed-gateway-token',
+      ANTHROPIC_API_KEY: 'managed-gateway-token',
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN: 'managed-gateway-token',
+      CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE: '1',
+      CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE: 'user-preference',
+      CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET: '1',
+    };
+    const missingManagerBin = path.join(tempDir, 'missing-manager-bin');
+    const orphanedHookPath = path.join(missingManagerBin, 'claude-workflow-gateway.bashrc');
+    await fs.mkdir(missingManagerBin);
+    await fs.copyFile(sourceableHookPath, orphanedHookPath);
+    const missingManagerEnvironment = {
+      ...managedTitleEnvironment,
+      PATH: missingManagerBin,
+    };
+    const missingManagerInstalledBashHook = await runProcess(
+      '/bin/bash',
+      ['--noprofile', '--norc', '-c', restoreManagedTitleCommand, '_', bashrcPath],
+      missingManagerEnvironment
+    );
+    assert.equal(
+      missingManagerInstalledBashHook.code,
+      0,
+      missingManagerInstalledBashHook.stderr || missingManagerInstalledBashHook.stdout
+    );
+    const missingManagerSourceableBashHook = await runProcess(
+      '/bin/bash',
+      ['--noprofile', '--norc', '-c', restoreManagedTitleCommand, '_', orphanedHookPath],
+      missingManagerEnvironment
+    );
+    assert.equal(
+      missingManagerSourceableBashHook.code,
+      0,
+      missingManagerSourceableBashHook.stderr || missingManagerSourceableBashHook.stdout
+    );
+    const failedInstalledBashHook = await runProcess(
+      'bash',
+      ['--noprofile', '--norc', '-c', restoreManagedTitleCommand, '_', bashrcPath],
+      managedTitleEnvironment
+    );
+    assert.equal(
+      failedInstalledBashHook.code,
+      0,
+      failedInstalledBashHook.stderr || failedInstalledBashHook.stdout
+    );
+    const failedSourceableBashHook = await runProcess(
+      'bash',
+      ['--noprofile', '--norc', '-c', restoreManagedTitleCommand, '_', sourceableHookPath],
+      managedTitleEnvironment
+    );
+    assert.equal(
+      failedSourceableBashHook.code,
+      0,
+      failedSourceableBashHook.stderr || failedSourceableBashHook.stdout
+    );
+
+    const restoreCompleteOverlayWithErrexit = [
+      'set -eu',
+      'export ANTHROPIC_AUTH_TOKEN=user-auth-token',
+      'export ANTHROPIC_API_KEY=user-api-key',
+      'export ANTHROPIC_BASE_URL=https://api.anthropic.com',
+      'export ANTHROPIC_MODEL=user-model',
+      'export CLAUDE_CODE_AUTO_COMPACT_WINDOW=user-window',
+      'export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=0',
+      'export NO_PROXY=user-upper',
+      'export no_proxy=user-lower',
+      '. "$2"',
+      'set -x',
+      '. "$1"',
+      'case $- in *x*) ;; *) exit 28 ;; esac',
+      'set +x',
+      'test "$ANTHROPIC_AUTH_TOKEN" = user-auth-token',
+      'test "$ANTHROPIC_API_KEY" = user-api-key',
+      'test "$ANTHROPIC_BASE_URL" = https://api.anthropic.com',
+      'test "$ANTHROPIC_MODEL" = user-model',
+      'test "$CLAUDE_CODE_AUTO_COMPACT_WINDOW" = user-window',
+      'test "$CLAUDE_CODE_DISABLE_TERMINAL_TITLE" = 0',
+      'test "$NO_PROXY" = user-upper',
+      'test "$no_proxy" = user-lower',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_SET_NAMES+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_SET_NAMES+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN+x}"',
+      'printf "SURVIVED\\n"',
+    ].join('\n');
+    for (const hookPath of [bashrcPath, sourceableHookPath, orphanedHookPath]) {
+      const hookEnvironment =
+        hookPath === orphanedHookPath ? missingManagerEnvironment : managedTitleEnvironment;
+      const guardedBashHook = await runProcess(
+        '/bin/bash',
+        [
+          '--noprofile',
+          '--norc',
+          '-c',
+          restoreCompleteOverlayWithErrexit,
+          '_',
+          hookPath,
+          managedOverlayPath,
+        ],
+        hookEnvironment
+      );
+      assert.equal(
+        guardedBashHook.code,
+        0,
+        `${hookPath}: ${guardedBashHook.stderr || guardedBashHook.stdout}`
+      );
+      assert.equal(guardedBashHook.stdout.trim(), 'SURVIVED');
+      for (const secret of ['user-api-key', 'user-auth-token', 'managed-gateway-token']) {
+        assert.equal(guardedBashHook.stderr.includes(secret), false, hookPath);
+      }
+    }
+
+    const preserveChangedTitleCommand = [
+      '. "$1"',
+      'test -z "${ANTHROPIC_AUTH_TOKEN+x}"',
+      'test "${ANTHROPIC_API_KEY-}" = user-api-key',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN+x}"',
+      'test "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-}" = user-change',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET+x}"',
+    ].join('; ');
+    const preserveChangedTitle = await runProcess(
+      'bash',
+      ['--noprofile', '--norc', '-c', preserveChangedTitleCommand, '_', sourceableHookPath],
+      {
+        ...managedTitleEnvironment,
+        ANTHROPIC_API_KEY: 'user-api-key',
+        CLAUDE_CODE_DISABLE_TERMINAL_TITLE: 'user-change',
+      }
+    );
+    assert.equal(
+      preserveChangedTitle.code,
+      0,
+      preserveChangedTitle.stderr || preserveChangedTitle.stdout
+    );
+
     const zshProbe = await runProcess('sh', ['-c', 'command -v zsh'], process.env);
     if (zshProbe.code === 0) {
+      const zshPath = zshProbe.stdout.trim();
       const sourceZshrc = await runProcess(
         'zsh',
         [
@@ -5914,6 +6362,56 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
         }
       );
       assert.equal(sourceZshrc.code, 0, sourceZshrc.stderr || sourceZshrc.stdout);
+
+      const failedSourceableZshHook = await runProcess(
+        'zsh',
+        ['-f', '-c', restoreManagedTitleCommand, '_', sourceableHookPath],
+        { ...managedTitleEnvironment, SHELL: '/bin/zsh' }
+      );
+      assert.equal(
+        failedSourceableZshHook.code,
+        0,
+        failedSourceableZshHook.stderr || failedSourceableZshHook.stdout
+      );
+
+      for (const hookPath of [zshrcPath, sourceableHookPath, orphanedHookPath]) {
+        const hookEnvironment =
+          hookPath === orphanedHookPath
+            ? { ...missingManagerEnvironment, SHELL: '/bin/zsh' }
+            : { ...managedTitleEnvironment, SHELL: '/bin/zsh' };
+        const guardedZshHook = await runProcess(
+          zshPath,
+          [
+            '-f',
+            '-c',
+            restoreCompleteOverlayWithErrexit,
+            '_',
+            hookPath,
+            managedOverlayPath,
+          ],
+          hookEnvironment
+        );
+        assert.equal(
+          guardedZshHook.code,
+          0,
+          `${hookPath}: ${guardedZshHook.stderr || guardedZshHook.stdout}`
+        );
+        assert.equal(guardedZshHook.stdout.trim(), 'SURVIVED');
+        for (const secret of ['user-api-key', 'user-auth-token', 'managed-gateway-token']) {
+          assert.equal(guardedZshHook.stderr.includes(secret), false, hookPath);
+        }
+      }
+
+      const missingManagerInstalledZshHook = await runProcess(
+        zshPath,
+        ['-f', '-c', restoreManagedTitleCommand, '_', zshrcPath],
+        { ...missingManagerEnvironment, SHELL: zshPath }
+      );
+      assert.equal(
+        missingManagerInstalledZshHook.code,
+        0,
+        missingManagerInstalledZshHook.stderr || missingManagerInstalledZshHook.stdout
+      );
     }
 
     const unsupported = await runProcess('bash', [daemonScript, 'install-shell'], {
@@ -5949,7 +6447,7 @@ await runTest('gateway route-map config can define custom exposed model routes',
     process.env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON = JSON.stringify({
       'claude-codex-review': {
         provider: 'openai',
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
         sandbox: 'workspace-write',
         approvalPolicy: 'never',
         reasoningEffort: 'medium',
@@ -6570,12 +7068,16 @@ await runTest(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +
+          "const settingsIndex = process.argv.indexOf('--settings');\n" +
+          "const settings = settingsIndex >= 0 ? JSON.parse(fs.readFileSync(process.argv[settingsIndex + 1], 'utf8')) : {};\n" +
           'const target = process.env.ULTRATHINK_TEST_CLAUDE_ENV_PATH;\n' +
           'fs.writeFileSync(target, JSON.stringify({\n' +
           "  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || '',\n" +
           "  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',\n" +
           "  ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',\n" +
           "  CLAUDE_CODE_SUBAGENT_MODEL: process.env.CLAUDE_CODE_SUBAGENT_MODEL || '',\n" +
+          "  CLAUDE_CODE_DISABLE_TERMINAL_TITLE: process.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE || '',\n" +
+          "  privateSettingsOwnTerminalTitle: Object.hasOwn(settings.env || {}, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),\n" +
           "  NO_PROXY: process.env.NO_PROXY || '',\n" +
           "  no_proxy: process.env.no_proxy || '',\n" +
           "}), 'utf8');\n" +
@@ -6594,6 +7096,7 @@ await runTest(
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
           ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'anthropic-key',
           ULTRATHINK_TEST_CLAUDE_ENV_PATH: capturedEnvPath,
+          CLAUDE_CODE_DISABLE_TERMINAL_TITLE: 'user-choice',
           ANTHROPIC_AUTH_TOKEN: '',
           ANTHROPIC_API_KEY: '',
           ...cleanProxyEnv({
@@ -6608,6 +7111,8 @@ await runTest(
       assert.equal(capturedEnv.ANTHROPIC_AUTH_TOKEN, 'gateway-secret');
       assert.equal(capturedEnv.ANTHROPIC_API_KEY, 'gateway-secret');
       assert.equal(capturedEnv.CLAUDE_CODE_SUBAGENT_MODEL, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
+      assert.equal(capturedEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, 'user-choice');
+      assert.equal(capturedEnv.privateSettingsOwnTerminalTitle, false);
       assert.equal(capturedEnv.ANTHROPIC_BASE_URL.startsWith('http://127.0.0.1:'), true);
       assert.equal(capturedEnv.NO_PROXY, 'localhost,127.0.0.1');
       assert.equal(capturedEnv.no_proxy, 'localhost,127.0.0.1');
@@ -6764,9 +7269,11 @@ await runTest(
         '#!/usr/bin/env node\n' +
           "const fs = require('node:fs');\n" +
           'async function main() {\n' +
-          '  const response = await fetch(`${process.env.ANTHROPIC_BASE_URL}/healthz`);\n' +
+          "  const authToken = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '';\n" +
+          "  const headers = authToken ? { authorization: 'Bearer ' + authToken } : {};\n" +
+          '  const response = await fetch(`${process.env.ANTHROPIC_BASE_URL}/healthz`, { headers });\n' +
           '  const health = await response.json();\n' +
-          '  const modelsResponse = await fetch(`${process.env.ANTHROPIC_BASE_URL}/v1/models`);\n' +
+          '  const modelsResponse = await fetch(`${process.env.ANTHROPIC_BASE_URL}/v1/models`, { headers });\n' +
           '  const models = await modelsResponse.json();\n' +
           '  const payload = {\n' +
           '    health,\n' +
@@ -6805,9 +7312,9 @@ await runTest(
       const frontierHealth = await runWithDisplayEnv('frontier-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-fable-5',
         ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-fable-5*',
-        ULTRATHINK_GATEWAY_CODEX_MODEL: 'gpt-5.5',
+        ULTRATHINK_GATEWAY_CODEX_MODEL: 'gpt-5.6-sol',
         ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT: 'xhigh',
-        ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.5',
+        ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.6-sol',
         ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT: 'xhigh',
       });
       const deepSeekMainHealth = await runWithDisplayEnv('deepseek-main-health.json', {
@@ -6865,7 +7372,7 @@ await runTest(
         true
       );
       assert.deepEqual(frontierHealth.health.anthropic_passthrough_models, ['claude-fable-5*']);
-      assert.equal(frontierHealth.health.codex_target_model, 'gpt-5.5');
+      assert.equal(frontierHealth.health.codex_target_model, 'gpt-5.6-sol');
       assert.equal(frontierHealth.health.codex_reasoning_effort, 'xhigh');
       assert.equal(
         frontierHealth.health.exposed_models.includes('claude-fable-5'),
@@ -6873,7 +7380,7 @@ await runTest(
       );
       assert.equal(
         frontierHealth.subagentModel,
-        'codex-gpt-5.5-xhigh-via-claude-sonnet-5'
+        'codex-sol'
       );
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
@@ -8108,7 +8615,7 @@ await runTest('gateway applies explicit route-map entries before default routing
     routeMap: {
       'claude-codex-review': {
         provider: 'openai',
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
         reasoningEffort: 'medium',
         verbosity: 'high',
         displayName: 'Codex Review Route',
@@ -8134,7 +8641,7 @@ await runTest('gateway applies explicit route-map entries before default routing
     assert.equal(response.status, 200);
     const payload = await response.json();
     assert.equal(payload.model, 'claude-codex-review');
-    assert.equal(captured[0].model, 'gpt-5.5');
+    assert.equal(captured[0].model, 'gpt-5.6-sol');
     assert.equal(captured[0].reasoning_effort, 'medium');
     assert.equal(captured[0].verbosity, 'high');
 
@@ -9399,7 +9906,7 @@ await runTest(
         routeMap: {
           'claude-sonnet-4-7': {
             provider: 'codex',
-            model: 'gpt-5.5',
+            model: 'gpt-5.6-sol',
             reasoningEffort: 'low',
             verbosity: 'low',
           },

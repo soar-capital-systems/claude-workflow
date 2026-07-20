@@ -163,7 +163,12 @@ function processExists(pid) {
   }
 }
 
-function finalAppServer(logPath, userAgent = 'codex_cli_rs/0.144.1') {
+function finalAppServer(
+  logPath,
+  userAgent =
+    'claude_workflow_gateway/0.144.6 (Mac OS 26.4.0; arm64) ' +
+    'iTerm.app/3.6.10 (claude_workflow_gateway; 0.1.0)'
+) {
   return `#!/usr/bin/env node
 const fs = require('node:fs');
 const readline = require('node:readline');
@@ -308,6 +313,579 @@ setInterval(function keepAlive() {}, 1000);
 `;
 }
 
+function phaseAwareAppServer() {
+  return `#!/usr/bin/env node
+const readline = require('node:readline');
+function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+function sendBatch(values) { process.stdout.write(values.map((value) => JSON.stringify(value) + '\\n').join('')); }
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', function onLine(line) {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'codex_cli_rs/0.144.1' } });
+    return;
+  }
+  if (message.method === 'thread/start') {
+    send({ id: message.id, result: { thread: { id: 'thread-' + process.pid } } });
+    return;
+  }
+  if (message.method !== 'turn/start') {
+    return;
+  }
+
+  const turnId = 'turn-' + process.pid;
+  const input = message.params.input[0].text;
+  const events = [{ id: message.id, result: { turn: { id: turnId } } }];
+  if (input.includes('phase-aware-case')) {
+    events.push(
+      { method: 'item/started', params: { turnId, item: {
+        id: 'commentary', type: 'agentMessage', phase: 'commentary', text: ''
+      } } },
+      { method: 'item/agentMessage/delta', params: {
+        turnId, itemId: 'commentary', delta: 'INTERNAL_COMMENTARY'
+      } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'commentary', type: 'agentMessage', phase: 'commentary', text: 'INTERNAL_COMMENTARY'
+      } } },
+      { method: 'item/started', params: { turnId, item: {
+        id: 'superseded-final', type: 'agentMessage', phase: 'final_answer', text: ''
+      } } },
+      { method: 'item/agentMessage/delta', params: {
+        turnId, itemId: 'superseded-final', delta: 'SUPERSEDED_FINAL'
+      } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'superseded-final', type: 'agentMessage', phase: 'final_answer', text: 'SUPERSEDED_FINAL'
+      } } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'legacy-after-final', type: 'agentMessage', text: 'LEGACY_MUST_NOT_REPLACE_FINAL'
+      } } },
+      { method: 'item/started', params: { turnId, item: {
+        id: 'final', type: 'agentMessage', phase: 'final_answer', text: ''
+      } } },
+      { method: 'item/agentMessage/delta', params: {
+        turnId, itemId: 'final', delta: 'DIRECT_FINAL'
+      } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'final', type: 'agentMessage', text: 'DIRECT_FINAL'
+      } } }
+    );
+  } else if (input.includes('legacy-stream-case')) {
+    events.push(
+      { method: 'item/agentMessage/delta', params: {
+        turnId, itemId: 'legacy', delta: 'LEGACY_DIRECT'
+      } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'legacy', type: 'agentMessage', text: 'LEGACY_DIRECT'
+      } } }
+    );
+  } else if (input.includes('legacy-selection-case')) {
+    events.push(
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'legacy-first', type: 'agentMessage', text: 'LEGACY_FIRST'
+      } } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'legacy-last', type: 'agentMessage', text: 'LEGACY_LAST'
+      } } }
+    );
+  } else if (input.includes('commentary-only-case')) {
+    events.push(
+      { method: 'item/started', params: { turnId, item: {
+        id: 'commentary-only', type: 'agentMessage', phase: 'commentary', text: ''
+      } } },
+      { method: 'item/agentMessage/delta', params: {
+        turnId, itemId: 'commentary-only', delta: 'COMMENTARY_ONLY'
+      } },
+      { method: 'item/completed', params: { turnId, item: {
+        id: 'commentary-only', type: 'agentMessage', phase: 'commentary', text: 'COMMENTARY_ONLY'
+      } } }
+    );
+  }
+  events.push({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
+  sendBatch(events);
+});
+setInterval(function keepAlive() {}, 1000);
+`;
+}
+
+function immediateToolAppServer(logPath) {
+  return `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const logPath = ${JSON.stringify(logPath)};
+function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
+function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+function sendBatch(values) { process.stdout.write(values.map((value) => JSON.stringify(value) + '\\n').join('')); }
+let turnId = '';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', function onLine(line) {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'codex_cli_rs/0.144.1' } });
+    return;
+  }
+  if (message.method === 'thread/start') {
+    log({
+      event: 'thread_start',
+      experimentalRawEvents: message.params.experimentalRawEvents === true
+    });
+    send({ id: message.id, result: { thread: { id: 'thread-' + process.pid } } });
+    return;
+  }
+  if (message.method === 'turn/start') {
+    turnId = 'turn-' + process.pid;
+    sendBatch([
+      { id: message.id, result: { turn: { id: turnId } } },
+      { method: 'rawResponse/completed', params: {
+        threadId: 'thread-' + process.pid,
+        turnId,
+        responseId: 'response-built-in-tool',
+        usage: { inputTokens: 11, cachedInputTokens: 1, outputTokens: 2, totalTokens: 13 }
+      } },
+      { method: 'rawResponse/completed', params: {
+        threadId: 'thread-' + process.pid,
+        turnId,
+        responseId: 'response-tool',
+        usage: { inputTokens: 19, cachedInputTokens: 4, outputTokens: 3, totalTokens: 22 }
+      } },
+      { id: 901, method: 'item/tool/call', params: {
+        turnId,
+        callId: 'call_immediate',
+        tool: 'ext_tool_001',
+        arguments: { command: 'printf immediate' }
+      } }
+    ]);
+    setTimeout(function emitSeparateParallelCall() {
+      send({ id: 902, method: 'item/tool/call', params: {
+        turnId,
+        callId: 'call_parallel',
+        tool: 'ext_tool_001',
+        arguments: { command: 'printf parallel' }
+      } });
+    }, 25);
+    return;
+  }
+  if (message.id === 902 && message.error) {
+    log({ event: 'parallel_rejected', message: message.error.message });
+    return;
+  }
+  if (message.id === 901 && message.result) {
+    log({ event: 'tool_result', text: message.result.contentItems?.[0]?.text });
+    setImmediate(function complete() {
+      sendBatch([
+        { method: 'rawResponse/completed', params: {
+          threadId: 'thread-' + process.pid,
+          turnId,
+          responseId: 'response-built-in-after-tool',
+          usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 }
+        } },
+        { method: 'rawResponse/completed', params: {
+          threadId: 'thread-' + process.pid,
+          turnId,
+          responseId: 'response-final',
+          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 }
+        } },
+        { method: 'thread/tokenUsage/updated', params: {
+          turnId,
+          tokenUsage: {
+            total: { inputTokens: 47, cachedInputTokens: 5, outputTokens: 8, totalTokens: 55 },
+            last: { inputTokens: 10, outputTokens: 2, totalTokens: 12 }
+          }
+        } },
+        { method: 'item/started', params: { turnId, item: {
+          id: 'final', type: 'agentMessage', phase: 'final_answer', text: ''
+        } } },
+        { method: 'item/agentMessage/delta', params: {
+          turnId, itemId: 'final', delta: 'AFTER_TOOL'
+        } },
+        { method: 'item/completed', params: { turnId, item: {
+          id: 'final', type: 'agentMessage', phase: 'final_answer', text: 'AFTER_TOOL'
+        } } },
+        { method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } }
+      ]);
+    });
+  }
+});
+setInterval(function keepAlive() {}, 1000);
+`;
+}
+
+function legacyToolBoundaryAppServer(logPath) {
+  return `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const logPath = ${JSON.stringify(logPath)};
+function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
+function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+let turnId = '';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', function onLine(line) {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'codex_cli_rs/0.143.0' } });
+    return;
+  }
+  if (message.method === 'thread/start') {
+    const hasRawEvents = Object.hasOwn(message.params, 'experimentalRawEvents');
+    log({ event: 'thread_start', hasRawEvents });
+    if (hasRawEvents) {
+      send({ id: message.id, error: {
+        code: -32602,
+        message: 'unknown field experimentalRawEvents'
+      } });
+      return;
+    }
+    send({ id: message.id, result: { thread: { id: 'thread-legacy-' + process.pid } } });
+    return;
+  }
+  if (message.method === 'turn/start') {
+    turnId = 'turn-legacy-' + process.pid;
+    send({ id: message.id, result: { turn: { id: turnId } } });
+    send({ id: 911, method: 'item/tool/call', params: {
+      turnId,
+      callId: 'call_legacy',
+      tool: 'ext_tool_001',
+      arguments: { command: 'printf legacy' }
+    } });
+    return;
+  }
+  if (message.id === 911 && message.result) {
+    log({ event: 'tool_result', text: message.result.contentItems?.[0]?.text });
+    send({ method: 'item/completed', params: { turnId, item: {
+      id: 'legacy-final', type: 'agentMessage', text: 'LEGACY_AFTER_TOOL'
+    } } });
+    send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
+  }
+});
+setInterval(function keepAlive() {}, 1000);
+`;
+}
+
+function structuredOutputRetryAppServer(logPath) {
+  return `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const logPath = ${JSON.stringify(logPath)};
+function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
+function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
+function completeResponse(turnId, responseId) {
+  send({ method: 'rawResponse/completed', params: {
+    threadId: 'thread-structured',
+    turnId,
+    responseId,
+    usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 }
+  } });
+}
+const turnId = 'turn-structured';
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', function onLine(line) {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: { userAgent: 'codex_cli_rs/0.145.0' } });
+    return;
+  }
+  if (message.method === 'thread/start') {
+    log({ event: 'thread_start' });
+    send({ id: message.id, result: { thread: { id: 'thread-structured' } } });
+    return;
+  }
+  if (message.method === 'turn/start') {
+    send({ id: message.id, result: { turn: { id: turnId } } });
+    completeResponse(turnId, 'response-invalid');
+    send({ id: 921, method: 'item/tool/call', params: {
+      turnId,
+      callId: 'structured_invalid',
+      tool: 'StructuredOutput',
+      arguments: { answer: 42 }
+    } });
+    return;
+  }
+  if (message.id === 921 && message.result) {
+    log({ event: 'first_result', success: message.result.success });
+    completeResponse(turnId, 'response-corrected');
+    send({ id: 922, method: 'item/tool/call', params: {
+      turnId,
+      callId: 'structured_corrected',
+      tool: 'StructuredOutput',
+      arguments: { answer: 'corrected' }
+    } });
+    return;
+  }
+  if (message.id === 922 && message.result) {
+    log({ event: 'second_result', success: message.result.success });
+  }
+});
+setInterval(function keepAlive() {}, 1000);
+`;
+}
+
+async function testPhaseAwareAgentMessages() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-agent-phases-'));
+  const command = path.join(tempDir, 'fake-codex');
+  await makeExecutable(command, phaseAwareAppServer());
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
+  try {
+    const phaseEvents = [];
+    const phaseOutcome = await manager.streamRequest(
+      request('phase-aware'),
+      body('phase-aware-case'),
+      route(),
+      function collect(event) {
+        phaseEvents.push(event);
+      }
+    );
+    assert.equal(phaseOutcome.text, 'DIRECT_FINAL');
+    assert.equal(
+      phaseEvents.filter((event) => event.type === 'text_delta').map((event) => event.text).join(''),
+      'DIRECT_FINAL'
+    );
+    assert.equal(JSON.stringify(phaseEvents).includes('INTERNAL_COMMENTARY'), false);
+    assert.equal(JSON.stringify(phaseEvents).includes('SUPERSEDED_FINAL'), false);
+    assert.equal(JSON.stringify(phaseEvents).includes('LEGACY_MUST_NOT_REPLACE_FINAL'), false);
+
+    const legacyEvents = [];
+    const legacyOutcome = await manager.streamRequest(
+      request('legacy-stream'),
+      body('legacy-stream-case'),
+      route(),
+      function collect(event) {
+        legacyEvents.push(event);
+      }
+    );
+    assert.equal(legacyOutcome.text, 'LEGACY_DIRECT');
+    assert.equal(
+      legacyEvents.filter((event) => event.type === 'text_delta').map((event) => event.text).join(''),
+      'LEGACY_DIRECT'
+    );
+
+    const selectedLegacyEvents = [];
+    const selectedLegacy = await manager.streamRequest(
+      request('legacy-selection'),
+      body('legacy-selection-case'),
+      route(),
+      function collect(event) {
+        selectedLegacyEvents.push(event);
+      }
+    );
+    assert.equal(selectedLegacy.text, 'LEGACY_LAST');
+    assert.equal(
+      selectedLegacyEvents
+        .filter((event) => event.type === 'text_delta')
+        .map((event) => event.text)
+        .join(''),
+      'LEGACY_LAST'
+    );
+    assert.equal(JSON.stringify(selectedLegacyEvents).includes('LEGACY_FIRST'), false);
+
+    const commentaryOnly = await manager.processRequest(
+      request('commentary-only'),
+      body('commentary-only-case'),
+      route()
+    );
+    assert.equal(commentaryOnly.text, '');
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function testToolBoundaryCompletesWithoutFixedDelay() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-tool-boundary-'));
+  const command = path.join(tempDir, 'fake-codex');
+  const logPath = path.join(tempDir, 'app-server.jsonl');
+  await makeExecutable(command, immediateToolAppServer(logPath));
+  const tools = [
+    {
+      name: 'Bash',
+      description: 'Run a shell command.',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } } },
+    },
+  ];
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
+  try {
+    const startedAt = Date.now();
+    const first = await manager.processRequest(
+      request('immediate-tool'),
+      body('Run the tool immediately.', tools),
+      route()
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(first.type, 'tool_use');
+    assert.equal(first.toolCall.id, 'call_immediate');
+    assert.equal(elapsedMs < 1_500, true, `tool boundary took ${elapsedMs}ms`);
+    assert.deepEqual(first.usage, {
+      input_tokens: 25,
+      output_tokens: 5,
+      cache_read_input_tokens: 5,
+      total_tokens: 35,
+    });
+    const boundaryEntries = await readJsonLines(logPath);
+    assert.equal(
+      boundaryEntries.some(
+        (entry) => entry.event === 'thread_start' && entry.experimentalRawEvents === true
+      ),
+      true
+    );
+    await waitFor(async function parallelCallRejected() {
+      const entries = await readJsonLines(logPath);
+      return entries.some((entry) => entry.event === 'parallel_rejected');
+    }, 'separate parallel tool call rejection');
+
+    const continued = await manager.processRequest(
+      request('immediate-tool'),
+      toolResultBody('call_immediate', 'IMMEDIATE_RESULT', tools),
+      route()
+    );
+    assert.equal(continued.type, 'final');
+    assert.equal(continued.text, 'AFTER_TOOL');
+    assert.deepEqual(continued.usage, {
+      input_tokens: 17,
+      output_tokens: 3,
+      total_tokens: 20,
+    });
+    const entries = await readJsonLines(logPath);
+    const rejection = entries.find((entry) => entry.event === 'parallel_rejected');
+    assert.match(rejection.message, /call_parallel/u);
+    assert.match(rejection.message, /call_immediate/u);
+    const results = entries.filter((entry) => entry.event === 'tool_result');
+    assert.deepEqual(results.map((entry) => entry.text), ['IMMEDIATE_RESULT']);
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function testLegacyToolBoundaryCompletesWithoutRawEvents() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-legacy-boundary-'));
+  const command = path.join(tempDir, 'fake-codex');
+  const logPath = path.join(tempDir, 'app-server.jsonl');
+  await makeExecutable(command, legacyToolBoundaryAppServer(logPath));
+  const tools = [
+    {
+      name: 'Bash',
+      description: 'Run a shell command.',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } } },
+    },
+  ];
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
+  try {
+    const startedAt = Date.now();
+    const first = await manager.processRequest(
+      request('legacy-tool'),
+      body('Run the legacy tool.', tools),
+      route()
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(first.type, 'tool_use');
+    assert.equal(first.toolCall.id, 'call_legacy');
+    assert.equal(elapsedMs < 1_000, true, `legacy tool boundary took ${elapsedMs}ms`);
+
+    const threadStarts = (await readJsonLines(logPath)).filter(
+      (entry) => entry.event === 'thread_start'
+    );
+    assert.deepEqual(threadStarts.map((entry) => entry.hasRawEvents), [true, false]);
+
+    const continued = await manager.processRequest(
+      request('legacy-tool'),
+      toolResultBody('call_legacy', 'LEGACY_RESULT', tools),
+      route()
+    );
+    assert.equal(continued.type, 'final');
+    assert.equal(continued.text, 'LEGACY_AFTER_TOOL');
+    const entries = await readJsonLines(logPath);
+    assert.deepEqual(
+      entries.filter((entry) => entry.event === 'tool_result').map((entry) => entry.text),
+      ['LEGACY_RESULT']
+    );
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function testStructuredOutputSchemaRetryStaysOnLiveTurn() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-structured-retry-'));
+  const command = path.join(tempDir, 'fake-codex');
+  const logPath = path.join(tempDir, 'app-server.jsonl');
+  await makeExecutable(command, structuredOutputRetryAppServer(logPath));
+  const tools = [
+    {
+      name: 'StructuredOutput',
+      description: 'Return the typed result.',
+      input_schema: {
+        type: 'object',
+        properties: { answer: { type: 'string' } },
+        required: ['answer'],
+        additionalProperties: false,
+      },
+    },
+  ];
+  const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
+  try {
+    const initialBody = body('Return the typed result.', tools);
+    const invalid = await manager.processRequest(
+      request('structured-retry'),
+      initialBody,
+      route()
+    );
+    assert.deepEqual(invalid.toolCall, {
+      id: 'structured_invalid',
+      name: 'StructuredOutput',
+      input: { answer: 42 },
+    });
+    assert.equal(manager.sessions.size, 1);
+
+    const corrected = await manager.processRequest(
+      request('structured-retry'),
+      {
+        model: MODEL,
+        messages: [
+          ...initialBody.messages,
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'structured_invalid',
+                name: 'StructuredOutput',
+                input: { answer: 42 },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'structured_invalid',
+                is_error: true,
+                content: 'answer must be a string',
+              },
+            ],
+          },
+        ],
+        tools,
+      },
+      route()
+    );
+    assert.deepEqual(corrected.toolCall, {
+      id: 'structured_corrected',
+      name: 'StructuredOutput',
+      input: { answer: 'corrected' },
+    });
+    assert.equal(manager.sessions.size, 1);
+
+    const entries = await readJsonLines(logPath);
+    assert.equal(entries.filter((entry) => entry.event === 'thread_start').length, 1);
+    assert.deepEqual(
+      entries.filter((entry) => entry.event === 'first_result').map((entry) => entry.success),
+      [false]
+    );
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function testCoalescedStreamingEvents() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-coalesced-stream-'));
   const command = path.join(tempDir, 'fake-codex');
@@ -325,8 +903,8 @@ async function testCoalescedStreamingEvents() {
     );
     assert.equal(outcome.type, 'final');
     assert.equal(outcome.text, 'COALESCED_STREAM');
-    assert.deepEqual(events.map((event) => event.type), ['text_delta', 'usage', 'boundary']);
-    assert.equal(events[0].text, 'COALESCED_STREAM');
+    assert.deepEqual(events.map((event) => event.type), ['usage', 'text_delta', 'boundary']);
+    assert.equal(events[1].text, 'COALESCED_STREAM');
     assert.equal(events.at(-1).outcome.text, 'COALESCED_STREAM');
   } finally {
     await manager.close();
@@ -443,7 +1021,14 @@ async function testDynamicToolsOnlyVersionGate() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-version-'));
   const command = path.join(tempDir, 'fake-codex-old');
   const logPath = path.join(tempDir, 'app-server.jsonl');
-  await makeExecutable(command, finalAppServer(logPath, 'codex_cli_rs/0.143.0'));
+  await makeExecutable(
+    command,
+    finalAppServer(
+      logPath,
+      'claude_workflow_gateway/0.143.0 (Linux 6.6; x86_64) ' +
+        'terminal/999.0.0 (claude_workflow_gateway; 0.1.0)'
+    )
+  );
   const manager = trackManager(
     new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: true }))
   );
@@ -482,13 +1067,20 @@ async function testPendingToolRetentionAndHardCapacity() {
   );
 
   try {
+    const startedAt = Date.now();
     const first = await manager.processRequest(
       request('pending-session'),
       body('Run the external tool.', tools),
       route()
     );
+    const elapsedMs = Date.now() - startedAt;
     assert.equal(first.type, 'tool_use');
     assert.equal(first.toolCall.id, 'call_pending');
+    assert.equal(
+      elapsedMs < 1_500,
+      true,
+      `token-usage tool boundary fell through to the legacy timer after ${elapsedMs}ms`
+    );
 
     await new Promise(function waitPastIdle(resolve) {
       setTimeout(resolve, 60);
@@ -635,6 +1227,14 @@ try {
   beginStage('EPIPE child process');
   const epipeChild = await testProviderInChildProcess();
   if (!epipeChild) {
+    beginStage('phase-aware agent messages');
+    await testPhaseAwareAgentMessages();
+    beginStage('immediate tool boundary');
+    await testToolBoundaryCompletesWithoutFixedDelay();
+    beginStage('legacy tool boundary');
+    await testLegacyToolBoundaryCompletesWithoutRawEvents();
+    beginStage('StructuredOutput schema retry');
+    await testStructuredOutputSchemaRetryStaysOnLiveTurn();
     beginStage('coalesced streaming events');
     await testCoalescedStreamingEvents();
     beginStage('dynamic-tools thread mode');

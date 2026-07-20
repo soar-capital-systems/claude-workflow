@@ -11,9 +11,7 @@ const DEFAULT_PENDING_TOOL_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
 const DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES = 64_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
-// Cold-start bound only: once the Codex app-server reports the model's real
-// context window (thread/tokenUsage/updated), budgets adapt to it. Codex
-// Keep the pre-learning default conservative; once app-server reports the
+// Keep the cold-start default conservative. Once app-server reports the
 // selected model's real context window, the session budget adapts to it.
 const DEFAULT_INPUT_MAX_TOKENS = 192_000;
 // Fraction of the reported context window usable as input budget; the rest
@@ -68,6 +66,8 @@ const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 const READ_TOOL_NAME = 'Read';
+const STRUCTURED_OUTPUT_TOOL_NAME = 'StructuredOutput';
+const CLAUDE_TOOL_NAME_GUIDANCE_HEADER = 'Claude Code tool name:';
 const READ_GUIDANCE_HEADER = 'Codex Read guidance:';
 const LARGE_OUTPUT_GUIDANCE_HEADER = 'Codex large-output guidance:';
 const LARGE_OUTPUT_TOOL_NAMES = new Set(['Bash', 'Grep']);
@@ -97,7 +97,11 @@ function noop() {}
 
 function parseCodexAppServerVersion(initializeResult) {
   const userAgent = String(initializeResult?.userAgent || initializeResult?.user_agent || '');
-  const match = userAgent.match(/codex_cli_rs\/(\d+)\.(\d+)\.(\d+)/u);
+  // Codex sets the app-server originator from initialize.clientInfo.name, then
+  // returns `<originator>/<codex-version> (...)`. Older releases used the
+  // fixed `codex_cli_rs` originator, so parse the anchored product/version
+  // token rather than a particular product name.
+  const match = userAgent.match(/^[^/\r\n]+\/(\d+)\.(\d+)\.(\d+)(?:\b|[-+])/u);
   return match ? match.slice(1, 4).map(Number) : null;
 }
 
@@ -351,12 +355,29 @@ function codexToolInputSchema(tool) {
   return schema;
 }
 
+function codexDynamicToolDescription(tool, internalName, preserveOriginalName) {
+  const description = codexToolDescription(tool);
+  if (preserveOriginalName) {
+    return description || tool?.name || internalName;
+  }
+
+  const originalName = tool?.name || internalName;
+  const nameGuidance =
+    `${CLAUDE_TOOL_NAME_GUIDANCE_HEADER} ${originalName}. ` +
+    `When Claude Code instructions refer to ${originalName}, invoke this tool.`;
+  return description ? `${nameGuidance}\n\n${description}` : nameGuidance;
+}
+
 export function buildCodexDynamicToolRegistry(tools) {
   const originalTools = Array.isArray(tools) ? tools : [];
   const byInternalName = new Map();
   const dynamicTools = originalTools.map(function mapTool(tool, index) {
-    const internalName = `ext_tool_${String(index + 1).padStart(3, '0')}`;
-    const description = codexToolDescription(tool);
+    const preserveOriginalName =
+      tool?.name === STRUCTURED_OUTPUT_TOOL_NAME && !byInternalName.has(STRUCTURED_OUTPUT_TOOL_NAME);
+    const internalName = preserveOriginalName
+      ? STRUCTURED_OUTPUT_TOOL_NAME
+      : `ext_tool_${String(index + 1).padStart(3, '0')}`;
+    const description = codexDynamicToolDescription(tool, internalName, preserveOriginalName);
     const inputSchema = codexToolInputSchema(tool);
     const record = {
       internalName,
@@ -369,7 +390,7 @@ export function buildCodexDynamicToolRegistry(tools) {
 
     return {
       name: internalName,
-      description: description || tool.name || internalName,
+      description,
       inputSchema,
     };
   });
@@ -1058,7 +1079,6 @@ function createBoundary(turnId, requestBody, usageBaseline = emptyUsage()) {
       ...emptyUsage(),
       ...(usageBaseline || {}),
     },
-    deltaItemIds: new Set(),
     finished: false,
     outcome: null,
     error: null,
@@ -2124,6 +2144,7 @@ class CodexGatewaySession {
     this.threadId = null;
     this.pendingToolCall = null;
     this.activeBoundary = null;
+    this.interBoundaryListeners = null;
     this.routingReservation = null;
     this.transcriptAnchor = null;
     this.toolResultWindowBytes = 0;
@@ -2214,6 +2235,24 @@ class CodexGatewaySession {
     return this.isIdle();
   }
 
+  isCapacityEvictable() {
+    if (this.isDisposableIdle()) {
+      return true;
+    }
+
+    // StructuredOutput is terminal when Claude accepts it, but a schema
+    // rejection arrives as a follow-up tool_result on this same session. Keep
+    // the live session for that correction path; only treat it as disposable
+    // when a full pool must admit other work. A rejected result can still
+    // recover from the authoritative Claude transcript after such an eviction.
+    return (
+      this.ephemeralThread === true &&
+      !this.routingReservation &&
+      this.activeBoundary?.finished === true &&
+      this.pendingToolCall?.tool === STRUCTURED_OUTPUT_TOOL_NAME
+    );
+  }
+
   isForkSession() {
     return this.sessionKey !== this.baseSessionKey;
   }
@@ -2255,6 +2294,153 @@ class CodexGatewaySession {
       previous_tool_result_window_bytes: this.toolResultWindowBytes,
     });
     this.toolResultWindowBytes = 0;
+  }
+
+  applyTokenUsage(tokenUsagePayload, usageBaseline, turnId, tracer = null) {
+    const tokenUsage = normalizeCodexTokenUsage(tokenUsagePayload);
+    const usage = tokenUsage.last || usageDelta(tokenUsage.total, usageBaseline);
+    this.latestTotalUsage = tokenUsage.total || addUsage(usageBaseline, usage);
+    if (tokenUsage.model_context_window) {
+      this.modelContextWindow = tokenUsage.model_context_window;
+      this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
+    }
+
+    // Prefer the per-turn snapshot (tracks shrinkage after app-server
+    // compaction); fall back to the cumulative total, which overestimates
+    // live context — the safe direction for recycle pressure.
+    const previousContextTokens = this.latestContextTokens || 0;
+    const latestContextTokens =
+      contextTokensFromUsage(tokenUsage.last) ||
+      contextTokensFromUsage(tokenUsage.total) ||
+      previousContextTokens ||
+      0;
+    this.latestContextTokens = latestContextTokens;
+    if (
+      previousContextTokens > 0 &&
+      latestContextTokens > 0 &&
+      latestContextTokens < Math.floor(previousContextTokens * CODEX_CONTEXT_DROP_RESET_FRACTION)
+    ) {
+      this.resetToolResultWindow('context_usage_drop', tracer);
+    }
+    traceLog(tracer || this.tracer, 'codex.usage.updated', {
+      turn_id: turnId,
+      usage,
+      total_usage: tokenUsage.total,
+      last_usage: tokenUsage.last,
+      model_context_window: tokenUsage.model_context_window,
+      previous_context_tokens: previousContextTokens,
+      latest_context_tokens: latestContextTokens,
+    });
+
+    return usage;
+  }
+
+  applyRawResponseUsage(
+    usagePayload,
+    accumulatedUsage,
+    usageBaseline,
+    turnId,
+    tracer = null
+  ) {
+    if (!usagePayload) {
+      return null;
+    }
+
+    const responseUsage = normalizeUsageBreakdown(usagePayload);
+    const usage = addUsage(accumulatedUsage, responseUsage);
+    this.latestTotalUsage = addUsage(usageBaseline, usage);
+
+    // rawResponse/completed describes one upstream response rather than an
+    // accumulated thread total. Its input is nevertheless the best immediate
+    // view of live context on a dynamic-tool boundary.
+    const previousContextTokens = this.latestContextTokens || 0;
+    const latestContextTokens =
+      contextTokensFromUsage(responseUsage) || previousContextTokens || 0;
+    this.latestContextTokens = latestContextTokens;
+    if (
+      previousContextTokens > 0 &&
+      latestContextTokens > 0 &&
+      latestContextTokens < Math.floor(previousContextTokens * CODEX_CONTEXT_DROP_RESET_FRACTION)
+    ) {
+      this.resetToolResultWindow('raw_response_context_usage_drop', tracer);
+    }
+    traceLog(tracer || this.tracer, 'codex.raw_response_usage.updated', {
+      turn_id: turnId,
+      response_usage: responseUsage,
+      accumulated_usage: usage,
+      previous_context_tokens: previousContextTokens,
+      latest_context_tokens: latestContextTokens,
+    });
+
+    return usage;
+  }
+
+  rejectParallelToolCall(message, turnId, tracer = null) {
+    if (
+      !this.pendingToolCall ||
+      message.method !== 'item/tool/call' ||
+      message.params?.turnId !== turnId
+    ) {
+      return false;
+    }
+
+    const params = message.params;
+    const originalName = originalToolName(this.toolRegistry, params.tool);
+    const errorMessage =
+      `parallel Codex tool call ${params.callId || 'unknown'} rejected while waiting ` +
+      `for tool_result for ${this.pendingToolCall.callId}`;
+    traceLog(tracer || this.tracer, 'codex.tool_call.parallel_rejected', {
+      turn_id: turnId,
+      call_id: params.callId || null,
+      tool_name: originalName,
+      pending_call_id: this.pendingToolCall.callId,
+      pending_tool_name: this.pendingToolCall.tool,
+    });
+    if (message.id !== undefined) {
+      this.connection.send({
+        id: message.id,
+        error: {
+          code: -32000,
+          message: errorMessage,
+        },
+      });
+    }
+    return true;
+  }
+
+  stopInterBoundaryCapture() {
+    if (!this.interBoundaryListeners) {
+      return;
+    }
+    const listeners = this.interBoundaryListeners;
+    this.interBoundaryListeners = null;
+    this.connection.off('notification', listeners.notification);
+    this.connection.off('server-request', listeners.serverRequest);
+    this.connection.off('error', listeners.error);
+  }
+
+  captureInterBoundaryEvents(turnId, usageBaseline, tracer = null) {
+    this.stopInterBoundaryCapture();
+    const notification = (message) => {
+      if (
+        message.method !== 'thread/tokenUsage/updated' ||
+        message.params?.turnId !== turnId ||
+        (!message.params?.tokenUsage?.total && !message.params?.tokenUsage?.last)
+      ) {
+        return;
+      }
+      this.applyTokenUsage(message.params.tokenUsage, usageBaseline, turnId, tracer);
+    };
+    const serverRequest = (message) => {
+      this.rejectParallelToolCall(message, turnId, tracer);
+    };
+    const error = () => {
+      this.stopInterBoundaryCapture();
+    };
+    this.interBoundaryListeners = { notification, serverRequest, error };
+    this.connection.on('notification', notification);
+    this.connection.on('server-request', serverRequest);
+    this.connection.on('error', error);
   }
 
   initialInputMode() {
@@ -2338,19 +2524,45 @@ class CodexGatewaySession {
     }
 
     const threadConfig = codexThreadConfigOverrides(this.config, this.route);
-    const result = await this.connection.request('thread/start', {
+    const threadStartParams = {
       model: this.route.upstreamModel,
       cwd: this.config.codex.cwd,
       approvalPolicy: this.route.approvalPolicy,
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
+      // Raw response events expose exact per-response usage. Codex emits the
+      // completion before it drains dynamic-tool futures, so the subsequent
+      // item/tool/call itself is the usable Claude boundary.
+      experimentalRawEvents: true,
       serviceName: 'claude_workflow_gateway',
       threadSource: this.threadSource,
       ...(Object.keys(threadConfig).length > 0 ? { config: threadConfig } : {}),
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
       ...(this.config.codex.dynamicToolsOnly === true ? { environments: [] } : {}),
-    });
+    };
+    let result = null;
+    try {
+      result = await this.connection.request('thread/start', threadStartParams);
+    } catch (error) {
+      if (
+        !/experimentalRawEvents|experimental raw events|unknown field|invalid params/iu.test(
+          error?.message || ''
+        )
+      ) {
+        throw error;
+      }
+
+      // Older app-server builds may reject the experimental field instead of
+      // ignoring it. Retry once without the field; tool boundaries do not
+      // depend on raw events.
+      traceLog(this.tracer, 'codex.thread.raw_events_unsupported', {
+        error_message: error?.message || String(error),
+      });
+      const legacyThreadStartParams = { ...threadStartParams };
+      delete legacyThreadStartParams.experimentalRawEvents;
+      result = await this.connection.request('thread/start', legacyThreadStartParams);
+    }
 
     this.threadId = result.thread?.id || null;
     if (!this.threadId) {
@@ -2470,6 +2682,7 @@ class CodexGatewaySession {
       read_sanitization: readSanitizationTrace(this.pendingToolCall.readSanitization),
       is_error: toolResult.isError,
     });
+    this.stopInterBoundaryCapture();
     this.connection.send({
       id: this.pendingToolCall.requestId,
       result: {
@@ -2586,41 +2799,65 @@ class CodexGatewaySession {
     });
 
     const cleanup = () => {
-      clearTimeout(toolUseSettlementTimer);
-      clearTimeout(toolUseFallbackTimer);
+      clearImmediate(toolUseSettleHandle);
       this.connection.off('notification', onNotification);
       this.connection.off('server-request', onServerRequest);
       this.connection.off('error', onError);
     };
 
-    let toolUseSettlementTimer = null;
-    let toolUseFallbackTimer = null;
-    let deferredToolUseOutcome = null;
+    const agentMessages = new Map();
+    const agentMessageOrder = [];
+    let agentTextEmitted = false;
+    let rawUsageObserved = false;
+    let toolUseSettleHandle = null;
 
-    const completeDeferredToolUse = () => {
-      if (!deferredToolUseOutcome || boundary.finished) {
+    const normalizeAgentMessagePhase = (phase) => {
+      return phase === undefined || phase === null ? null : String(phase);
+    };
+
+    const agentMessageRecord = (itemId) => {
+      const id = String(itemId || `agent-message-${agentMessageOrder.length + 1}`);
+      let record = agentMessages.get(id);
+      if (!record) {
+        record = {
+          id,
+          phase: null,
+          text: '',
+        };
+        agentMessages.set(id, record);
+        agentMessageOrder.push(record);
+      }
+      return record;
+    };
+
+    const selectedAgentMessage = () => {
+      for (let index = agentMessageOrder.length - 1; index >= 0; index -= 1) {
+        if (agentMessageOrder[index].phase === 'final_answer') {
+          return agentMessageOrder[index];
+        }
+      }
+      for (let index = agentMessageOrder.length - 1; index >= 0; index -= 1) {
+        if (agentMessageOrder[index].phase === null) {
+          return agentMessageOrder[index];
+        }
+      }
+      return null;
+    };
+
+    const refreshSelectedAgentText = () => {
+      boundary.text = selectedAgentMessage()?.text || '';
+      return boundary.text;
+    };
+
+    const emitSelectedAgentText = (text) => {
+      if (!text || agentTextEmitted) {
         return;
       }
-
-      const outcome = deferredToolUseOutcome;
-      deferredToolUseOutcome = null;
-      completeBoundary(outcome);
-    };
-
-    const scheduleDeferredToolUseCompletion = (delayMs) => {
-      clearTimeout(toolUseSettlementTimer);
-      toolUseSettlementTimer = setTimeout(function settleToolUse() {
-        completeDeferredToolUse();
-      }, delayMs);
-      toolUseSettlementTimer.unref?.();
-    };
-
-    const scheduleDeferredToolUseFallback = () => {
-      clearTimeout(toolUseFallbackTimer);
-      toolUseFallbackTimer = setTimeout(function settleToolUseFallback() {
-        completeDeferredToolUse();
-      }, 2_000);
-      toolUseFallbackTimer.unref?.();
+      agentTextEmitted = true;
+      boundary.emit({
+        type: 'text_delta',
+        text,
+      });
     };
 
     const failBoundary = (error) => {
@@ -2653,6 +2890,10 @@ class CodexGatewaySession {
       }
 
       cleanup();
+      emitSelectedAgentText(outcome.text);
+      if (outcome.type === 'tool_use') {
+        this.captureInterBoundaryEvents(turnId, boundary.usageBaseline, tracer);
+      }
       boundary.finished = true;
       populateEstimatedUsage(boundary, requestBody, outcome);
       this.transcriptAnchor = makeContinuityAnchor(requestBody, outcome);
@@ -2678,15 +2919,29 @@ class CodexGatewaySession {
     };
 
     const onNotification = (message) => {
+      if (
+        message.method === 'item/started' &&
+        message.params?.turnId === turnId &&
+        message.params?.item?.type === 'agentMessage'
+      ) {
+        const item = message.params.item;
+        const record = agentMessageRecord(item.id);
+        if (Object.hasOwn(item, 'phase')) {
+          record.phase = normalizeAgentMessagePhase(item.phase);
+        }
+        if (typeof item.text === 'string' && item.text !== '') {
+          record.text = item.text;
+        }
+        refreshSelectedAgentText();
+        return;
+      }
+
       if (message.method === 'item/agentMessage/delta' && message.params?.turnId === turnId) {
-        boundary.deltaItemIds.add(message.params?.itemId);
+        const record = agentMessageRecord(message.params?.itemId);
         const text = message.params?.delta || '';
         if (text) {
-          boundary.text += text;
-          boundary.emit({
-            type: 'text_delta',
-            text,
-          });
+          record.text += text;
+          refreshSelectedAgentText();
         }
         return;
       }
@@ -2696,27 +2951,37 @@ class CodexGatewaySession {
         message.params?.turnId === turnId &&
         message.params?.item?.type === 'agentMessage'
       ) {
-        const itemId = message.params.item.id;
-        if (!boundary.deltaItemIds.has(itemId) && typeof message.params.item.text === 'string') {
-          const text = message.params.item.text;
-          if (text) {
-            boundary.text += text;
-            boundary.emit({
-              type: 'text_delta',
-              text,
-            });
-          }
+        const item = message.params.item;
+        const record = agentMessageRecord(item.id);
+        if (Object.hasOwn(item, 'phase')) {
+          record.phase = normalizeAgentMessagePhase(item.phase);
         }
+        if (typeof item.text === 'string') {
+          record.text = item.text;
+        }
+        refreshSelectedAgentText();
         return;
       }
 
       if (
-        message.method === 'item/completed' &&
-        message.params?.turnId === turnId &&
-        message.params?.item?.type === 'dynamicToolCall' &&
-        deferredToolUseOutcome
+        message.method === 'rawResponse/completed' &&
+        message.params?.turnId === turnId
       ) {
-        scheduleDeferredToolUseCompletion(500);
+        const rawUsage = this.applyRawResponseUsage(
+          message.params?.usage,
+          boundary.usage,
+          boundary.usageBaseline,
+          turnId,
+          tracer
+        );
+        if (rawUsage) {
+          rawUsageObserved = true;
+          boundary.usage = rawUsage;
+          boundary.emit({
+            type: 'usage',
+            usage: boundary.usage,
+          });
+        }
         return;
       }
 
@@ -2725,46 +2990,19 @@ class CodexGatewaySession {
         message.params?.turnId === turnId &&
         (message.params?.tokenUsage?.total || message.params?.tokenUsage?.last)
       ) {
-        const tokenUsage = normalizeCodexTokenUsage(message.params.tokenUsage);
-        boundary.usage = tokenUsage.last || usageDelta(tokenUsage.total, boundary.usageBaseline);
-        this.latestTotalUsage = tokenUsage.total || addUsage(boundary.usageBaseline, boundary.usage);
-        if (tokenUsage.model_context_window) {
-          this.modelContextWindow = tokenUsage.model_context_window;
-          this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
+        const tokenUsage = this.applyTokenUsage(
+          message.params.tokenUsage,
+          boundary.usageBaseline,
+          turnId,
+          tracer
+        );
+        if (!rawUsageObserved) {
+          boundary.usage = tokenUsage;
         }
-        // Prefer the per-turn snapshot (tracks shrinkage after app-server
-        // compaction); fall back to the cumulative total, which overestimates
-        // live context — the safe direction for recycle pressure.
-        const previousContextTokens = this.latestContextTokens || 0;
-        const latestContextTokens =
-          contextTokensFromUsage(tokenUsage.last) ||
-          contextTokensFromUsage(tokenUsage.total) ||
-          previousContextTokens ||
-          0;
-        this.latestContextTokens = latestContextTokens;
-        if (
-          previousContextTokens > 0 &&
-          latestContextTokens > 0 &&
-          latestContextTokens < Math.floor(previousContextTokens * CODEX_CONTEXT_DROP_RESET_FRACTION)
-        ) {
-          this.resetToolResultWindow('context_usage_drop', tracer);
-        }
-        traceLog(tracer, 'codex.usage.updated', {
-          turn_id: turnId,
-          usage: boundary.usage,
-          total_usage: tokenUsage.total,
-          last_usage: tokenUsage.last,
-          model_context_window: tokenUsage.model_context_window,
-          previous_context_tokens: previousContextTokens,
-          latest_context_tokens: latestContextTokens,
-        });
         boundary.emit({
           type: 'usage',
           usage: boundary.usage,
         });
-        if (deferredToolUseOutcome) {
-          completeDeferredToolUse();
-        }
         return;
       }
 
@@ -2786,12 +3024,16 @@ class CodexGatewaySession {
 
       completeBoundary({
         type: 'final',
-        text: boundary.text,
+        text: refreshSelectedAgentText(),
       });
     };
 
     const onServerRequest = (message) => {
       if (message.method !== 'item/tool/call' || message.params?.turnId !== turnId) {
+        return;
+      }
+
+      if (this.rejectParallelToolCall(message, turnId, tracer)) {
         return;
       }
 
@@ -2802,29 +3044,6 @@ class CodexGatewaySession {
         params.arguments || {},
         params.callId || null
       );
-      if (this.pendingToolCall) {
-        const errorMessage =
-          `parallel Codex tool call ${params.callId || 'unknown'} rejected while waiting ` +
-          `for tool_result for ${this.pendingToolCall.callId}`;
-        traceLog(tracer, 'codex.tool_call.parallel_rejected', {
-          turn_id: turnId,
-          call_id: params.callId || null,
-          tool_name: originalName,
-          pending_call_id: this.pendingToolCall.callId,
-          pending_tool_name: this.pendingToolCall.tool,
-        });
-        if (message.id !== undefined) {
-          this.connection.send({
-            id: message.id,
-            error: {
-              code: -32000,
-              message: errorMessage,
-            },
-          });
-        }
-        return;
-      }
-
       if (sanitizedToolCall.readSanitization?.changed) {
         traceLog(tracer, 'codex.read_tool.arguments_sanitized', {
           turn_id: turnId,
@@ -2849,16 +3068,25 @@ class CodexGatewaySession {
         read_sanitization: readSanitizationTrace(sanitizedToolCall.readSanitization),
       });
 
-      deferredToolUseOutcome = {
+      const toolUseOutcome = {
         type: 'tool_use',
-        text: boundary.text,
+        text: refreshSelectedAgentText(),
         toolCall: {
           id: params.callId,
           name: originalName,
           input: sanitizedToolCall.arguments,
         },
       };
-      scheduleDeferredToolUseFallback();
+      // Codex only polls dynamic-tool futures after the upstream Responses
+      // stream has completed. Settle on the next event-loop turn to avoid
+      // same-stack reentrancy while adding no inference or fixed wait.
+      toolUseSettleHandle = setImmediate(function settleToolUseBoundary() {
+        toolUseSettleHandle = null;
+        completeBoundary({
+          ...toolUseOutcome,
+          text: refreshSelectedAgentText(),
+        });
+      });
     };
 
     this.connection.subscribeToTurn(onNotification, onServerRequest, onError);
@@ -2937,6 +3165,7 @@ class CodexGatewaySession {
     this.disposed = true;
     clearTimeout(this.idleTimer);
     clearTimeout(this.pendingToolTimer);
+    this.stopInterBoundaryCapture();
     traceLog(this.tracer, 'codex.session.closed');
     await this.connection.close(reason);
   }
@@ -3492,7 +3721,7 @@ export class CodexSessionManager {
 
     const candidates = Array.from(this.sessions.entries())
       .filter(function disposableCandidate([, session]) {
-        return session.isDisposableIdle?.();
+        return session.isCapacityEvictable?.() ?? session.isDisposableIdle?.();
       })
       .sort(function oldestFirst(left, right) {
         return (left[1].lastUsedAt || 0) - (right[1].lastUsedAt || 0);
@@ -3718,7 +3947,10 @@ export class CodexSessionManager {
 
     const candidates = Array.from(this.sessions.entries())
       .filter(function disposableCandidate([, session]) {
-        return session !== protectedSession && session.isDisposableIdle?.();
+        return (
+          session !== protectedSession &&
+          (session.isCapacityEvictable?.() ?? session.isDisposableIdle?.())
+        );
       })
       .sort(function oldestFirst(left, right) {
         return (left[1].lastUsedAt || 0) - (right[1].lastUsedAt || 0);

@@ -309,6 +309,53 @@ async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
   }
 }
 
+async function testSourcedDirectCodexEnvironmentKeepsDaemonCurrent() {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-codex-env-'));
+  const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
+  const envFile = path.join(stateDir, 'gateway.env');
+  const env = {
+    ...process.env,
+    CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'none',
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(await freePort()),
+    ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'codex',
+    ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
+  };
+  delete env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON;
+  delete env.ULTRATHINK_GATEWAY_SHARED_SECRET;
+  for (const name of Object.keys(env)) {
+    if (
+      name.startsWith('CLAUDE_WORKFLOW_GATEWAY_MANAGED_') ||
+      name.startsWith('CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_')
+    ) {
+      delete env[name];
+    }
+  }
+
+  try {
+    const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
+    assert.equal(started.code, 0, started.stderr || started.stdout);
+    const originalPid = await readPid(pidFile);
+
+    const sourcedStatus = await runProcess(
+      'bash',
+      ['-c', '. "$1"\n"$2" status', 'managed-codex-status', envFile, DAEMON_SCRIPT],
+      env
+    );
+    assert.equal(sourcedStatus.code, 0, sourcedStatus.stderr || sourcedStatus.stdout);
+    assert.match(sourcedStatus.stdout, /healthy and current/u);
+    assert.equal(await readPid(pidFile), originalPid);
+  } finally {
+    try {
+      await stopDaemon(env, pidFile);
+    } catch {
+      // Best-effort cleanup for failed assertions.
+    }
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+}
+
 async function testManagedPortValidation() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-daemon-port-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
@@ -528,4 +575,5 @@ await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();
 await testSourcedManagedAuthKeepsKimiDaemonCurrent();
+await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

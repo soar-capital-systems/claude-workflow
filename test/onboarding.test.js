@@ -16,6 +16,7 @@ import {
 } from '../js/cli/onboarding.js';
 import {
   CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
+  inspectClaudeRoutingSettingsConflicts,
   inspectClaudeThirdPartyModelSupport,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
@@ -213,6 +214,7 @@ test(
               `stale-routing-value-${index}`,
             ])
           ),
+          CLAUDE_CODE_DISABLE_TERMINAL_TITLE: '1',
           UNRELATED_SETTING: 'preserved',
         },
         permissions: { allow: ['Read'] },
@@ -264,6 +266,27 @@ test(
       /regular file, not a symlink/u
     );
     assert.equal(await fsp.readFile(real, 'utf8'), '{"preserved":true}\n');
+  }
+);
+
+test(
+  'terminal-title preferences are not treated as workflow routing conflicts',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const home = await temporaryDirectory(t, 'claude-workflow-claude-title-setting-');
+    const repository = path.join(home, 'repo');
+    const settingsPath = path.join(repository, '.claude', 'settings.json');
+    await fsp.mkdir(path.join(repository, '.git'), { recursive: true });
+    await fsp.mkdir(path.dirname(settingsPath), { recursive: true });
+    await fsp.writeFile(
+      settingsPath,
+      '{"env":{"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1"}}\n'
+    );
+
+    assert.deepEqual(
+      inspectClaudeRoutingSettingsConflicts(isolatedEnvironment(home), repository),
+      []
+    );
   }
 );
 
@@ -539,6 +562,35 @@ test(
 );
 
 test(
+  'direct Codex setup does not require an Anthropic login',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-codex-main-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      FAKE_CLAUDE_LOGGED_OUT: '1',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'codex',
+      ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
+    });
+
+    const withoutPreparation = runCli(['setup'], { env, timeout: 5_000 });
+    assert.equal(withoutPreparation.status, 1);
+    assert.match(
+      `${withoutPreparation.stdout}\n${withoutPreparation.stderr}`,
+      /setup --prepare-claude/u
+    );
+
+    const result = runCli(['setup', '--prepare-claude'], { env, timeout: 5_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /provider authentication via gateway/u);
+    assert.match(result.stdout, /third-party model support enabled/u);
+  }
+);
+
+test(
   'setup rejects unsupported Codex versions before authentication',
   { skip: process.platform === 'win32' },
   async function (t) {
@@ -673,6 +725,43 @@ test(
       (await fsp.readFile(configPath, 'utf8')).trim(),
       `ULTRATHINK_GATEWAY_KIMI_API_KEY=${fakeKey}`
     );
+  }
+);
+
+test(
+  'config selects a direct Codex main route and clears it when returning to Fable',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-codex-main-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const env = isolatedEnvironment(home);
+
+    const update = runCli(['config', '--main', 'codex', '--agents', 'sol'], { env });
+    assert.equal(update.status, 0, update.stderr);
+    assert.match(update.stdout, /Next: run `claude-workflow setup --prepare-claude`/u);
+
+    const configPath = path.join(home, '.claude-workflow.env');
+    const content = await fsp.readFile(configPath, 'utf8');
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=codex/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=codex/u);
+    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=/u);
+    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5\.6-sol/u);
+
+    const show = runCli(['config'], { env });
+    assert.equal(show.status, 0, show.stderr);
+    assert.match(show.stdout, /Main\s+Codex direct -> codex \(codex\)/u);
+    const json = runCli(['config', '--json'], { env });
+    assert.equal(json.status, 0, json.stderr);
+    assert.equal(JSON.parse(json.stdout).main.target, 'codex:gpt-5.6-sol/max');
+
+    const resetMain = runCli(['config', '--main', 'fable'], { env });
+    assert.equal(resetMain.status, 0, resetMain.stderr);
+    const resetContent = await fsp.readFile(configPath, 'utf8');
+    assert.match(resetContent, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=anthropic/u);
+    assert.doesNotMatch(resetContent, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=/u);
+    assert.doesNotMatch(resetContent, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=/u);
   }
 );
 

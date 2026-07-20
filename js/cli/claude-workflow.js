@@ -452,7 +452,7 @@ async function main() {
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildWorkflowGatewayConfig();
   const resolvedMainRoute = resolveModelRoute(mainModelId, config);
-  if (routeProvider(resolvedMainRoute) === 'kimi') {
+  if (routeProvider(resolvedMainRoute) !== 'anthropic') {
     const thirdPartyState = inspectClaudeThirdPartyModelSupport();
     if (!thirdPartyState.enabled) {
       throw new Error(

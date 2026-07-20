@@ -18,7 +18,10 @@ import {
   routeEntryValue,
 } from './model-routing.js';
 import { proxyExclusionEnvForHost } from './proxy.js';
-import { MANAGED_GATEWAY_AUTH_ENV_NAME } from '../utils/child-env.js';
+import {
+  CLAUDE_TERMINAL_TITLE_ENV_NAME,
+  MANAGED_GATEWAY_AUTH_ENV_NAME,
+} from '../utils/child-env.js';
 
 const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
 // Workflow-profile ceiling for the Codex input budget. The codex provider also
@@ -335,6 +338,7 @@ export function buildWorkflowGatewayConfig({
     ...mainRouteMap,
     ...baseRouteMap,
   };
+  const resolvedMainProvider = routeProvider(routeMap[mainModelId], mainProvider);
   const hasKimiRoute = Object.values(routeMap).some(function usesKimi(route) {
     return routeProvider(route, '') === 'kimi';
   });
@@ -347,7 +351,7 @@ export function buildWorkflowGatewayConfig({
     envString('ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS') !== '';
   const anthropicPassthroughModels = passthroughEnvProvided
     ? baseConfig.anthropicPassthroughModels
-    : mainProvider === 'anthropic'
+    : resolvedMainProvider === 'anthropic'
       ? [defaultAnthropicPassthroughPattern(mainModelId)]
       : [];
   const hasAnthropicRoute =
@@ -355,9 +359,11 @@ export function buildWorkflowGatewayConfig({
     Object.values(routeMap).some(function usesAnthropic(route) {
       return routeProvider(route, '') === 'anthropic';
     });
+  const requiresClientGatewayCredential =
+    hasKimiRoute || resolvedMainProvider !== 'anthropic';
   const sharedSecret =
     baseConfig.sharedSecret ||
-    (hasKimiRoute ? crypto.randomBytes(32).toString('base64url') : '');
+    (requiresClientGatewayCredential ? crypto.randomBytes(32).toString('base64url') : '');
   if (
     sharedSecret &&
     hasKimiRoute &&
@@ -374,7 +380,11 @@ export function buildWorkflowGatewayConfig({
     !envString('ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY')
   ) {
     throw new Error(
-      'A gateway shared secret with an Anthropic route requires a dedicated gateway-side credential. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY; a generic ANTHROPIC_API_KEY is not accepted because the local gateway credential must remain distinct from upstream authentication.'
+      'A gateway shared secret with an Anthropic route requires a dedicated gateway-side ' +
+        'credential. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY; a generic ANTHROPIC_API_KEY ' +
+        'is not accepted because the local gateway credential must remain distinct from ' +
+        'upstream authentication. For a Codex-only main route, remove the explicit Anthropic ' +
+        'route or set ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=none.'
     );
   }
 
@@ -436,6 +446,12 @@ export function buildWorkflowClientEnv(
   }
 
   const mainRoute = resolveModelRoute(mainModelId, config);
+  if (routeProvider(mainRoute, '') === 'codex') {
+    // Claude Code otherwise spends a second provider request generating a
+    // terminal title. Direct Codex mode should make one request for a plain
+    // no-tool prompt and return that response unchanged.
+    clientEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] = '1';
+  }
   if (routeProvider(mainRoute, '') === 'kimi') {
     const contextTokens = String(mainRoute.contextTokens || 1_048_576);
     clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;

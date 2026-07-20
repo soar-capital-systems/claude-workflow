@@ -39,10 +39,14 @@ const ISOLATED_ENV_NAMES = Object.freeze([
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_MODEL',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_TERMINAL_TITLE',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
   'CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL',
   MANAGED_GATEWAY_AUTH_ENV_NAME,
+  'CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE',
+  'CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE',
+  'CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET',
   'CLAUDE_WORKFLOW_MAIN_PROVIDER',
   'KIMI_API_KEY',
   'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS',
@@ -211,6 +215,10 @@ test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', 
       assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, String(KIMI_CONTEXT_TOKENS));
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(KIMI_CONTEXT_TOKENS));
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+      assert.equal(
+        Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
+        false
+      );
       assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
       assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
       assert.equal(
@@ -353,10 +361,14 @@ test('Kimi client settings follow only the resolved main route', async function 
       assert.equal(workflow.mainModelId.startsWith('claude-fable-5'), true);
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, null);
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, null);
+      assert.equal(
+        Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
+        false
+      );
       const serialized = serializeWorkflowEnvironment(clientEnv);
-      assert.match(serialized, /^unset CLAUDE_CODE_AUTO_COMPACT_WINDOW$/mu);
-      assert.match(serialized, /^unset CLAUDE_CODE_EFFORT_LEVEL$/mu);
-      assert.match(serialized, /^unset CLAUDE_CODE_MAX_CONTEXT_TOKENS$/mu);
+      assert.match(serialized, /^unset CLAUDE_CODE_AUTO_COMPACT_WINDOW\b/mu);
+      assert.match(serialized, /^unset CLAUDE_CODE_EFFORT_LEVEL\b/mu);
+      assert.match(serialized, /^unset CLAUDE_CODE_MAX_CONTEXT_TOKENS\b/mu);
     }
   );
 

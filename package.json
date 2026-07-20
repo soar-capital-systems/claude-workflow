@@ -1,7 +1,7 @@
 {
   "name": "@onetool/claude-workflow",
   "version": "0.1.0",
-  "description": "Claude Code launcher with Anthropic or Kimi main routing and Codex-backed workflow agents.",
+  "description": "Claude Code launcher with Anthropic, direct Codex, or Kimi main routing and Codex-backed workflow agents.",
   "type": "module",
   "bin": {
     "claude-workflow": "js/cli/claude-workflow.js",
@@ -16,7 +16,7 @@
     "daemon:log": "bash scripts/claude-workflow-daemon.sh log",
     "check": "node scripts/check-syntax.mjs",
     "test": "npm run -s check && npm run -s test:gateway && npm run -s test:onboarding",
-    "test:gateway": "node test/gateway.test.js && node test/codex-provider-hardening.test.js && node test/daemon-observability.test.js && node --test test/security-hardening.test.js test/kimi-provider.test.js test/installed-claude-kimi.test.js",
+    "test:gateway": "node test/gateway.test.js && node test/codex-provider-hardening.test.js && node test/daemon-observability.test.js && node --test test/security-hardening.test.js test/kimi-provider.test.js test/installed-claude-kimi.test.js test/installed-claude-codex.test.js",
     "test:onboarding": "node --test test/onboarding.test.js",
     "test:package": "node test/package-install-smoke.test.js",
     "prepack": "npm run -s check",

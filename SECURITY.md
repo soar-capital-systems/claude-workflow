@@ -14,9 +14,9 @@ published gateway env files, or complete private prompts/transcripts.
   automation mode, not a sandbox boundary. Use `--no-yolo` for normal prompts.
 - The gateway binds to loopback by default, but loopback is not an OS-user
   boundary. Other local users or processes in the same network namespace may
-  be able to connect. A Kimi main route therefore creates a random gateway
-  secret and requires it on `/v1`; the shared daemon publishes that secret only
-  through its owner-only environment file.
+  be able to connect. A managed non-Anthropic main route therefore creates a
+  random gateway secret and requires it on `/v1`; the shared daemon publishes
+  that secret only through its owner-only environment file.
 - Non-loopback binds require `ULTRATHINK_GATEWAY_SHARED_SECRET`. When that is
   set, every Anthropic route also needs the dedicated gateway-side
   `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`. A generic `ANTHROPIC_API_KEY` is not

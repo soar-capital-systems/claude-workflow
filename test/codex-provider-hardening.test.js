@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
 import { CodexSessionManager } from '../js/gateway/codex-provider.js';
@@ -125,8 +126,8 @@ async function makeExecutable(filePath, content) {
 }
 
 async function waitFor(check, description, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     if (await check()) {
       return;
     }
@@ -185,6 +186,12 @@ log({
   hasOpenAiApiKey: Object.hasOwn(process.env, 'OPENAI_API_KEY'),
   hasZaiApiKey: Object.hasOwn(process.env, 'ZAI_API_KEY'),
   hasGatewayKimiApiKey: Object.hasOwn(process.env, 'ULTRATHINK_GATEWAY_KIMI_API_KEY'),
+  qwenCredentialCount: [
+    'BAILIAN_TOKEN_PLAN_API_KEY',
+    'DASHSCOPE_API_KEY',
+    'QWEN_API_KEY',
+    'ULTRATHINK_GATEWAY_QWEN_API_KEY'
+  ].filter((name) => Object.hasOwn(process.env, name)).length,
   hasGatewaySharedSecret: Object.hasOwn(process.env, 'ULTRATHINK_GATEWAY_SHARED_SECRET'),
   hasAnthropicAuthToken: Object.hasOwn(process.env, 'ANTHROPIC_AUTH_TOKEN'),
   hasAnthropicApiKey: Object.hasOwn(process.env, 'ANTHROPIC_API_KEY')
@@ -702,13 +709,13 @@ async function testToolBoundaryCompletesWithoutFixedDelay() {
   ];
   const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
   try {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     const first = await manager.processRequest(
       request('immediate-tool'),
       body('Run the tool immediately.', tools),
       route()
     );
-    const elapsedMs = Date.now() - startedAt;
+    const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');
     assert.equal(first.toolCall.id, 'call_immediate');
     assert.equal(elapsedMs < 1_500, true, `tool boundary took ${elapsedMs}ms`);
@@ -768,13 +775,13 @@ async function testLegacyToolBoundaryCompletesWithoutRawEvents() {
   ];
   const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
   try {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     const first = await manager.processRequest(
       request('legacy-tool'),
       body('Run the legacy tool.', tools),
       route()
     );
-    const elapsedMs = Date.now() - startedAt;
+    const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');
     assert.equal(first.toolCall.id, 'call_legacy');
     assert.equal(elapsedMs < 1_000, true, `legacy tool boundary took ${elapsedMs}ms`);
@@ -927,6 +934,15 @@ async function testDynamicToolsOnlyThreadMode() {
   const previousGlmApiKey = process.env.GLM_API_KEY;
   const previousOpenAiApiKey = process.env.OPENAI_API_KEY;
   const previousZaiApiKey = process.env.ZAI_API_KEY;
+  const qwenCredentials = {
+    BAILIAN_TOKEN_PLAN_API_KEY: 'sk-sp-test-bailian-app-server-key',
+    DASHSCOPE_API_KEY: 'test-dashscope-app-server-key',
+    QWEN_API_KEY: 'sk-sp-test-qwen-fallback-app-server-key',
+    ULTRATHINK_GATEWAY_QWEN_API_KEY: 'sk-sp-test-qwen-app-server-key',
+  };
+  const previousQwenCredentials = Object.fromEntries(
+    Object.keys(qwenCredentials).map((name) => [name, process.env[name]])
+  );
   process.env.KIMI_API_KEY = 'test-kimi-app-server-fallback-key';
   process.env.ULTRATHINK_GATEWAY_KIMI_API_KEY = 'test-kimi-app-server-key';
   process.env.ULTRATHINK_GATEWAY_SHARED_SECRET = 'test-gateway-shared-secret';
@@ -936,6 +952,7 @@ async function testDynamicToolsOnlyThreadMode() {
   process.env.GLM_API_KEY = 'test-glm-app-server-key';
   process.env.OPENAI_API_KEY = 'test-openai-app-server-key';
   process.env.ZAI_API_KEY = 'test-zai-app-server-key';
+  Object.assign(process.env, qwenCredentials);
 
   const configuredManager = trackManager(
     new CodexSessionManager(managerConfig(command, tempDir, { dynamicToolsOnly: false }))
@@ -974,6 +991,7 @@ async function testDynamicToolsOnlyThreadMode() {
     assert.equal(processes.every((entry) => entry.hasGlmApiKey === false), true);
     assert.equal(processes.every((entry) => entry.hasOpenAiApiKey === false), true);
     assert.equal(processes.every((entry) => entry.hasZaiApiKey === false), true);
+    assert.equal(processes.every((entry) => entry.qwenCredentialCount === 0), true);
   } finally {
     await Promise.all([configuredManager.close(), dynamicOnlyManager.close()]);
     if (previousKimiApiKey === undefined) {
@@ -1006,6 +1024,7 @@ async function testDynamicToolsOnlyThreadMode() {
       ['GLM_API_KEY', previousGlmApiKey],
       ['OPENAI_API_KEY', previousOpenAiApiKey],
       ['ZAI_API_KEY', previousZaiApiKey],
+      ...Object.entries(previousQwenCredentials),
     ]) {
       if (value === undefined) {
         delete process.env[name];
@@ -1067,13 +1086,13 @@ async function testPendingToolRetentionAndHardCapacity() {
   );
 
   try {
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     const first = await manager.processRequest(
       request('pending-session'),
       body('Run the external tool.', tools),
       route()
     );
-    const elapsedMs = Date.now() - startedAt;
+    const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');
     assert.equal(first.toolCall.id, 'call_pending');
     assert.equal(

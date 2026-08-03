@@ -23,7 +23,7 @@ export function setTimeoutGuard(label, ms = 30000) {
 }
 
 export async function makeTempDir(prefix) {
-  const dir = path.join(tmpdir(), `claude-workflow-test-${prefix}-${crypto.randomBytes(4).toString('hex')}`);
+  const dir = path.join(tmpdir(), `ultrathink-test-${prefix}-${crypto.randomBytes(4).toString('hex')}`);
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }

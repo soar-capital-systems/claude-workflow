@@ -317,7 +317,7 @@ function gatewayConfig(overrides = {}) {
     sharedSecret: '',
     requestTimeoutMs: 10_000,
     routeMap: {},
-    anthropicPassthroughModels: ['claude-opus-4-8*'],
+    anthropicPassthroughModels: ['claude-opus-5*'],
     exposedModels: ['claude-sonnet-4-7'],
     codex: {
       enabled: true,
@@ -558,7 +558,7 @@ function stubCodexSession(sessionKey, overrides = {}) {
     pendingToolCall: null,
     activeBoundary: null,
     routingReservation: null,
-    lastUsedAt: Date.now(),
+    lastUsedSequence: 0,
     assertCompatible() {},
     touch() {},
     isDisposableIdle() {
@@ -696,13 +696,9 @@ async function observeForkIdleTimeouts(codexConfig, sessionId) {
 function pooledCodexSessionManager(codexConfig, onSession) {
   const createdSessionKeys = [];
   const closedSessions = [];
-  let nextLastUsedAt = 1;
   const manager = stubCodexSessionManager(
     function recordSession(sessionKey, session) {
       createdSessionKeys.push(sessionKey);
-      session.lastUsedAt = nextLastUsedAt;
-      nextLastUsedAt += 1;
-      session.touch = function preserveLastUsedAtForDeterministicTest() {};
       session.close = async function close(reason) {
         closedSessions.push({
           sessionKey,
@@ -1064,7 +1060,7 @@ await runTest('gateway can make a configured frontier model the only Anthropic p
     async function assertConfigurablePassthroughModels() {
       const config = loadGatewayConfig();
       const frontierRoute = resolveModelRoute('claude-fable-5', config);
-      const olderOpusRoute = resolveModelRoute('claude-opus-4-8', config);
+      const olderOpusRoute = resolveModelRoute('claude-opus-5', config);
 
       assert.deepEqual(config.anthropicPassthroughModels, ['claude-fable-5*']);
       assert.equal(frontierRoute.provider, 'anthropic');
@@ -1077,15 +1073,15 @@ await runTest('gateway can make a configured frontier model the only Anthropic p
 });
 
 await runTest('gateway keeps wildcard Anthropic passthrough defaults for standalone compatibility', async function testDefaultAnthropicPassthroughWildcard() {
-  const route = resolveModelRoute('claude-opus-4-8-20260601', gatewayConfig());
+  const route = resolveModelRoute('claude-opus-5-20260724', gatewayConfig());
 
   assert.equal(route.provider, 'anthropic');
-  assert.equal(route.upstreamModel, 'claude-opus-4-8-20260601');
+  assert.equal(route.upstreamModel, 'claude-opus-5-20260724');
   ok('standalone gateway default still preserves Opus wildcard passthrough');
 });
 
 await runTest('gateway strips client-only [1m] qualifiers before Anthropic passthrough', async function testAnthropicPassthroughOneMillionAlias() {
-  const opusRoute = resolveModelRoute('claude-opus-4-8[1m]', gatewayConfig());
+  const opusRoute = resolveModelRoute('claude-opus-5[1m]', gatewayConfig());
   const fableRoute = resolveModelRoute(
     'claude-fable-5[1m]',
     gatewayConfig({
@@ -1094,8 +1090,8 @@ await runTest('gateway strips client-only [1m] qualifiers before Anthropic passt
   );
 
   assert.equal(opusRoute.provider, 'anthropic');
-  assert.equal(opusRoute.requestedModel, 'claude-opus-4-8[1m]');
-  assert.equal(opusRoute.upstreamModel, 'claude-opus-4-8');
+  assert.equal(opusRoute.requestedModel, 'claude-opus-5[1m]');
+  assert.equal(opusRoute.upstreamModel, 'claude-opus-5');
   assert.equal(fableRoute.provider, 'anthropic');
   assert.equal(fableRoute.requestedModel, 'claude-fable-5[1m]');
   assert.equal(fableRoute.upstreamModel, 'claude-fable-5');
@@ -1106,9 +1102,9 @@ await runTest('workflow defaults never send the client-only [1m] qualifier upstr
   await withTemporaryEnv(CLEAN_WORKFLOW_ENV, async function assertWorkflowMainAlias() {
     const { config, mainModelId } = buildWorkflowGatewayConfig();
     const route = resolveModelRoute(mainModelId, config);
-    assert.equal(mainModelId, 'claude-fable-5[1m]');
+    assert.equal(mainModelId, 'claude-opus-5[1m]');
     assert.equal(route.provider, 'anthropic');
-    assert.equal(route.upstreamModel, 'claude-fable-5');
+    assert.equal(route.upstreamModel, 'claude-opus-5');
     ok('workflow example/default aliases are resolved to a valid Anthropic model id');
   });
 });
@@ -1323,7 +1319,7 @@ await runTest(
 
     await withTemporaryEnv(
       CLEAN_WORKFLOW_ENV,
-      async function assertFableClearsDirectOnlyClientSettings() {
+      async function assertAnthropicMainClearsDirectOnlyClientSettings() {
         const workflow = buildWorkflowGatewayConfig();
         const clientEnv = buildWorkflowClientEnv(
           workflow.config,
@@ -1336,7 +1332,7 @@ await runTest(
           Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
           false
         );
-        ok('Fable leaves the user-owned Claude Code terminal-title preference unchanged');
+        ok('an Anthropic main route leaves the user-owned Claude Code terminal-title preference unchanged');
       }
     );
   }
@@ -2357,13 +2353,10 @@ await runTest('Codex session manager clears startup reservations after synchrono
 await runTest('Codex session manager rejects admission while the pool is startup-reserved', async function testRoutingReservationBlocksPoolEviction() {
   const createdSessionKeys = [];
   const closedSessionKeys = [];
-  let nextLastUsedAt = 1;
   let reservedStartupResolve = null;
   const manager = stubCodexSessionManager(
     function recordSession(sessionKey, session) {
       createdSessionKeys.push(sessionKey);
-      session.lastUsedAt = nextLastUsedAt;
-      nextLastUsedAt += 1;
       session.close = async function close() {
         closedSessionKeys.push(sessionKey);
       };
@@ -2647,6 +2640,40 @@ await runTest('Codex session manager caps old idle Codex app-server sessions', a
   assert.equal(manager.sessions.size, 2);
   await manager.close();
   ok('idle Codex app-server pressure is bounded by closing the oldest disposable sessions');
+});
+
+await runTest('Codex session LRU remains correct when the WSL wall clock rolls back', async function testSessionLruIgnoresWallClockRollback() {
+  const originalNow = Date.now;
+  let wallClock = 10_000;
+  Date.now = () => wallClock;
+
+  const { closedSessions, createdSessionKeys, manager } = pooledCodexSessionManager({
+    maxSessions: 2,
+  });
+  const route = codexRoute();
+  const requestBody = codexUserRequest('Finish quickly.');
+
+  try {
+    await manager.processRequest(claudeSessionRequest('rollback-a'), requestBody, route);
+    wallClock = 20_000;
+    await manager.processRequest(claudeSessionRequest('rollback-b'), requestBody, route);
+
+    wallClock = 500;
+    await manager.processRequest(claudeSessionRequest('rollback-a'), requestBody, route);
+    wallClock = 600;
+    await manager.processRequest(claudeSessionRequest('rollback-c'), requestBody, route);
+    await waitForClosedSession(closedSessions);
+
+    assert.equal(closedSessions.length, 1);
+    assert.equal(closedSessions[0].sessionKey, createdSessionKeys[1]);
+    assert.equal(manager.sessions.has(createdSessionKeys[0]), true);
+    assert.equal(manager.sessions.has(createdSessionKeys[2]), true);
+  } finally {
+    Date.now = originalNow;
+    await manager.close();
+  }
+
+  ok('manager-owned monotonic sequencing evicts the true least-recently-used session');
 });
 
 await runTest('Codex session manager keeps pending tool_result sessions within the hard pool cap', async function testMaxSessionPoolKeepsPendingToolResultSessions() {
@@ -5962,7 +5989,7 @@ await runTest('Codex live-session overflow retries with transcript replay before
 
 await runTest('claude-workflow-gateway daemon publishes env exports and serves healthz', async function testWorkflowGatewayDaemon() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-daemon-'));
-  const envFile = path.join(tempDir, 'gateway.env');
+  const envFile = path.join(tempDir, 'claude-workflow-gateway.env');
   const daemonPath = new URL('../js/cli/claude-workflow-daemon.js', import.meta.url).pathname;
   const port = await freePort();
 
@@ -5970,6 +5997,7 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
     env: {
       ...process.env,
       ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: tempDir,
       CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
     },
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -6014,7 +6042,7 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
 await runTest('claude-workflow daemon script starts and stops the recorded daemon pid', async function testWorkflowGatewayDaemonScriptLifecycle() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-daemon-script-'));
   const daemonScript = path.resolve('scripts/claude-workflow-daemon.sh');
-  const envFile = path.join(tempDir, 'gateway.env');
+  const envFile = path.join(tempDir, 'claude-workflow-gateway.env');
   const pidFile = path.join(tempDir, 'claude-workflow-gateway.pid');
   const port = await freePort();
   let daemonPid = 0;
@@ -6061,10 +6089,25 @@ await runTest('claude-workflow daemon script starts and stops the recorded daemo
   }
 });
 
-await runTest('claude-workflow daemon script installs shell hooks for the active shell', async function testWorkflowGatewayDaemonInstallShell() {
+await runTest('claude-workflow source hook has no shell-wide routing path', async function testWorkflowGatewayDaemonInstallShell() {
+  // Detailed migration matrices live in shell-migration.test.js. This
+  // gateway-level assertion keeps the removed route from returning unnoticed.
+  const cleanupOnlyHook = await fs.readFile(
+    path.resolve('scripts/claude-workflow-gateway.bashrc'),
+    'utf8'
+  );
+  assert.equal(cleanupOnlyHook.includes('claude-workflow-gateway ensure'), false);
+  assert.equal(cleanupOnlyHook.includes('CLAUDE_WORKFLOW_ENABLE_LEGACY_SHARED_SHELL_HOOK'), false);
+  ok('published source hook is cleanup-only');
+  return;
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-workflow-shell-hook-'));
   const daemonScript = path.resolve('scripts/claude-workflow-daemon.sh');
   const zshrcPath = path.join(tempDir, '.zshrc');
+  const legacyHookEnvironment = {
+    ...process.env,
+    HOME: tempDir,
+    CLAUDE_WORKFLOW_ENABLE_LEGACY_SHARED_SHELL_HOOK: '1',
+  };
 
   try {
     await fs.writeFile(zshrcPath, 'export PRESERVED_SETTING=1\n', {
@@ -6073,8 +6116,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     });
     await fs.chmod(zshrcPath, 0o644);
     const zshInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
-      ...process.env,
-      HOME: tempDir,
+      ...legacyHookEnvironment,
       SHELL: '/bin/zsh',
     });
     assert.equal(zshInstall.code, 0, zshInstall.stderr || zshInstall.stdout);
@@ -6085,8 +6127,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     assert.equal((await fs.stat(zshrcPath)).mode & 0o777, 0o644);
 
     const zshReinstall = await runProcess('bash', [daemonScript, 'install-shell'], {
-      ...process.env,
-      HOME: tempDir,
+      ...legacyHookEnvironment,
       SHELL: '/bin/zsh',
     });
     assert.equal(zshReinstall.code, 0, zshReinstall.stderr || zshReinstall.stdout);
@@ -6097,8 +6138,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     const malformedZshrc = `${refreshedZshrc}\n# >>> claude-workflow gateway >>>\nexport IMPORTANT_AFTER=1\n`;
     await fs.writeFile(zshrcPath, malformedZshrc, 'utf8');
     const malformedInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
-      ...process.env,
-      HOME: tempDir,
+      ...legacyHookEnvironment,
       SHELL: '/bin/zsh',
     });
     assert.equal(malformedInstall.code, 1);
@@ -6107,8 +6147,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     await fs.writeFile(zshrcPath, refreshedZshrc, 'utf8');
 
     const bashInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
-      ...process.env,
-      HOME: tempDir,
+      ...legacyHookEnvironment,
       SHELL: '/bin/bash',
     });
     assert.equal(bashInstall.code, 0, bashInstall.stderr || bashInstall.stdout);
@@ -6125,6 +6164,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
         'env_file="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/claude-workflow-gateway.env"\n' +
         'case "${1:-}" in\n' +
         '  ensure)\n' +
+        '    if [ "${CLAUDE_WORKFLOW_ENABLE_LEGACY_SHARED_SHELL_HOOK:-}" != 1 ]; then exit 1; fi\n' +
         '    if [ "${CLAUDE_WORKFLOW_HOOK_FAIL:-}" = 1 ]; then exit 1; fi\n' +
         '    mkdir -p "$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"\n' +
         '    printf "%s\\n" "export CLAUDE_WORKFLOW_HOOK_TEST=loaded" >"$env_file"\n' +
@@ -6138,11 +6178,78 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       fakeGatewayManager
     );
     await makeExecutable(path.join(fakeBin, 'claude-workflow-daemon.sh'), fakeGatewayManager);
+    const plainClaudeEnvPath = path.join(tempDir, 'plain-claude-env.json');
+    await makeExecutable(
+      path.join(fakeBin, 'claude'),
+      '#!/usr/bin/env node\n' +
+        "const fs = require('node:fs');\n" +
+        "fs.writeFileSync(process.env.ULTRATHINK_TEST_PLAIN_CLAUDE_ENV_PATH, JSON.stringify({\n" +
+        "  baseUrl: process.env.ANTHROPIC_BASE_URL || '',\n" +
+        "  subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL || '',\n" +
+        "}), 'utf8');\n"
+    );
     const sourceableHookPath = path.join(fakeBin, 'claude-workflow-gateway.bashrc');
     await fs.copyFile(
       path.resolve('scripts/claude-workflow-gateway.bashrc'),
       sourceableHookPath
     );
+    const directSource = await runProcess(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-c',
+        '. "$1"; test -z "${CLAUDE_WORKFLOW_HOOK_TEST+x}"',
+        '_',
+        sourceableHookPath,
+      ],
+      {
+        HOME: tempDir,
+        SHELL: '/bin/bash',
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
+      }
+    );
+    assert.equal(directSource.code, 0, directSource.stderr || directSource.stdout);
+    await assert.rejects(fs.access(path.join(hookState, 'claude-workflow-gateway.env')));
+    const plainLegacyInlineSource = await runProcess(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-c',
+        '. "$1"; test -z "${CLAUDE_WORKFLOW_HOOK_TEST+x}"',
+        '_',
+        bashrcPath,
+      ],
+      {
+        HOME: tempDir,
+        SHELL: '/bin/bash',
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
+      }
+    );
+    assert.equal(
+      plainLegacyInlineSource.code,
+      0,
+      plainLegacyInlineSource.stderr || plainLegacyInlineSource.stdout
+    );
+    const plainClaude = await runProcess(
+      'bash',
+      ['--noprofile', '--rcfile', bashrcPath, '-ic', 'claude'],
+      {
+        HOME: tempDir,
+        SHELL: '/bin/bash',
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
+        ULTRATHINK_TEST_PLAIN_CLAUDE_ENV_PATH: plainClaudeEnvPath,
+      }
+    );
+    assert.equal(plainClaude.code, 0, plainClaude.stderr || plainClaude.stdout);
+    assert.deepEqual(JSON.parse(await fs.readFile(plainClaudeEnvPath, 'utf8')), {
+      baseUrl: '',
+      subagentModel: '',
+    });
     const sourceBashrc = await runProcess(
       'bash',
       [
@@ -6154,8 +6261,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
         bashrcPath,
       ],
       {
-        ...process.env,
-        HOME: tempDir,
+        ...legacyHookEnvironment,
         SHELL: '/bin/bash',
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
         CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
@@ -6186,6 +6292,48 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       }),
       'utf8'
     );
+    const cleanupHookState = path.join(tempDir, 'cleanup-hook-state');
+    const cleanupDefaultOverlayCommand = [
+      '. "$2"',
+      'test "$ANTHROPIC_BASE_URL" = http://127.0.0.1:4318',
+      'test "$ANTHROPIC_MODEL" = codex',
+      'test "$CLAUDE_CODE_DISABLE_TERMINAL_TITLE" = 1',
+      '. "$1"',
+      'test -z "${ANTHROPIC_API_KEY+x}"',
+      'test -z "${ANTHROPIC_AUTH_TOKEN+x}"',
+      'test -z "${ANTHROPIC_BASE_URL+x}"',
+      'test -z "${ANTHROPIC_MODEL+x}"',
+      'test -z "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_SET_NAMES+x}"',
+      'test -z "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_SET_NAMES+x}"',
+    ].join('; ');
+    const cleanupDefaultOverlay = await runProcess(
+      'bash',
+      [
+        '--noprofile',
+        '--norc',
+        '-c',
+        cleanupDefaultOverlayCommand,
+        '_',
+        sourceableHookPath,
+        managedOverlayPath,
+      ],
+      {
+        HOME: tempDir,
+        SHELL: '/bin/bash',
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: cleanupHookState,
+      }
+    );
+    assert.equal(
+      cleanupDefaultOverlay.code,
+      0,
+      cleanupDefaultOverlay.stderr || cleanupDefaultOverlay.stdout
+    );
+    await assert.rejects(
+      fs.access(path.join(cleanupHookState, 'claude-workflow-gateway.env'))
+    );
     const restoreManagedTitleCommand = [
       '. "$1"',
       'test -z "${ANTHROPIC_AUTH_TOKEN+x}"',
@@ -6200,6 +6348,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
       ...process.env,
       HOME: tempDir,
       SHELL: '/bin/bash',
+      CLAUDE_WORKFLOW_ENABLE_LEGACY_SHARED_SHELL_HOOK: '1',
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
       CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: failedHookState,
       CLAUDE_WORKFLOW_HOOK_FAIL: '1',
@@ -6354,8 +6503,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
           zshrcPath,
         ],
         {
-          ...process.env,
-          HOME: tempDir,
+          ...legacyHookEnvironment,
           SHELL: '/bin/zsh',
           PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
           CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: hookState,
@@ -6415,12 +6563,39 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     }
 
     const unsupported = await runProcess('bash', [daemonScript, 'install-shell'], {
-      ...process.env,
-      HOME: tempDir,
+      ...legacyHookEnvironment,
       SHELL: '/usr/bin/fish',
     });
     assert.equal(unsupported.code, 1);
     assert.match(unsupported.stderr, /unsupported shell fish/u);
+
+    const defaultInstall = await runProcess('bash', [daemonScript, 'install-shell'], {
+      ...process.env,
+      HOME: tempDir,
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(defaultInstall.code, 0, defaultInstall.stderr || defaultInstall.stdout);
+    assert.match(defaultInstall.stdout, /automatic shell routing is disabled/u);
+    const defaultZshrc = await fs.readFile(zshrcPath, 'utf8');
+    assert.equal(defaultZshrc.includes('>>> claude-workflow gateway >>>'), false);
+
+    const absentShellHome = path.join(tempDir, 'absent-shell-home');
+    await fs.mkdir(absentShellHome);
+    const absentDefaultInstall = await runProcess(
+      'bash',
+      [daemonScript, 'install-shell'],
+      {
+        ...process.env,
+        HOME: absentShellHome,
+        SHELL: '/bin/bash',
+      }
+    );
+    assert.equal(
+      absentDefaultInstall.code,
+      0,
+      absentDefaultInstall.stderr || absentDefaultInstall.stdout
+    );
+    await assert.rejects(fs.access(path.join(absentShellHome, '.bashrc')));
 
     const uninstall = await runProcess('bash', [daemonScript, 'uninstall-shell'], {
       ...process.env,
@@ -6430,7 +6605,7 @@ await runTest('claude-workflow daemon script installs shell hooks for the active
     assert.equal(uninstall.code, 0, uninstall.stderr || uninstall.stdout);
     const uninstalledZshrc = await fs.readFile(zshrcPath, 'utf8');
     assert.equal(uninstalledZshrc.includes('>>> claude-workflow gateway >>>'), false);
-    ok('shell hooks use the stable PATH command, refresh on upgrades, and uninstall cleanly');
+    ok('plain shells remain direct unless legacy shell routing is explicitly enabled');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -6472,7 +6647,7 @@ await runTest('gateway enforces auth for /v1 and exposes Claude-shaped model dis
   const runtime = createGatewayServer(gatewayConfig({
     port: gatewayPort,
     sharedSecret: 'test-secret',
-    exposedModels: ['claude-opus-4-8', 'claude-sonnet-4-7'],
+    exposedModels: ['claude-opus-5', 'claude-sonnet-4-7'],
     codex: {
       enabled: false,
     },
@@ -6491,7 +6666,7 @@ await runTest('gateway enforces auth for /v1 and exposes Claude-shaped model dis
     assert.equal(health.status, 200);
     const healthPayload = await health.json();
     assert.equal(healthPayload.display_routed_model, false);
-    assert.deepEqual(healthPayload.anthropic_passthrough_models, ['claude-opus-4-8*']);
+    assert.deepEqual(healthPayload.anthropic_passthrough_models, ['claude-opus-5*']);
 
     const unauthorized = await fetch(`http://127.0.0.1:${gatewayPort}/v1/models`);
     assert.equal(unauthorized.status, 401);
@@ -6505,7 +6680,7 @@ await runTest('gateway enforces auth for /v1 and exposes Claude-shaped model dis
       payload.data.map(function ids(model) {
         return model.id;
       }),
-      ['claude-opus-4-8', 'claude-sonnet-4-7']
+      ['claude-opus-5', 'claude-sonnet-4-7']
     );
     assert.match(payload.data[1].display_name, /Codex profile gpt-5\.6-terra\/low/u);
     ok('model discovery is Claude-shaped and auth-gated');
@@ -6605,7 +6780,7 @@ await runTest('gateway does not forward the shared secret to Anthropic passthrou
         id: 'msg_test',
         type: 'message',
         role: 'assistant',
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         content: [{ type: 'text', text: 'ok' }],
         stop_reason: 'end_turn',
         stop_sequence: null,
@@ -6620,7 +6795,7 @@ await runTest('gateway does not forward the shared secret to Anthropic passthrou
   const runtime = createGatewayServer(gatewayConfig({
     port: gatewayPort,
     sharedSecret: 'gateway-secret',
-    exposedModels: ['claude-opus-4-8'],
+    exposedModels: ['claude-opus-5'],
     openai: {
       apiKey: 'openai-key',
     },
@@ -6639,7 +6814,7 @@ await runTest('gateway does not forward the shared secret to Anthropic passthrou
         authorization: 'Bearer gateway-secret',
       }),
       body: JSON.stringify({
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         max_tokens: 128,
         messages: [{ role: 'user', content: 'hello' }],
       }),
@@ -6669,7 +6844,7 @@ await runTest('gateway preserves path prefixes when joining Anthropic upstream U
         id: 'msg_path_prefix',
         type: 'message',
         role: 'assistant',
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         content: [{ type: 'text', text: 'ok' }],
         stop_reason: 'end_turn',
         stop_sequence: null,
@@ -6683,7 +6858,7 @@ await runTest('gateway preserves path prefixes when joining Anthropic upstream U
   const gatewayPort = await freePort();
   const runtime = createGatewayServer(gatewayConfig({
     port: gatewayPort,
-    exposedModels: ['claude-opus-4-8'],
+    exposedModels: ['claude-opus-5'],
     openai: {
       apiKey: 'openai-key',
     },
@@ -6700,7 +6875,7 @@ await runTest('gateway preserves path prefixes when joining Anthropic upstream U
       method: 'POST',
       headers: jsonHeaders(),
       body: JSON.stringify({
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         max_tokens: 128,
         messages: [{ role: 'user', content: 'hello' }],
       }),
@@ -6708,7 +6883,7 @@ await runTest('gateway preserves path prefixes when joining Anthropic upstream U
 
     assert.equal(response.status, 200);
     assert.equal(capturedUrl, '/proxy/v1/messages');
-    assert.equal(capturedBody.model, 'claude-opus-4-8');
+    assert.equal(capturedBody.model, 'claude-opus-5');
     ok('Anthropic passthrough keeps configured upstream base path prefixes');
   } finally {
     await runtime.close();
@@ -6733,7 +6908,7 @@ await runTest('gateway honors HTTP_PROXY and NO_PROXY for upstream JSON requests
         id: 'msg_proxy',
         type: 'message',
         role: 'assistant',
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         content: [{ type: 'text', text: 'proxied ok' }],
         stop_reason: 'end_turn',
         stop_sequence: null,
@@ -6773,7 +6948,7 @@ await runTest('gateway honors HTTP_PROXY and NO_PROXY for upstream JSON requests
   function createAnthropicProxyGateway(port) {
     return createGatewayServer(gatewayConfig({
       port,
-      exposedModels: ['claude-opus-4-8'],
+      exposedModels: ['claude-opus-5'],
       openai: {
         apiKey: 'openai-key',
       },
@@ -6789,7 +6964,7 @@ await runTest('gateway honors HTTP_PROXY and NO_PROXY for upstream JSON requests
       method: 'POST',
       headers: jsonHeaders(),
       body: JSON.stringify({
-        model: 'claude-opus-4-8',
+        model: 'claude-opus-5',
         max_tokens: 128,
         messages: [{ role: 'user', content }],
       }),
@@ -6864,7 +7039,7 @@ await runTest('gateway rejects unsupported proxy URL schemes clearly', async fun
     async function assertUnsupportedProxyScheme() {
       const runtime = createGatewayServer(gatewayConfig({
         port: gatewayPort,
-        exposedModels: ['claude-opus-4-8'],
+        exposedModels: ['claude-opus-5'],
         openai: {
           apiKey: 'openai-key',
         },
@@ -6880,7 +7055,7 @@ await runTest('gateway rejects unsupported proxy URL schemes clearly', async fun
           method: 'POST',
           headers: jsonHeaders(),
           body: JSON.stringify({
-            model: 'claude-opus-4-8',
+            model: 'claude-opus-5',
             max_tokens: 128,
             messages: [{ role: 'user', content: 'hello unsupported proxy' }],
           }),
@@ -7171,7 +7346,7 @@ await runTest(
           "    method: 'POST',\n" +
           "    headers: { 'content-type': 'application/json' },\n" +
           '    body: JSON.stringify({\n' +
-          "      model: 'claude-opus-4-8[1m]',\n" +
+          "      model: 'claude-opus-5[1m]',\n" +
           "      messages: [{ role: 'user', content: 'Use the 1m alias.' }],\n" +
           '    }),\n' +
           '  });\n' +
@@ -7194,9 +7369,9 @@ await runTest(
           ...CLEAN_WORKFLOW_ENV,
           PATH: `${tempDir}:${process.env.PATH || ''}`,
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
-          ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-4-8[1m]',
+          ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-5[1m]',
           ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'anthropic',
-          ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-opus-4-8*',
+          ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-opus-5*',
           ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'anthropic-key',
           ULTRATHINK_GATEWAY_ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropicPort}`,
           ULTRATHINK_TEST_CLAUDE_RESPONSE_PATH: responsePath,
@@ -7208,8 +7383,8 @@ await runTest(
       assert.equal(result.code, 0);
       const payload = JSON.parse(await fs.readFile(responsePath, 'utf8'));
       assert.equal(seenBodies.length, 1);
-      assert.equal(seenBodies[0].model, 'claude-opus-4-8');
-      assert.equal(payload.model, 'claude-opus-4-8');
+      assert.equal(seenBodies[0].model, 'claude-opus-5');
+      assert.equal(payload.model, 'claude-opus-5');
       ok('claude-workflow preserves the [1m] client alias while sending the plain Anthropic API id upstream');
     } finally {
       await closeServer(anthropicServer);
@@ -7224,6 +7399,7 @@ await runTest(
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-display-model-'));
     const claudePath = path.join(tempDir, 'claude');
     const codexPath = path.join(tempDir, 'codex-wrapper');
+    const workflowHome = path.join(tempDir, 'home');
 
     async function runLauncherWithDisplayEnv(captureName, envOverrides = {}) {
       const healthPath = path.join(tempDir, captureName);
@@ -7233,6 +7409,8 @@ await runTest(
         {
           ...process.env,
           ...CLEAN_WORKFLOW_ENV,
+          HOME: workflowHome,
+          USERPROFILE: workflowHome,
           PATH: `${tempDir}:${process.env.PATH || ''}`,
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
           ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL: '',
@@ -7253,7 +7431,7 @@ await runTest(
         envOverrides
       );
 
-      assert.equal(result.code, 0);
+      assert.equal(result.code, 0, result.stderr || result.stdout);
       return JSON.parse(await fs.readFile(healthPath, 'utf8'));
     }
 
@@ -7264,6 +7442,12 @@ await runTest(
     }
 
     try {
+      await fs.mkdir(workflowHome);
+      await fs.writeFile(
+        path.join(workflowHome, '.claude.json'),
+        '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n',
+        { mode: 0o600 }
+      );
       await makeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
@@ -7322,7 +7506,7 @@ await runTest(
         ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: 'deepseek-key',
         ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: 'deepseek-v4-pro',
         ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'max',
-        ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-fable-5-20260601',
+        ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-opus-5-20260724',
       });
       const glmMainHealth = await runWithDisplayEnv('glm-main-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'glm-5.2[1m]',
@@ -7346,20 +7530,20 @@ await runTest(
       assert.equal(defaultHealth.health.display_routed_model, true);
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
       assert.equal(defaultHealth.autoCompactWindow, '');
-      // The launcher now defaults the frontier main model to Fable 5 1m and keeps
-      // the Fable 5 family on Anthropic; lower-tier Claude ids route to Codex Terra.
+      // The launcher now defaults the main model to Opus 5 1m and keeps
+      // the Opus 5 family on Anthropic; lower-tier Claude ids route to Codex Terra.
       assert.deepEqual(
         defaultHealth.health.anthropic_passthrough_models,
-        ['claude-fable-5*']
+        ['claude-opus-5*']
       );
       assert.equal(
-        defaultHealth.health.exposed_models.includes('claude-fable-5[1m]'),
+        defaultHealth.health.exposed_models.includes('claude-opus-5[1m]'),
         true
       );
       assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.6-terra');
       assert.equal(defaultHealth.health.codex_reasoning_effort, 'max');
       assert.match(
-        modelDisplayName(defaultHealth, 'claude-opus-4-8') || '',
+        modelDisplayName(defaultHealth, 'claude-sonnet-4-7') || '',
         /Codex gpt-5\.6-terra/u
       );
       assert.equal(optedOutHealth.health.display_routed_model, false);
@@ -7386,15 +7570,15 @@ await runTest(
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
       assert.equal(deepSeekMainHealth.autoCompactWindow, '');
       assert.equal(
-        modelDisplayName(deepSeekMainHealth, 'claude-fable-5[1m]'),
+        modelDisplayName(deepSeekMainHealth, 'claude-opus-5[1m]'),
         'DeepSeek Main Route'
       );
       assert.equal(
-        modelDisplayName(deepSeekMainHealth, 'claude-fable-5'),
+        modelDisplayName(deepSeekMainHealth, 'claude-opus-5'),
         'DeepSeek Main Route'
       );
       assert.equal(
-        modelDisplayName(deepSeekMainHealth, 'claude-fable-5-20260601'),
+        modelDisplayName(deepSeekMainHealth, 'claude-opus-5-20260724'),
         'DeepSeek Main Route'
       );
       assert.equal(glmMainHealth.health.glm_model, 'glm-5.2');
@@ -7685,7 +7869,7 @@ await runTest(
         'claude-one-shot-json-args.json'
       );
       const variadicPassthroughArgs = await runWithArgs(
-        ['--', '--add-dir', 'first', 'second', '--background', '--worktree'],
+        ['--', '--add-dir', 'first', 'second', '--verbose', '--worktree'],
         'claude-variadic-passthrough-args.json'
       );
       const nativeDelimiterArgs = await runWithArgs(
@@ -7742,7 +7926,7 @@ await runTest(
         '--add-dir',
         'first',
         'second',
-        '--background',
+        '--verbose',
         '--worktree',
       ]);
       assert.deepEqual(nativeDelimiterArgs.slice(-2), ['--', '--model']);
@@ -7792,7 +7976,7 @@ await runTest(
 
       const modelOverrideResult = await runProcess(
         'node',
-        ['js/cli/claude-workflow.js', '--', '--model', 'claude-opus-4-8'],
+        ['js/cli/claude-workflow.js', '--', '--model', 'claude-opus-5'],
         {
           ...process.env,
           ...CLEAN_WORKFLOW_ENV,
@@ -9976,7 +10160,7 @@ await runTest(
   }
 );
 
-await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic', async function testAnthropicPassthrough() {
+await runTest('gateway proxies Opus 5 requests and token counts to Anthropic', async function testAnthropicPassthrough() {
   const anthropicPort = await freePort();
   const seen = {
     messages: [],
@@ -10021,7 +10205,7 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
   const gatewayPort = await freePort();
   const runtime = createGatewayServer(gatewayConfig({
     port: gatewayPort,
-    exposedModels: ['claude-opus-4-8', 'claude-opus-4-8[1m]'],
+    exposedModels: ['claude-opus-5', 'claude-opus-5[1m]'],
     openai: {
       apiKey: 'openai-key',
     },
@@ -10034,7 +10218,7 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
   await waitForListening(runtime.server);
 
   try {
-    for (const modelId of ['claude-opus-4-8', 'claude-opus-4-8[1m]']) {
+    for (const modelId of ['claude-opus-5', 'claude-opus-5[1m]']) {
       const messageResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
         method: 'POST',
         headers: jsonHeaders(),
@@ -10045,7 +10229,7 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
       });
       assert.equal(messageResponse.status, 200);
       const messagePayload = await messageResponse.json();
-      assert.equal(messagePayload.model, 'claude-opus-4-8');
+      assert.equal(messagePayload.model, 'claude-opus-5');
 
       const tokenResponse = await fetch(
         `http://127.0.0.1:${gatewayPort}/v1/messages/count_tokens`,
@@ -10067,15 +10251,15 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
       seen.messages.map(function messageModel(body) {
         return body.model;
       }),
-      ['claude-opus-4-8', 'claude-opus-4-8']
+      ['claude-opus-5', 'claude-opus-5']
     );
     assert.deepEqual(
       seen.countTokens.map(function tokenCountModel(body) {
         return body.model;
       }),
-      ['claude-opus-4-8', 'claude-opus-4-8']
+      ['claude-opus-5', 'claude-opus-5']
     );
-    ok('Opus 4.8 passthrough works for base and [1m] aliases in messages and count_tokens');
+    ok('Opus 5 passthrough works for base and [1m] aliases in messages and count_tokens');
   } finally {
     await runtime.close();
     await closeServer(anthropicServer);

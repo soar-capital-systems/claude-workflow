@@ -4,6 +4,14 @@
 
 ### Added
 
+- First-class Alibaba Qwen 3.8 Max routing. `config --main qwen` selects the
+  `qwen3.8-max[1m]` client alias, exact `qwen3.8-max` upstream model,
+  983,616-token context, 131,072-token answer cap, and xhigh reasoning through
+  the Token Plan OpenAI-compatible endpoint.
+- Qwen contract coverage for streamed reasoning, parallel tools, strict
+  reasoning replay, Token Plan credential pairing, rate-limit headers,
+  conservative local token counts, 12,000-line tool results, and an installed
+  Claude clean-home tool loop.
 - Direct Codex main routing through `claude-workflow config --main codex`, using
   the configured Codex model and reasoning effort without an Anthropic parent
   or login. Clean-home setup supplies private local gateway authentication and
@@ -21,6 +29,13 @@
 
 ### Changed
 
+- Opus 5 is the default main route. Fable remains available with
+  `claude-workflow config --main fable`.
+- Direct non-Anthropic routes disable Claude Code's automatic terminal-title
+  request. Protocol conversion is local and does not add a model inference;
+  only genuine tool continuations add provider turns.
+- Shared-daemon installation and upgrades use explicit managed-state ownership,
+  current-runtime reconciliation, and self-contained global-install checks.
 - Codex final-answer selection is local and phase-aware. Commentary and
   superseded assistant messages are excluded, and dynamic-tool boundaries
   settle on the next event-loop turn without another inference or fixed delay.

@@ -12,11 +12,15 @@ const PACKAGE_PATH_PARTS = PACKAGE_NAME.split('/');
 const PACKAGE_METADATA = JSON.parse(await fs.readFile(path.join(ROOT, 'package.json'), 'utf8'));
 const WORKFLOW_ENV_PREFIXES = [
   'ANTHROPIC_',
+  'BAILIAN_',
   'CLAUDE_WORKFLOW_',
   'CODEX_',
+  'DASHSCOPE_',
   'DEEPSEEK_',
   'GLM_',
   'KIMI_',
+  'OPENAI_',
+  'QWEN_',
   'ULTRATHINK_',
   'ZAI_',
 ];
@@ -74,7 +78,11 @@ try {
     'SECURITY.md',
     'SUPPORT.md',
     'docs/LARGE_FILES_AND_DIFFS.md',
+    'js/cli/claude-workflow-managed-state.js',
+    'js/gateway/provider-profiles.js',
     'scripts/claude-workflow-daemon.sh',
+    'scripts/reconcile-installed-daemon.mjs',
+    'scripts/validate-local-install.mjs',
   ]) {
     assert.equal(packedPaths.has(requiredPath), true, `tarball is missing ${requiredPath}`);
   }
@@ -127,19 +135,31 @@ try {
 
   const globalPrefix = path.join(temporaryRoot, 'global-prefix');
   const globalHome = path.join(temporaryRoot, 'global-home');
+  const qwenHome = path.join(temporaryRoot, 'qwen-home');
   const globalState = path.join(temporaryRoot, 'global-state');
   await fs.mkdir(globalHome);
-  run('npm', [
-    'install',
-    '--global',
-    '--install-links',
-    '--prefer-offline',
-    '--no-audit',
-    '--no-fund',
-    '--prefix',
-    globalPrefix,
-    tarball,
-  ]);
+  await fs.mkdir(qwenHome);
+  run(
+    'npm',
+    [
+      'install',
+      '--global',
+      '--install-links',
+      '--prefer-offline',
+      '--no-audit',
+      '--no-fund',
+      '--prefix',
+      globalPrefix,
+      tarball,
+    ],
+    {
+      env: isolatedWorkflowEnvironment({
+        HOME: globalHome,
+        USERPROFILE: globalHome,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: globalState,
+      }),
+    }
+  );
 
   if (process.platform !== 'win32') {
     const globalPackage = path.join(
@@ -172,6 +192,18 @@ try {
   assert.equal(versionResult.stdout.trim(), packMetadata.version);
   run(workflowBin, ['setup', '--help']);
   run(workflowBin, ['config', '--help']);
+  const qwenConfigResult = run(workflowBin, ['config', '--main', 'qwen'], {
+    env: isolatedWorkflowEnvironment({ HOME: qwenHome, USERPROFILE: qwenHome }),
+  });
+  assert.match(qwenConfigResult.stdout, /ULTRATHINK_GATEWAY_QWEN_API_KEY/u);
+  const qwenConfigPath = path.join(qwenHome, '.claude-workflow.env');
+  const qwenConfig = await fs.readFile(qwenConfigPath, 'utf8');
+  assert.match(qwenConfig, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=qwen/u);
+  assert.match(qwenConfig, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max\[1m\]/u);
+  assert.doesNotMatch(qwenConfig, /API_KEY=/u);
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(qwenConfigPath)).mode & 0o777, 0o600);
+  }
 
   if (process.platform !== 'win32') {
     const fakeBin = path.join(temporaryRoot, 'fake-native-bin');

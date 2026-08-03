@@ -1,18 +1,10 @@
 import process from 'node:process';
 
+import { GATEWAY_PROVIDER_CREDENTIAL_ENV_NAMES } from '../gateway/provider-profiles.js';
+
 export const GATEWAY_ONLY_CREDENTIAL_ENV_NAMES = Object.freeze([
-  'DEEPSEEK_API_KEY',
-  'GLM_API_KEY',
-  'KIMI_API_KEY',
-  'OPENAI_API_KEY',
-  'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY',
-  'ULTRATHINK_GATEWAY_CODEX_API_KEY',
-  'ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY',
-  'ULTRATHINK_GATEWAY_GLM_API_KEY',
-  'ULTRATHINK_GATEWAY_KIMI_API_KEY',
-  'ULTRATHINK_GATEWAY_OPENAI_API_KEY',
+  ...GATEWAY_PROVIDER_CREDENTIAL_ENV_NAMES,
   'ULTRATHINK_GATEWAY_SHARED_SECRET',
-  'ZAI_API_KEY',
 ]);
 
 export const MANAGED_GATEWAY_AUTH_ENV_NAME =
@@ -41,6 +33,15 @@ const ANTHROPIC_CLIENT_AUTH_ENV_NAMES = Object.freeze([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_API_KEY',
 ]);
+const LEGACY_WORKFLOW_MODEL_ENV_NAMES = Object.freeze([
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+]);
+const LEGACY_WORKFLOW_GATEWAY_URL = 'http://127.0.0.1:4318';
+const LEGACY_WORKFLOW_AGENT_MODEL = 'codex-terra';
+const LEGACY_WORKFLOW_MAIN_MODEL = 'claude-fable-5[1m]';
 
 function workflowEnvironmentNames(value) {
   return new Set(
@@ -96,8 +97,40 @@ export function environmentWithoutManagedWorkflowEnvironment(env = process.env) 
   return childEnv;
 }
 
-export function environmentWithoutManagedGatewayAuth(env = process.env) {
+export function environmentWithoutLegacyWorkflowRouting(env = process.env) {
   const childEnv = environmentWithoutManagedWorkflowEnvironment(env);
+  const hasLegacySignature =
+    childEnv.ANTHROPIC_BASE_URL === LEGACY_WORKFLOW_GATEWAY_URL &&
+    LEGACY_WORKFLOW_MODEL_ENV_NAMES.some(
+      (name) => childEnv[name] === LEGACY_WORKFLOW_AGENT_MODEL
+    );
+  if (!hasLegacySignature) {
+    return childEnv;
+  }
+
+  delete childEnv.ANTHROPIC_BASE_URL;
+  for (const name of LEGACY_WORKFLOW_MODEL_ENV_NAMES) {
+    if (childEnv[name] === LEGACY_WORKFLOW_AGENT_MODEL) {
+      delete childEnv[name];
+    }
+  }
+  if (
+    childEnv.ANTHROPIC_MODEL === 'codex' ||
+    childEnv.ANTHROPIC_MODEL === LEGACY_WORKFLOW_MAIN_MODEL
+  ) {
+    delete childEnv.ANTHROPIC_MODEL;
+  }
+  if (childEnv.ANTHROPIC_DEFAULT_FABLE_MODEL === LEGACY_WORKFLOW_MAIN_MODEL) {
+    delete childEnv.ANTHROPIC_DEFAULT_FABLE_MODEL;
+  }
+  if (childEnv.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY === '0') {
+    delete childEnv.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY;
+  }
+  return childEnv;
+}
+
+export function environmentWithoutManagedGatewayAuth(env = process.env) {
+  const childEnv = environmentWithoutLegacyWorkflowRouting(env);
   const managedToken = childEnv[MANAGED_GATEWAY_AUTH_ENV_NAME];
   if (typeof managedToken === 'string' && managedToken !== '') {
     for (const name of ANTHROPIC_CLIENT_AUTH_ENV_NAMES) {

@@ -4,12 +4,12 @@
  * Shared claude-workflow gateway daemon.
  *
  * Runs the same workflow-routing gateway the `claude-workflow` launcher
- * spawns per session, but on a fixed localhost port so that plain, resumed,
- * and background Claude Code sessions can route through it via exported env
- * (see scripts/claude-workflow-daemon.sh and scripts/claude-workflow-gateway.bashrc).
+ * spawns per session, but on a fixed localhost port for explicitly configured
+ * local clients. It never changes plain Claude Code sessions through shell
+ * startup configuration.
  * On listen it publishes the env exports to
  * ${XDG_STATE_HOME:-~/.cache}/claude-workflow/claude-workflow-gateway.env
- * for shells to source.
+ * for explicit integrations to consume.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -39,6 +39,12 @@ import {
   envString,
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
+import {
+  MANAGED_ENV_BASENAME,
+  claimManagedState,
+  validateManagedStatePaths,
+  verifyManagedArtifactForReplacement,
+} from './claude-workflow-managed-state.js';
 
 const DEFAULT_DAEMON_PORT = 4318;
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
@@ -72,20 +78,34 @@ export function daemonPort() {
   return parsed;
 }
 
-function envFilePath() {
-  const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
-  if (configuredTarget) {
-    if (!path.isAbsolute(configuredTarget)) {
-      throw new Error('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be an absolute path');
-    }
-    return configuredTarget;
-  }
-
+function managedStateConfiguration() {
   const stateHome = envString('XDG_STATE_HOME') || path.join(os.homedir(), '.cache');
   if (!path.isAbsolute(stateHome)) {
     throw new Error('XDG_STATE_HOME must be an absolute path');
   }
-  return path.join(stateHome, 'claude-workflow', 'claude-workflow-gateway.env');
+  const canonicalStateDirectory = path.join(stateHome, 'claude-workflow');
+  const legacyStateDirectory = path.join(os.homedir(), '.cache', 'ultrathink');
+  let stateDirectory = envString('CLAUDE_WORKFLOW_GATEWAY_STATE_DIR');
+  if (!stateDirectory) {
+    const legacyHasPriorState =
+      !fs.existsSync(canonicalStateDirectory) &&
+      (fs.existsSync(path.join(legacyStateDirectory, 'claude-workflow-gateway.pid')) ||
+        fs.existsSync(path.join(legacyStateDirectory, MANAGED_ENV_BASENAME)) ||
+        fs.existsSync(path.join(legacyStateDirectory, '.claude-workflow-gateway.owner')));
+    stateDirectory = legacyHasPriorState ? legacyStateDirectory : canonicalStateDirectory;
+  }
+
+  const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
+  const environmentFile =
+    configuredTarget || path.join(stateDirectory, MANAGED_ENV_BASENAME);
+  validateManagedStatePaths(stateDirectory, environmentFile);
+  const kind =
+    stateDirectory === canonicalStateDirectory
+      ? 'canonical'
+      : stateDirectory === legacyStateDirectory
+        ? 'legacy'
+        : 'custom';
+  return { environmentFile, kind, stateDirectory };
 }
 
 export function quotePosixShellValue(value) {
@@ -216,6 +236,58 @@ export function managedWorkflowEnvironmentCleanupShell() {
     '}',
     '_claude_workflow_gateway_restore_environment || :',
     'unset -f _claude_workflow_gateway_restore_environment 2>/dev/null || :',
+  ].join('\n');
+}
+
+export function markerlessWorkflowEnvironmentCleanupShell() {
+  return [
+    '_claude_workflow_gateway_cleanup_markerless_environment() {',
+    '  case $- in',
+    '    *x*) _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE=1; set +x ;;',
+    '    *) _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE=0 ;;',
+    '  esac',
+    '  _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE=0',
+    '  if [ "${ANTHROPIC_BASE_URL-}" = http://127.0.0.1:4318 ] && {',
+    '    [ "${CLAUDE_CODE_SUBAGENT_MODEL-}" = codex-terra ] ||',
+    '      [ "${ANTHROPIC_DEFAULT_SONNET_MODEL-}" = codex-terra ] ||',
+    '      [ "${ANTHROPIC_DEFAULT_HAIKU_MODEL-}" = codex-terra ] ||',
+    '      [ "${ANTHROPIC_DEFAULT_OPUS_MODEL-}" = codex-terra ]',
+    '  }; then',
+    '    _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE=1',
+    '  fi',
+    '  if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE" = 1 ]; then',
+    '    unset ANTHROPIC_BASE_URL 2>/dev/null || :',
+    '    for _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME in CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do',
+    '      eval "_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE=\\${${_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME}-}"',
+    '      if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE" = codex-terra ]; then',
+    '        unset "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME" 2>/dev/null || :',
+    '      fi',
+    '    done',
+    '    case "${ANTHROPIC_MODEL-}" in',
+    '      codex|\'claude-fable-5[1m]\') unset ANTHROPIC_MODEL 2>/dev/null || : ;;',
+    '    esac',
+    '    if [ "${ANTHROPIC_DEFAULT_FABLE_MODEL-}" = \'claude-fable-5[1m]\' ]; then',
+    '      unset ANTHROPIC_DEFAULT_FABLE_MODEL 2>/dev/null || :',
+    '    fi',
+    '    if [ "${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY-}" = 0 ]; then',
+    '      unset CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 2>/dev/null || :',
+    '    fi',
+    '  fi',
+    '  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE 2>/dev/null || :',
+    '  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME 2>/dev/null || :',
+    '  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE 2>/dev/null || :',
+    '  if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE" = 1 ]; then',
+    '    unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE 2>/dev/null || :',
+    '    set -x',
+    '  else',
+    '    unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE 2>/dev/null || :',
+    '  fi',
+    '  return 0',
+    '}',
+    'if [ "${_CLAUDE_WORKFLOW_GATEWAY_HAD_MANAGED_OVERLAY:-0}" != 1 ]; then',
+    '  _claude_workflow_gateway_cleanup_markerless_environment || :',
+    'fi',
+    'unset -f _claude_workflow_gateway_cleanup_markerless_environment 2>/dev/null || :',
   ].join('\n');
 }
 
@@ -366,61 +438,40 @@ export function serializeWorkflowEnvironment(clientEnv) {
   return `${xtraceGuard.join('\n')}\n${managedWorkflowEnvironmentCleanupShell()}\n${managedAuthCleanup.join('\n')}\n${managedTerminalTitleCleanup.join('\n')}\n${snapshotLines.join('\n')}\n${applyLines.join('\n')}\n${xtraceRestore.join('\n')}\n`;
 }
 
-function ensureEnvironmentDirectory(directory, hardenExistingDirectory) {
-  const existed = fs.existsSync(directory);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  let stats = fs.lstatSync(directory);
-  if (stats.isSymbolicLink() || !stats.isDirectory()) {
-    throw new Error(`workflow environment directory must be a real directory: ${directory}`);
-  }
-  if (!existed || hardenExistingDirectory) {
-    fs.chmodSync(directory, 0o700);
-    stats = fs.lstatSync(directory);
-    if ((stats.mode & 0o077) !== 0) {
-      throw new Error(
-        `workflow environment directory does not enforce owner-only permissions: ${directory}. ` +
-          'On WSL, use the Linux filesystem or enable DrvFS metadata.'
-      );
-    }
-  } else if ((stats.mode & 0o077) !== 0) {
-    throw new Error(
-      `custom workflow environment directory must not be accessible by group or other users: ${directory}`
-    );
-  }
-}
-
 export function writeWorkflowEnvironmentFile(
   targetPath,
   clientEnv,
-  { hardenExistingDirectory = true } = {}
+  { stateKind = 'custom' } = {}
 ) {
-  const target = path.resolve(targetPath);
+  const target = targetPath;
   const directory = path.dirname(target);
-  ensureEnvironmentDirectory(directory, hardenExistingDirectory);
+  validateManagedStatePaths(directory, target);
+  claimManagedState(directory, {
+    kind: stateKind,
+    allowMigration: stateKind !== 'custom',
+  });
+  verifyManagedArtifactForReplacement(directory, path.basename(target));
 
   const tempPath = path.join(
     directory,
     `.${path.basename(target)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
   );
   let descriptor = null;
-  let published = false;
   try {
     descriptor = fs.openSync(tempPath, 'wx', 0o600);
     fs.writeFileSync(descriptor, serializeWorkflowEnvironment(clientEnv), 'utf8');
     fs.fchmodSync(descriptor, 0o600);
+    const tempStats = fs.fstatSync(descriptor);
+    if (!tempStats.isFile() || (tempStats.mode & 0o077) !== 0) {
+      throw new Error(
+        `workflow environment file does not enforce owner-only permissions: ${tempPath}. ` +
+          'On WSL, use the Linux filesystem or enable DrvFS metadata.'
+      );
+    }
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = null;
     fs.renameSync(tempPath, target);
-    published = true;
-    fs.chmodSync(target, 0o600);
-    const targetStats = fs.lstatSync(target);
-    if (!targetStats.isFile() || targetStats.isSymbolicLink() || (targetStats.mode & 0o077) !== 0) {
-      throw new Error(
-        `workflow environment file does not enforce owner-only permissions: ${target}. ` +
-          'On WSL, use the Linux filesystem or enable DrvFS metadata.'
-      );
-    }
     return target;
   } catch (error) {
     if (descriptor !== null) {
@@ -431,7 +482,7 @@ export function writeWorkflowEnvironmentFile(
       }
     }
     try {
-      fs.unlinkSync(published ? target : tempPath);
+      fs.unlinkSync(tempPath);
     } catch (cleanupError) {
       if (cleanupError?.code !== 'ENOENT') {
         // Preserve the original write error.
@@ -442,8 +493,7 @@ export function writeWorkflowEnvironmentFile(
 }
 
 function writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId) {
-  const configuredTarget = envString('CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
-  const target = envFilePath();
+  const { environmentFile: target, kind } = managedStateConfiguration();
   const clientEnv = buildWorkflowClientEnv(
     config,
     gatewayBaseUrl,
@@ -451,10 +501,7 @@ function writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId) {
     mainModelId
   );
   return writeWorkflowEnvironmentFile(target, clientEnv, {
-    // The default cache directory belongs exclusively to this daemon. An
-    // explicit custom path may live in a broader user-managed directory, so
-    // do not silently chmod that existing directory.
-    hardenExistingDirectory: !configuredTarget,
+    stateKind: kind,
   });
 }
 

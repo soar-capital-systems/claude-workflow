@@ -11,6 +11,8 @@ Several independent limits apply to one review:
 
 - Claude Code can reject an oversized Read result before the gateway receives
   it. Line count, token count, and a dense single line can each trigger this.
+- The gateway accepts JSON request bodies up to 20 MiB. This is separate from
+  provider context limits and can bind first for unusually large tool results.
 - Codex and the gateway may shorten tool output before it enters model history.
   An omission marker identifies an unseen gap; it is not a continuation cursor.
 - A context window counts the complete conversation, including system
@@ -21,11 +23,18 @@ Several independent limits apply to one review:
   bytes, so the byte limit can bind first. See Kimi's
   [model reference](https://www.kimi.com/code/docs/en/kimi-code/models.html) and
   [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
+- Qwen 3.8 Max exposes a 983,616-token client context and a 131,072-token
+  answer cap. Its `xhigh` setting can use up to 262,144 thinking tokens, so a
+  large review still needs room for reasoning, tools, and the final report.
 
 Kimi Code does not document an Anthropic-compatible token-count endpoint. For
 Kimi routes, the gateway answers Claude Code's count request locally with a
 conservative UTF-8 byte estimate. This is a compaction signal, not an exact
 provider token count.
+
+The Qwen Token Plan route uses the same conservative local counting policy;
+Alibaba does not expose a compatible count endpoint for this workflow. The
+estimate makes no provider call and must not be treated as a billing count.
 
 ## Gateway guarantees
 
@@ -46,6 +55,9 @@ Claude Workflow applies the following rules:
    threads disable native shell and patch access and use Claude-provided tools,
    preventing the daemon's startup directory from leaking into another
    repository.
+7. Qwen tool-result translation does not add a gateway byte cap. Contract tests
+   carry a 12,000-line result through the continuation unchanged, but Claude's
+   own Read paging and the provider's context limits still apply.
 
 These guarantees prevent silent loss. They do not prove that every line was
 reviewed; coverage still has to be recorded.

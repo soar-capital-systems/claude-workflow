@@ -5,10 +5,13 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
+import { claimManagedState } from '../js/cli/claude-workflow-managed-state.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
+import { environmentWithoutManagedGatewayAuth } from '../js/utils/child-env.js';
 
 const DAEMON_SCRIPT = path.resolve('scripts/claude-workflow-daemon.sh');
 const DAEMON_JS = path.resolve('js/cli/claude-workflow-daemon.js');
+const POSTINSTALL_SCRIPT = path.resolve('scripts/reconcile-installed-daemon.mjs');
 
 function freePort() {
   return new Promise(function reservePort(resolve, reject) {
@@ -90,6 +93,12 @@ async function readHealth(port) {
   return response.json();
 }
 
+async function daemonFailureOutput(result, stateDir) {
+  const logPath = path.join(stateDir, 'claude-workflow-gateway.log');
+  const log = await fs.readFile(logPath, 'utf8').catch(() => '');
+  return [result.stderr, result.stdout, log].filter(Boolean).join('\n');
+}
+
 async function stopDaemon(env, pidFile) {
   let pid = 0;
   try {
@@ -141,13 +150,17 @@ async function testDaemonRevisionAndHealth() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-daemon-revision-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
   const revisionFile = path.join(stateDir, 'claude-workflow-gateway.revision');
-  const envFile = path.join(stateDir, 'gateway.env');
+  const envFile = path.join(stateDir, 'claude-workflow-gateway.env');
   const traceDir = path.join(stateDir, 'gateway-trace');
   const port = await freePort();
   const env = {
     ...process.env,
+    BAILIAN_TOKEN_PLAN_API_KEY: '',
     CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
     CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    DASHSCOPE_API_KEY: '',
+    QWEN_API_KEY: '',
+    ULTRATHINK_GATEWAY_QWEN_API_KEY: '',
     ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
   };
   delete env.ULTRATHINK_GATEWAY_TRACE_DIR;
@@ -155,6 +168,11 @@ async function testDaemonRevisionAndHealth() {
   delete env.ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT;
 
   try {
+    const stoppedReconcile = await runProcess('bash', [DAEMON_SCRIPT, 'reconcile'], env);
+    assert.equal(stoppedReconcile.code, 0, stoppedReconcile.stderr || stoppedReconcile.stdout);
+    assert.match(stoppedReconcile.stdout, /no running owned daemon to reconcile/u);
+    await assert.rejects(fs.access(pidFile));
+
     const start = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
     assert.equal(start.code, 0, start.stderr || start.stdout);
     const firstPid = await readPid(pidFile);
@@ -186,14 +204,26 @@ async function testDaemonRevisionAndHealth() {
     assert.equal(typeof firstHealth.codex_tool_result_window_max_bytes, 'number');
     assert.equal(typeof firstHealth.codex_auto_compact_token_limit, 'number');
     assert.equal(typeof firstHealth.codex_auto_compact_token_limit_scope, 'string');
+    assert.equal(firstHealth.qwen_model, 'qwen3.8-max');
+    assert.equal(firstHealth.qwen_reasoning_effort, 'xhigh');
+    assert.equal(firstHealth.qwen_context_tokens, 983_616);
+    assert.equal(firstHealth.qwen_max_output_tokens, 131_072);
+    assert.equal(firstHealth.qwen_key_configured, false);
+
+    const currentReconcile = await runProcess('bash', [DAEMON_SCRIPT, 'reconcile'], env);
+    assert.equal(currentReconcile.code, 0, currentReconcile.stderr || currentReconcile.stdout);
+    assert.match(currentReconcile.stdout, /already running current revision/u);
+    assert.match(currentReconcile.stdout, /matches the installed runtime revision/u);
+    assert.equal(await readPid(pidFile), firstPid);
 
     const changedEnvironment = {
       ...env,
-      GLM_BASE_URL: 'https://revision-test.invalid/v1',
+      BAILIAN_TOKEN_PLAN_API_KEY: 'sk-sp-test-revision-key',
     };
-    const restart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], changedEnvironment);
+    const restart = await runProcess('bash', [DAEMON_SCRIPT, 'reconcile'], changedEnvironment);
     assert.equal(restart.code, 0, restart.stderr || restart.stdout);
     assert.match(restart.stdout, /healthy daemon is stale; restarting/u);
+    assert.match(restart.stdout, /matches the installed runtime revision/u);
     const secondPid = await readPid(pidFile);
     assert.notEqual(secondPid, firstPid);
     await waitForCondition(function oldProcessExited() {
@@ -204,13 +234,19 @@ async function testDaemonRevisionAndHealth() {
     const secondHealth = await readHealth(port);
     assert.equal(secondHealth.runtime_revision, secondRevision);
     assert.equal(secondHealth.runtime_pid, secondPid);
+    assert.equal(secondHealth.qwen_key_configured, true);
+    assert.equal(JSON.stringify(secondHealth).includes('sk-sp-test-revision-key'), false);
 
     const thinkingEnvironment = {
       ...changedEnvironment,
       ULTRATHINK_THINKING_LEVEL: 'OFF',
     };
     const thinkingRestart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], thinkingEnvironment);
-    assert.equal(thinkingRestart.code, 0, thinkingRestart.stderr || thinkingRestart.stdout);
+    assert.equal(
+      thinkingRestart.code,
+      0,
+      await daemonFailureOutput(thinkingRestart, stateDir)
+    );
     assert.match(thinkingRestart.stdout, /healthy daemon is stale; restarting/u);
     const thirdPid = await readPid(pidFile);
     assert.notEqual(thirdPid, secondPid);
@@ -224,25 +260,51 @@ async function testDaemonRevisionAndHealth() {
     assert.equal(thirdHealth.runtime_pid, thirdPid);
 
     await fs.writeFile(revisionFile, 'stale-again\n', { mode: 0o600 });
-    const ensure = await runProcess('bash', [DAEMON_SCRIPT, 'ensure'], thinkingEnvironment);
-    assert.equal(ensure.code, 0, ensure.stderr || ensure.stdout);
-    const ensured = await waitForCondition(async function daemonWasReplaced() {
-      const candidate = await readPid(pidFile);
-      if (candidate === thirdPid || !processExists(candidate)) {
-        return null;
-      }
-      const revision = (await fs.readFile(revisionFile, 'utf8')).trim();
-      const health = await readHealth(port);
-      if (health.runtime_pid !== candidate || health.runtime_revision !== revision) {
-        return null;
-      }
-      return { health, pid: candidate, revision };
-    }, 'ensure to replace a healthy stale daemon');
-    await waitForCondition(function thirdProcessExited() {
-      return !processExists(thirdPid);
-    }, `third stale daemon process ${thirdPid} to exit`);
-    assert.equal(ensured.health.runtime_revision, ensured.revision);
-    assert.equal(ensured.health.runtime_pid, ensured.pid);
+    const disabledEnsure = await runProcess('bash', [DAEMON_SCRIPT, 'ensure'], thinkingEnvironment);
+    assert.equal(disabledEnsure.code, 1);
+    assert.match(disabledEnsure.stderr, /automatic shell routing was removed/u);
+
+    const ensure = await runProcess('bash', [DAEMON_SCRIPT, 'ensure'], {
+      ...thinkingEnvironment,
+      CLAUDE_WORKFLOW_ENABLE_LEGACY_SHARED_SHELL_HOOK: '1',
+    });
+    assert.equal(ensure.code, 1);
+    assert.match(ensure.stderr, /automatic shell routing was removed/u);
+    assert.equal(await readPid(pidFile), thirdPid);
+    assert.equal(processExists(thirdPid), true);
+
+    const unrelatedStateDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'ultrathink-daemon-unrelated-state-')
+    );
+    try {
+      claimManagedState(unrelatedStateDir, {
+        kind: 'custom',
+        allowMigration: false,
+      });
+      await fs.writeFile(
+        path.join(unrelatedStateDir, 'claude-workflow-gateway.pid'),
+        `${thirdPid}\n`,
+        { mode: 0o600 }
+      );
+      const unrelatedStop = await runProcess('bash', [DAEMON_SCRIPT, 'stop'], {
+        ...thinkingEnvironment,
+        CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: unrelatedStateDir,
+        CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: path.join(
+          unrelatedStateDir,
+          'claude-workflow-gateway.env'
+        ),
+        ULTRATHINK_GATEWAY_DAEMON_PORT: String(await freePort()),
+      });
+      assert.equal(unrelatedStop.code, 0, unrelatedStop.stderr || unrelatedStop.stdout);
+      assert.match(unrelatedStop.stdout, /not running/u);
+      assert.equal(
+        processExists(thirdPid),
+        true,
+        'a stale PID in another managed state must not terminate this daemon'
+      );
+    } finally {
+      await fs.rm(unrelatedStateDir, { recursive: true, force: true });
+    }
 
     await stopDaemon(thinkingEnvironment, pidFile);
 
@@ -267,10 +329,81 @@ async function testDaemonRevisionAndHealth() {
   }
 }
 
+async function testPostinstallReconcileIgnoresNpmLifecyclePath() {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-postinstall-home-'));
+  const stateDir = path.join(home, 'state');
+  await fs.mkdir(stateDir, { mode: 0o700 });
+  const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
+  const port = await freePort();
+  const baselineEnvironment = environmentWithoutManagedGatewayAuth(process.env);
+  const baselinePath = String(baselineEnvironment.PATH || '')
+    .split(path.delimiter)
+    .filter(
+      (entry) =>
+        !/(?:^|[/\\])node_modules[/\\]\.bin$/u.test(entry) &&
+        !/(?:^|[/\\])@npmcli[/\\]run-script[/\\]lib[/\\]node-gyp-bin$/u.test(entry)
+    )
+    .join(path.delimiter);
+  const env = {
+    ...baselineEnvironment,
+    HOME: home,
+    PATH: baselinePath,
+    SHELL: '/bin/bash',
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
+  };
+  delete env.CLAUDE_WORKFLOW_GATEWAY_ENV_FILE;
+  delete env.ULTRATHINK_GATEWAY_RUNTIME_REVISION;
+  delete env.ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT;
+  delete env.npm_lifecycle_event;
+
+  try {
+    const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
+    assert.equal(started.code, 0, started.stderr || started.stdout);
+    const originalPid = await readPid(pidFile);
+
+    const lifecyclePath = [
+      path.join(home, 'package', 'node_modules', '.bin'),
+      path.join(home, 'node_modules', '.bin'),
+      path.join(
+        home,
+        'npm',
+        'node_modules',
+        '@npmcli',
+        'run-script',
+        'lib',
+        'node-gyp-bin'
+      ),
+      env.PATH,
+    ].join(path.delimiter);
+    const reconciled = await runProcess(process.execPath, [POSTINSTALL_SCRIPT], {
+      ...env,
+      PATH: lifecyclePath,
+      npm_config_global: 'true',
+      npm_lifecycle_event: 'postinstall',
+    });
+    assert.equal(reconciled.code, 0, reconciled.stderr || reconciled.stdout);
+    assert.match(reconciled.stdout, /already running current revision/u);
+    assert.match(reconciled.stdout, /matches the installed runtime revision/u);
+    assert.equal(await readPid(pidFile), originalPid);
+
+    const status = await runProcess('bash', [DAEMON_SCRIPT, 'status'], env);
+    assert.equal(status.code, 0, status.stderr || status.stdout);
+    assert.match(status.stdout, /healthy and current/u);
+  } finally {
+    try {
+      await stopDaemon(env, pidFile);
+    } catch {
+      // Best-effort cleanup for failed assertions.
+    }
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
+
 async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-kimi-auth-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
-  const envFile = path.join(stateDir, 'gateway.env');
+  const envFile = path.join(stateDir, 'claude-workflow-gateway.env');
   const env = {
     ...process.env,
     CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
@@ -312,7 +445,7 @@ async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
 async function testSourcedDirectCodexEnvironmentKeepsDaemonCurrent() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-codex-env-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
-  const envFile = path.join(stateDir, 'gateway.env');
+  const envFile = path.join(stateDir, 'claude-workflow-gateway.env');
   const env = {
     ...process.env,
     CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
@@ -406,7 +539,7 @@ async function testRelativeManagerPathsAreRejected() {
       ULTRATHINK_GATEWAY_TRACE_DIR: 'relative-trace',
     });
     assert.equal(relativeTrace.code, 1);
-    assert.match(relativeTrace.stderr, /TRACE_DIR must be absolute/u);
+    assert.match(relativeTrace.stderr, /shared-daemon ULTRATHINK_GATEWAY_TRACE_DIR/u);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -454,6 +587,7 @@ async function testStopRejectsUnrelatedPidWithDaemonPathArgument() {
 
   try {
     await waitForCondition(() => processExists(innocent.pid), 'innocent process to start');
+    claimManagedState(stateDir, { kind: 'custom' });
     await fs.writeFile(pidFile, `${innocent.pid}\n`, { mode: 0o600 });
     const stopped = await runProcess('bash', [DAEMON_SCRIPT, 'stop'], env);
     assert.equal(stopped.code, 0, stopped.stderr || stopped.stdout);
@@ -477,19 +611,20 @@ async function testManagedPortChangeReplacesRecordedDaemon() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-daemon-port-change-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
   const firstPort = await freePort();
-  const secondPort = await freePort();
   const baseEnv = {
     ...process.env,
     CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
   };
   const firstEnv = { ...baseEnv, ULTRATHINK_GATEWAY_DAEMON_PORT: String(firstPort) };
-  const secondEnv = { ...baseEnv, ULTRATHINK_GATEWAY_DAEMON_PORT: String(secondPort) };
+  let secondEnv = null;
 
   try {
     const firstStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], firstEnv);
     assert.equal(firstStart.code, 0, firstStart.stderr || firstStart.stdout);
     const firstPid = await readPid(pidFile);
 
+    const secondPort = await freePort();
+    secondEnv = { ...baseEnv, ULTRATHINK_GATEWAY_DAEMON_PORT: String(secondPort) };
     const secondStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], secondEnv);
     assert.equal(secondStart.code, 0, secondStart.stderr || secondStart.stdout);
     assert.match(secondStart.stdout, /recorded daemon is not healthy on requested port/u);
@@ -501,7 +636,7 @@ async function testManagedPortChangeReplacesRecordedDaemon() {
     await assert.rejects(fetch(`http://127.0.0.1:${firstPort}/healthz`));
   } finally {
     try {
-      await stopDaemon(secondEnv, pidFile);
+      await stopDaemon(secondEnv || firstEnv, pidFile);
     } catch {
       // Best-effort cleanup for failed assertions.
     }
@@ -513,15 +648,10 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-daemon-foreign-health-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
   const daemonPort = await freePort();
-  const foreignPort = await freePort();
   const daemonEnv = {
     ...process.env,
     CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
     ULTRATHINK_GATEWAY_DAEMON_PORT: String(daemonPort),
-  };
-  const foreignEnv = {
-    ...daemonEnv,
-    ULTRATHINK_GATEWAY_DAEMON_PORT: String(foreignPort),
   };
   const foreignServer = net.createServer(function replyToHealth(socket) {
     const body = JSON.stringify({ ok: true, service: 'unrelated-service' });
@@ -539,6 +669,11 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
     const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], daemonEnv);
     assert.equal(started.code, 0, started.stderr || started.stdout);
     const daemonPid = await readPid(pidFile);
+    const foreignPort = await freePort();
+    const foreignEnv = {
+      ...daemonEnv,
+      ULTRATHINK_GATEWAY_DAEMON_PORT: String(foreignPort),
+    };
     foreignServer.listen(foreignPort, '127.0.0.1');
     await new Promise((resolve, reject) => {
       foreignServer.once('listening', resolve);
@@ -547,7 +682,10 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
 
     const collision = await runProcess('bash', [DAEMON_SCRIPT, 'start'], foreignEnv);
     assert.equal(collision.code, 1);
-    assert.match(collision.stderr, /belongs to another process/u);
+    assert.match(
+      collision.stderr,
+      /belongs to another process|is not owned by the recorded daemon/u
+    );
     assert.equal(processExists(daemonPid), true);
     assert.equal(await readPid(pidFile), daemonPid);
   } finally {
@@ -574,6 +712,7 @@ await testStopRejectsUnrelatedPidWithDaemonPathArgument();
 await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();
+await testPostinstallReconcileIgnoresNpmLifecyclePath();
 await testSourcedManagedAuthKeepsKimiDaemonCurrent();
 await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

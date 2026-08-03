@@ -21,13 +21,16 @@ published gateway env files, or complete private prompts/transcripts.
   set, every Anthropic route also needs the dedicated gateway-side
   `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`. A generic `ANTHROPIC_API_KEY` is not
   accepted as the shared-secret upstream credential.
-- Provider API keys, including `ULTRATHINK_GATEWAY_KIMI_API_KEY`, belong in the
+- Provider API keys, including `ULTRATHINK_GATEWAY_KIMI_API_KEY` and
+  `ULTRATHINK_GATEWAY_QWEN_API_KEY`, belong in the
   owner-only `~/.claude-workflow.env` file. Do not export them from a shell
   startup file or store them in a repository `.env`, command-line argument,
   issue, trace, or diagnostic attachment. Kimi requests use the gateway-side
-  key rather than Claude Code's inbound credential. Dedicated gateway keys are
-  removed from child processes; Kimi credentials and unrelated Anthropic
-  credentials are also removed from Codex probes and app-server processes.
+  key rather than Claude Code's inbound credential. Qwen Token Plan keys must
+  match their plan endpoint, and custom remote Qwen endpoints must use HTTPS.
+  Dedicated gateway keys are removed from child processes; Kimi, Qwen, and
+  unrelated Anthropic credentials are also removed from Codex probes and
+  app-server processes.
 - Per-session launches pass Claude a private owner-only `--settings` file that
   clears conflicting routing, beta, thinking, and provider-selection values.
   It contains only local gateway credentials, never upstream provider keys,

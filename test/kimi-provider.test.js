@@ -208,17 +208,14 @@ test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', 
       );
       assert.equal(clientEnv.ANTHROPIC_BASE_URL, 'http://127.0.0.1:4318');
       assert.equal(clientEnv.ANTHROPIC_MODEL, KIMI_MODEL_ALIAS);
-      assert.equal(clientEnv.ANTHROPIC_DEFAULT_FABLE_MODEL, KIMI_MODEL_ALIAS);
+      assert.equal(clientEnv.ANTHROPIC_DEFAULT_FABLE_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, String(KIMI_CONTEXT_TOKENS));
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(KIMI_CONTEXT_TOKENS));
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
-      assert.equal(
-        Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
-        false
-      );
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
       assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
       assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
       assert.equal(
@@ -345,7 +342,7 @@ test('Kimi client settings follow only the resolved main route', async function 
         },
       }),
     },
-    async function verifyDormantRouteDoesNotChangeFable() {
+    async function verifyDormantRouteDoesNotChangeOpus() {
       const workflow = buildWorkflowGatewayConfig();
       assert.notEqual(workflow.config.sharedSecret, '');
       assert.equal(
@@ -358,7 +355,7 @@ test('Kimi client settings follow only the resolved main route', async function 
         workflow.subagentModelId,
         workflow.mainModelId
       );
-      assert.equal(workflow.mainModelId.startsWith('claude-fable-5'), true);
+      assert.equal(workflow.mainModelId.startsWith('claude-opus-5'), true);
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, null);
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, null);
       assert.equal(

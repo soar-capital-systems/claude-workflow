@@ -12,6 +12,7 @@ import {
 import { isGatewayLoopbackHost, loadGatewayConfig } from './config.js';
 import { CodexSessionManager } from './codex-provider.js';
 import { GatewayError, listGatewayModels, resolveModelRoute } from './model-routing.js';
+import { gatewayProviderProfile, providerRequiresGatewayAuth } from './provider-profiles.js';
 import { proxyUrlForTarget } from './proxy.js';
 import { createGatewayTracer } from './trace.js';
 
@@ -20,14 +21,18 @@ const TOOL_REASONING_CACHE_MAX_ENTRIES = 2_048;
 
 export function assertGatewayBindIsSafe(config) {
   const host = config.host || '127.0.0.1';
-  const hasKimiRoute = Object.values(config.routeMap || {}).some(function usesKimi(route) {
-    return String(route?.provider || '').trim().toLowerCase() === 'kimi';
+  const protectedProvider = Object.values(config.routeMap || {}).find(function usesProtectedProvider(
+    route
+  ) {
+    return providerRequiresGatewayAuth(route?.provider);
   });
-  if (hasKimiRoute && !config.sharedSecret) {
+  if (protectedProvider && !config.sharedSecret) {
+    const provider = String(protectedProvider.provider || '').trim().toLowerCase();
+    const label = gatewayProviderProfile(provider)?.label || provider;
     throw new GatewayError(
       500,
       'api_error',
-      'Kimi routes require gateway authentication, including on loopback. Set ULTRATHINK_GATEWAY_SHARED_SECRET or use a managed workflow profile.'
+      `${label} routes require gateway authentication, including on loopback. Set ULTRATHINK_GATEWAY_SHARED_SECRET or use a managed workflow profile.`
     );
   }
   if (isGatewayLoopbackHost(host) || config.sharedSecret) {
@@ -142,7 +147,7 @@ async function safeJson(response) {
   }
 }
 
-function estimateKimiInputTokens(requestBody) {
+function estimateConservativeInputTokens(requestBody) {
   const serialized = JSON.stringify({
     model: requestBody?.model,
     system: requestBody?.system,
@@ -150,19 +155,21 @@ function estimateKimiInputTokens(requestBody) {
     tools: requestBody?.tools,
     tool_choice: requestBody?.tool_choice,
   });
-  // Kimi Code does not document an Anthropic count_tokens endpoint. A
-  // byte-aware 2:1 estimate is intentionally conservative for source code and
-  // Unicode while still approaching Kimi's separate 2 MiB message ceiling.
+  // Some third-party coding plans do not expose a compatible count_tokens
+  // endpoint. A byte-aware 2:1 estimate is intentionally conservative for
+  // source code and Unicode without making another billable model request.
   return Math.max(1, Math.ceil(Buffer.byteLength(serialized, 'utf8') / 2));
 }
 
-function copyAnthropicCompatibleResponseHeaders(upstream, res) {
+function copyUpstreamResponseHeaders(upstream, res, options = {}) {
   const exactHeaders = new Set([
-    'content-type',
     'request-id',
     'retry-after',
     'x-request-id',
   ]);
+  if (options.preserveContentType) {
+    exactHeaders.add('content-type');
+  }
 
   for (const [name, value] of upstream.headers) {
     if (
@@ -244,14 +251,7 @@ function normalizeProxyDispatcherUrl(proxyUrl) {
 }
 
 function openAiCompatibleConfig(config, route) {
-  if (route.provider === 'deepseek') {
-    return config.deepseek;
-  }
-  if (route.provider === 'glm') {
-    return config.glm;
-  }
-
-  return config.openai;
+  return config[route.providerConfigKey || route.provider] || config.openai;
 }
 
 function createOpenAiCompatibleHeaders(config, route) {
@@ -262,18 +262,15 @@ function createOpenAiCompatibleHeaders(config, route) {
 }
 
 function openAiCompatibleProviderLabel(route) {
-  if (route.provider === 'deepseek') {
-    return 'DeepSeek';
-  }
-  if (route.provider === 'glm') {
-    return 'GLM';
-  }
-
-  return 'OpenAI-compatible';
+  return route.providerLabel || 'OpenAI-compatible';
 }
 
 function preservesOpenAiReasoningContent(route) {
-  return route.provider === 'deepseek' || route.provider === 'glm';
+  return (
+    route.preserveAssistantThinking === true ||
+    route.provider === 'deepseek' ||
+    route.provider === 'glm'
+  );
 }
 
 function toolReasoningCacheNamespace(req) {
@@ -312,6 +309,8 @@ function openAiCompatibleTranslationOptions(req, route, toolReasoningCache) {
 
   return {
     preserveAssistantThinking: true,
+    emitReasoningContent: route.emitReasoningContent === true,
+    strictThinkingReplay: route.strictThinkingReplay === true,
     reasoningContentForToolCall(toolCallId) {
       if (!toolCallId) {
         return '';
@@ -383,14 +382,14 @@ function forwardedAnthropicCredential(req, config) {
 }
 
 function createAnthropicCompatibleHeaders(config, req, route) {
-  const providerConfig = route.provider === 'kimi' ? config.kimi : config.anthropic;
+  const providerConfig = anthropicCompatibleProviderConfig(config, route);
   const headers = upstreamHeaders({
     'anthropic-version': req.get('anthropic-version') || providerConfig.version,
   });
 
   copyAnthropicClientIdentityHeaders(req, headers);
 
-  if (route.provider === 'kimi') {
+  if (route.upstreamAuth === 'x-api-key') {
     headers['x-api-key'] = providerConfig.apiKey;
   } else {
     const forwardedCredential = forwardedAnthropicCredential(req, config);
@@ -429,7 +428,7 @@ function anthropicCompatibleRequestBody(requestBody, route, stream) {
     ...(stream ? { stream: true } : {}),
   };
 
-  if (route.provider === 'kimi') {
+  if (route.requestPolicy === 'kimi') {
     const outputConfig =
       requestBody?.output_config &&
       typeof requestBody.output_config === 'object' &&
@@ -457,7 +456,7 @@ function anthropicCompatibleRequestBody(requestBody, route, stream) {
 }
 
 function anthropicCompatibleProviderConfig(config, route) {
-  return route.provider === 'kimi' ? config.kimi : config.anthropic;
+  return config[route.providerConfigKey || route.provider] || config.anthropic;
 }
 
 async function proxyAnthropicCompatibleJson(req, res, config, route, signal) {
@@ -471,7 +470,7 @@ async function proxyAnthropicCompatibleJson(req, res, config, route, signal) {
   );
 
   const body = await safeJson(upstream);
-  copyAnthropicCompatibleResponseHeaders(upstream, res);
+  copyUpstreamResponseHeaders(upstream, res);
   res.status(upstream.status).json(body);
 }
 
@@ -486,7 +485,7 @@ async function proxyAnthropicCompatibleStream(req, res, config, route, signal) {
   );
 
   res.status(upstream.status);
-  copyAnthropicCompatibleResponseHeaders(upstream, res);
+  copyUpstreamResponseHeaders(upstream, res, { preserveContentType: true });
   if (!upstream.headers.get('content-type')) {
     res.setHeader('content-type', 'text/event-stream; charset=utf-8');
   }
@@ -682,6 +681,7 @@ function createStreamState(requestedModel, fallbackId) {
     messageId: fallbackId,
     requestedModel,
     messageStarted: false,
+    reasoningBlockStarted: false,
     textBlockStarted: false,
     textBlockIndex: 0,
     toolCalls: new Map(),
@@ -694,7 +694,7 @@ function createStreamState(requestedModel, fallbackId) {
   };
 }
 
-async function ensureTextBlockStarted(res, state) {
+async function ensureMessageStarted(res, state) {
   if (!state.messageStarted) {
     await writeSseEvent(res, 'message_start', {
       type: 'message_start',
@@ -711,6 +711,43 @@ async function ensureTextBlockStarted(res, state) {
     });
     state.messageStarted = true;
   }
+}
+
+async function ensureReasoningBlockStarted(res, state) {
+  await ensureMessageStarted(res, state);
+  if (state.reasoningBlockStarted) {
+    return;
+  }
+  await closeTextBlock(res, state);
+
+  await writeSseEvent(res, 'content_block_start', {
+    type: 'content_block_start',
+    index: state.textBlockIndex,
+    content_block: {
+      type: 'thinking',
+      thinking: '',
+      signature: '',
+    },
+  });
+  state.reasoningBlockStarted = true;
+}
+
+async function closeReasoningBlock(res, state) {
+  if (!state.reasoningBlockStarted) {
+    return;
+  }
+
+  await writeSseEvent(res, 'content_block_stop', {
+    type: 'content_block_stop',
+    index: state.textBlockIndex,
+  });
+  state.reasoningBlockStarted = false;
+  state.textBlockIndex += 1;
+}
+
+async function ensureTextBlockStarted(res, state) {
+  await ensureMessageStarted(res, state);
+  await closeReasoningBlock(res, state);
 
   if (state.textBlockStarted) {
     return;
@@ -836,6 +873,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
     requestBody,
     signal
   );
+  copyUpstreamResponseHeaders(upstream, res);
 
   if (!upstream.ok) {
     const body = await safeJson(upstream);
@@ -878,6 +916,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
 
         for (const dataLine of dataLines) {
           if (dataLine === '[DONE]') {
+            await closeReasoningBlock(res, state);
             await closeTextBlock(res, state);
             await ensureTextBlockStartedNoText(res, state);
             recordStreamingToolCallReasoning(state, translationOptions);
@@ -917,6 +956,17 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
           }
           if (choice.delta?.reasoning_content) {
             state.reasoningContent += choice.delta.reasoning_content;
+            if (translationOptions.emitReasoningContent) {
+              await ensureReasoningBlockStarted(res, state);
+              await writeSseEvent(res, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: state.textBlockIndex,
+                delta: {
+                  type: 'thinking_delta',
+                  thinking: choice.delta.reasoning_content,
+                },
+              });
+            }
           }
 
           if (choice.delta?.content) {
@@ -942,6 +992,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
     throw normalizeAbortError(error, signal);
   }
 
+  await closeReasoningBlock(res, state);
   await closeTextBlock(res, state);
   await ensureTextBlockStartedNoText(res, state);
   recordStreamingToolCallReasoning(state, translationOptions);
@@ -959,24 +1010,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReas
 }
 
 async function ensureTextBlockStartedNoText(res, state) {
-  if (state.messageStarted) {
-    return;
-  }
-
-  await writeSseEvent(res, 'message_start', {
-    type: 'message_start',
-    message: {
-      id: state.messageId,
-      type: 'message',
-      role: 'assistant',
-      model: state.requestedModel,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: state.usage,
-    },
-  });
-  state.messageStarted = true;
+  await ensureMessageStarted(res, state);
 }
 
 function codexOutcomeTextBlocks(text) {
@@ -1280,6 +1314,7 @@ async function handleOpenAiJson(req, res, config, route, signal, toolReasoningCa
     requestBody,
     signal
   );
+  copyUpstreamResponseHeaders(upstream, res);
   const body = await safeJson(upstream);
 
   if (!upstream.ok) {
@@ -1322,10 +1357,11 @@ async function handleCodexStream(req, res, config, codexSessions, route, signal,
 
 async function handleCountTokens(req, res, config, signal) {
   const route = resolveModelRoute(req.body?.model, config);
-  switch (route.provider) {
-    case 'anthropic': {
+  switch (route.tokenCountPolicy) {
+    case 'upstream': {
+      const providerConfig = anthropicCompatibleProviderConfig(config, route);
       const url = anthropicCompatibleRequestUrl(
-        config.anthropic.baseUrl,
+        providerConfig.baseUrl,
         'v1/messages/count_tokens',
         req
       );
@@ -1339,21 +1375,22 @@ async function handleCountTokens(req, res, config, signal) {
       res.status(upstream.status).json(body);
       return;
     }
-    case 'codex':
-    case 'deepseek':
-    case 'glm':
-    case 'openai':
+    case 'estimate':
       res.json({
         input_tokens: estimateAnthropicInputTokens(req.body),
       });
       return;
-    case 'kimi':
+    case 'conservative-estimate':
       res.json({
-        input_tokens: estimateKimiInputTokens(req.body),
+        input_tokens: estimateConservativeInputTokens(req.body),
       });
       return;
     default:
-      throw new GatewayError(500, 'api_error', `Unsupported gateway provider: ${route.provider}`);
+      throw new GatewayError(
+        500,
+        'api_error',
+        `Unsupported token-count policy for gateway provider: ${route.provider}`
+      );
   }
 }
 
@@ -1370,9 +1407,8 @@ async function handleMessages(
   req.abortSignal = signal;
   req.gatewayTracer = requestTracer;
 
-  switch (route.provider) {
+  switch (route.transport) {
     case 'anthropic':
-    case 'kimi':
       if (req.body?.stream === true) {
         await proxyAnthropicCompatibleStream(req, res, config, route, signal);
         return route;
@@ -1391,8 +1427,6 @@ async function handleMessages(
 
       await handleCodexJson(req, res, config, codexSessions, route, requestTracer);
       return route;
-    case 'deepseek':
-    case 'glm':
     case 'openai':
       if (req.body?.stream === true) {
         await streamOpenAiAsAnthropic(req, res, config, route, signal, toolReasoningCache);
@@ -1457,6 +1491,11 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       kimi_reasoning_effort: config.kimi?.reasoningEffort || null,
       kimi_context_tokens: config.kimi?.contextTokens ?? null,
       kimi_key_configured: Boolean(config.kimi?.apiKey),
+      qwen_model: config.qwen?.model || null,
+      qwen_reasoning_effort: config.qwen?.reasoningEffort || null,
+      qwen_context_tokens: config.qwen?.contextTokens ?? null,
+      qwen_max_output_tokens: config.qwen?.maxOutputTokens ?? null,
+      qwen_key_configured: Boolean(config.qwen?.apiKey),
       anthropic_passthrough_enabled:
         Array.isArray(config.anthropicPassthroughModels) &&
         config.anthropicPassthroughModels.length > 0,

@@ -11,12 +11,13 @@ import { fileURLToPath } from 'node:url';
 import {
   isWindowsMountedPath,
   rewriteConfigurationText,
+  runDoctorCommand,
   runSetupCommand,
+  validateSharedSetup,
   writeUserConfiguration,
 } from '../js/cli/onboarding.js';
 import {
   CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
-  inspectClaudeRoutingSettingsConflicts,
   inspectClaudeThirdPartyModelSupport,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
@@ -25,11 +26,15 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'js', 'cli', 'claude-workflow.js');
 const WORKFLOW_ENV_PREFIXES = [
   'ANTHROPIC_',
+  'BAILIAN_',
+  'CLAUDE_CODE_',
   'CLAUDE_WORKFLOW_',
   'CODEX_',
   'DEEPSEEK_',
+  'DASHSCOPE_',
   'GLM_',
   'KIMI_',
+  'QWEN_',
   'ULTRATHINK_',
   'ZAI_',
 ];
@@ -97,12 +102,12 @@ async function installFakeNativeTools(root) {
     claude,
     [
       '#!/usr/bin/env bash',
-      'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'claude:%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
+      'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'claude:%s|%s|%s|%s|%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY+x}" "${QWEN_API_KEY+x}" "${BAILIAN_TOKEN_PLAN_API_KEY+x}" "${DASHSCOPE_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
       'if [ "${1:-}" = "--version" ]; then echo "2.1.206 (Claude Code)"; exit 0; fi',
       'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ] && [ "${3:-}" = "--json" ]; then if [ "${FAKE_CLAUDE_LOGGED_OUT:-}" = "1" ]; then echo \'{"loggedIn":false}\'; exit 1; fi; echo \'{"loggedIn":true}\'; exit 0; fi',
       'if [ -n "${FAKE_CLAUDE_SETTINGS_CAPTURE_FILE:-}" ]; then _cw_args=("$@"); for ((_cw_i=0; _cw_i<${#_cw_args[@]}; _cw_i++)); do if [ "${_cw_args[$_cw_i]}" = "--settings" ]; then _cw_i=$((_cw_i + 1)); cp "${_cw_args[$_cw_i]}" "$FAKE_CLAUDE_SETTINGS_CAPTURE_FILE"; break; fi; done; fi',
       'if [ -n "${FAKE_CLAUDE_ARGS_FILE:-}" ]; then printf \'%s\\n\' "$@" > "$FAKE_CLAUDE_ARGS_FILE"; if [ -z "${FAKE_CLAUDE_ENV_FILE:-}" ]; then exit 0; fi; fi',
-      'if [ -n "${FAKE_CLAUDE_ENV_FILE:-}" ]; then printf \'%s\\n\' "${ULTRATHINK_GATEWAY_KIMI_API_KEY-unset}" "${KIMI_API_KEY-unset}" "${ANTHROPIC_MODEL-unset}" "${CLAUDE_CODE_EFFORT_LEVEL-unset}" "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-unset}" "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-unset}" "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" > "$FAKE_CLAUDE_ENV_FILE"; exit 0; fi',
+      'if [ -n "${FAKE_CLAUDE_ENV_FILE:-}" ]; then printf \'%s\\n\' "${ULTRATHINK_GATEWAY_KIMI_API_KEY-unset}" "${KIMI_API_KEY-unset}" "${ANTHROPIC_MODEL-unset}" "${CLAUDE_CODE_EFFORT_LEVEL-unset}" "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-unset}" "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-unset}" "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY-unset}" "${QWEN_API_KEY-unset}" "${BAILIAN_TOKEN_PLAN_API_KEY-unset}" "${DASHSCOPE_API_KEY-unset}" "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-unset}" > "$FAKE_CLAUDE_ENV_FILE"; exit 0; fi',
       'exit 2',
       '',
     ].join('\n'),
@@ -112,7 +117,7 @@ async function installFakeNativeTools(root) {
     codex,
     [
       '#!/usr/bin/env bash',
-      'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'codex:%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
+      'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'codex:%s|%s|%s|%s|%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY+x}" "${QWEN_API_KEY+x}" "${BAILIAN_TOKEN_PLAN_API_KEY+x}" "${DASHSCOPE_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
       'if [ "${1:-}" = "--version" ]; then echo "codex-cli ${FAKE_CODEX_VERSION:-0.144.1}"; exit 0; fi',
       'if [ "${1:-}" = "login" ] && [ "${2:-}" = "status" ]; then',
       '  if [ "${FAKE_CODEX_LOGGED_OUT:-}" = "1" ]; then echo "Not logged in"; exit 1; fi',
@@ -237,7 +242,6 @@ test(
     assert.equal(state.hasCompletedOnboarding, true);
     assert.equal(state.penguinModeOrgEnabled, true);
     assert.equal(await fsp.readFile(settingsPath, 'utf8'), originalSettings);
-    assert.deepEqual(prepared.conflictingSettingsEnvNames, []);
     assert.equal(inspectClaudeThirdPartyModelSupport(env).enabled, true);
     assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
     assert.equal((await fsp.stat(prepared.backupPath)).mode & 0o777, 0o600);
@@ -270,23 +274,95 @@ test(
 );
 
 test(
-  'terminal-title preferences are not treated as workflow routing conflicts',
+  'third-party readiness ignores malformed and symlinked persistent settings',
   { skip: process.platform === 'win32' },
   async function (t) {
-    const home = await temporaryDirectory(t, 'claude-workflow-claude-title-setting-');
-    const repository = path.join(home, 'repo');
-    const settingsPath = path.join(repository, '.claude', 'settings.json');
-    await fsp.mkdir(path.join(repository, '.git'), { recursive: true });
-    await fsp.mkdir(path.dirname(settingsPath), { recursive: true });
+    const home = await temporaryDirectory(t, 'claude-workflow-claude-settings-inspection-');
+    const settingsDirectory = path.join(home, '.claude');
+    const statePath = path.join(home, '.claude.json');
+    const settingsPath = path.join(settingsDirectory, 'settings.json');
+    await fsp.mkdir(settingsDirectory);
     await fsp.writeFile(
-      settingsPath,
-      '{"env":{"CLAUDE_CODE_DISABLE_TERMINAL_TITLE":"1"}}\n'
+      statePath,
+      '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n'
     );
 
-    assert.deepEqual(
-      inspectClaudeRoutingSettingsConflicts(isolatedEnvironment(home), repository),
-      []
+    await fsp.writeFile(settingsPath, '{not-json\n');
+    assert.equal(inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)).enabled, true);
+
+    await fsp.rm(settingsPath);
+    const realSettings = path.join(home, 'real-settings.json');
+    await fsp.writeFile(realSettings, '{}\n');
+    await fsp.symlink(realSettings, settingsPath);
+    assert.equal(inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)).enabled, true);
+  }
+);
+
+test(
+  'third-party readiness still validates the state file',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const home = await temporaryDirectory(t, 'claude-workflow-claude-state-inspection-');
+    const statePath = path.join(home, '.claude.json');
+
+    await fsp.writeFile(statePath, '{not-json\n');
+    assert.throws(
+      () => inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)),
+      /Claude state file is not valid JSON/u
     );
+
+    await fsp.rm(statePath);
+    const realState = path.join(home, 'real-state.json');
+    await fsp.writeFile(
+      realState,
+      '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n'
+    );
+    await fsp.symlink(realState, statePath);
+    assert.throws(
+      () => inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)),
+      /Claude state path must be a regular file, not a symlink/u
+    );
+  }
+);
+
+test(
+  'non-Anthropic launches ignore malformed and symlinked persistent user settings',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-settings-launch-');
+    const bin = await installFakeNativeTools(root);
+
+    for (const kind of ['malformed', 'symlink']) {
+      const home = path.join(root, `${kind}-home`);
+      const settingsDirectory = path.join(home, '.claude');
+      const settingsPath = path.join(settingsDirectory, 'settings.json');
+      const argsFile = path.join(root, `${kind}-args.txt`);
+      await fsp.mkdir(settingsDirectory, { recursive: true });
+      await fsp.writeFile(
+        path.join(home, '.claude.json'),
+        '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n'
+      );
+      if (kind === 'malformed') {
+        await fsp.writeFile(settingsPath, '{not-json\n');
+      } else {
+        const realSettings = path.join(root, 'real-settings.json');
+        await fsp.writeFile(realSettings, '{}\n');
+        await fsp.symlink(realSettings, settingsPath);
+      }
+
+      const result = runCli(['Reply with exactly OK.'], {
+        env: isolatedEnvironment(home, {
+          PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          FAKE_CLAUDE_ARGS_FILE: argsFile,
+          ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'codex',
+          ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
+        }),
+      });
+      assert.equal(result.status, 0, `${kind}: ${result.stderr}`);
+      const claudeArgs = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
+      assert.ok(claudeArgs.includes('--settings'));
+      assert.ok(claudeArgs.includes('codex'));
+    }
   }
 );
 
@@ -319,6 +395,20 @@ test('WSL path detection distinguishes mounted Windows paths', function () {
 });
 
 test(
+  'WSL path detection recognizes custom DrvFS mounts',
+  { skip: process.platform !== 'linux' },
+  function () {
+    const mountInfo =
+      '36 25 0:32 / /work/windows rw,relatime - drvfs C:\\\\ rw,uid=1000,gid=1000\n';
+    assert.equal(
+      isWindowsMountedPath('/work/windows/projects/ultrathink', mountInfo),
+      true
+    );
+    assert.equal(isWindowsMountedPath('/home/example/ultrathink', mountInfo), false);
+  }
+);
+
+test(
   'setup validates fake native tools without creating configuration',
   { skip: process.platform === 'win32' },
   async function (t) {
@@ -329,7 +419,11 @@ test(
     const env = isolatedEnvironment(home, { PATH: `${bin}${path.delimiter}${process.env.PATH}` });
 
     const result = runCli(['setup'], { env });
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      result.status,
+      0,
+      result.stderr || result.stdout || result.error?.message || `signal ${result.signal || 'none'}`
+    );
     assert.match(result.stdout, /Claude Workflow setup/u);
     assert.match(result.stdout, /Claude Code .*authenticated/u);
     assert.match(result.stdout, /Codex CLI .*authenticated/u);
@@ -339,7 +433,7 @@ test(
 );
 
 test(
-  'shared setup validates the shell before starting the daemon',
+  'shared setup schedules migration without requiring Bash or zsh as the active shell',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-shared-shell-');
@@ -352,23 +446,19 @@ test(
     });
     const actions = [];
 
-    assert.throws(
-      () =>
-        runSetupCommand(['--shared'], {
-          env,
-          stdout: { write() { return true; } },
-          runGatewayAction(action) {
-            actions.push(action);
-          },
-        }),
-      /does not support shell fish/u
-    );
-    assert.deepEqual(actions, []);
+    runSetupCommand(['--shared'], {
+      env,
+      stdout: { write() { return true; } },
+      runGatewayAction(action) {
+        actions.push(action);
+      },
+    });
+    assert.deepEqual(actions, ['migrate-shell', 'start']);
   }
 );
 
 test(
-  'shared setup validates a dangling shell-rc symlink target before starting',
+  'shared setup delegates shell-rc resolution to migration before daemon start',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-shared-symlink-');
@@ -384,23 +474,20 @@ test(
     });
     const actions = [];
 
-    assert.throws(
-      () =>
-        runSetupCommand(['--shared'], {
-          env,
-          stdout: { write() { return true; } },
-          runGatewayAction(action) {
-            actions.push(action);
-          },
-        }),
-      /non-directory ancestor/u
-    );
-    assert.deepEqual(actions, []);
+    runSetupCommand(['--shared'], {
+      env,
+      stdout: { write() { return true; } },
+      runGatewayAction(action) {
+        actions.push(action);
+      },
+    });
+    assert.deepEqual(actions, ['migrate-shell', 'start']);
+    assert.equal((await fsp.lstat(path.join(home, '.bashrc'))).isSymbolicLink(), true);
   }
 );
 
 test(
-  'shared setup refuses repository routing settings that outrank shell exports',
+  'shared setup leaves repository Claude routing settings untouched',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-shared-routing-conflict-');
@@ -421,19 +508,15 @@ test(
     });
     const actions = [];
 
-    assert.throws(
-      () =>
-        runSetupCommand(['--shared'], {
-          cwd: nested,
-          env,
-          stdout: { write() { return true; } },
-          runGatewayAction(action) {
-            actions.push(action);
-          },
-        }),
-      /shared mode cannot safely override.*ANTHROPIC_BASE_URL.*ANTHROPIC_MODEL/u
-    );
-    assert.deepEqual(actions, []);
+    runSetupCommand(['--shared'], {
+      cwd: nested,
+      env,
+      stdout: { write() { return true; } },
+      runGatewayAction(action) {
+        actions.push(action);
+      },
+    });
+    assert.deepEqual(actions, ['migrate-shell', 'start']);
     assert.equal(await fsp.readFile(settingsPath, 'utf8'), settingsText);
   }
 );
@@ -463,6 +546,61 @@ test(
       /shared mode cannot load a repository \.env/u
     );
     assert.deepEqual(actions, []);
+  }
+);
+
+test(
+  'shared setup rejects env and trace paths outside managed state',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-shared-owned-paths-');
+    const home = path.join(root, 'home');
+    const stateDirectory = path.join(root, 'state');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const baseEnv = isolatedEnvironment(home, {
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDirectory,
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      SHELL: '/bin/bash',
+    });
+    assert.throws(
+      () =>
+        validateSharedSetup({
+          ...baseEnv,
+          CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: path.join(root, 'external.env'),
+        }),
+      /must be exactly/u
+    );
+    assert.throws(
+      () =>
+        validateSharedSetup({
+          ...baseEnv,
+          ULTRATHINK_GATEWAY_TRACE_DIR: path.join(root, 'external-trace'),
+        }),
+      /shared-daemon ULTRATHINK_GATEWAY_TRACE_DIR/u
+    );
+  }
+);
+
+test(
+  'shared setup validates trace paths against selected legacy state',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-shared-legacy-state-');
+    const home = path.join(root, 'home');
+    const legacyState = path.join(home, '.cache', 'ultrathink');
+    await fsp.mkdir(legacyState, { recursive: true });
+    await fsp.writeFile(
+      path.join(legacyState, 'claude-workflow-gateway.env'),
+      "export ANTHROPIC_BASE_URL='http://127.0.0.1:4318'\n"
+    );
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      SHELL: '/bin/bash',
+      ULTRATHINK_GATEWAY_TRACE_DIR: path.join(legacyState, 'gateway-trace'),
+    });
+    assert.doesNotThrow(() => validateSharedSetup(env));
   }
 );
 
@@ -610,7 +748,7 @@ test(
 );
 
 test(
-  'shared setup starts the daemon before installing its shell hook',
+  'shared setup migrates historical shell routing before starting the daemon',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-shared-setup-');
@@ -629,13 +767,100 @@ test(
           return true;
         },
       },
-      runGatewayAction(action) {
-        actions.push(action);
+      runGatewayAction(action, actionOptions) {
+        actions.push({ action, env: actionOptions.env });
       },
     });
 
-    assert.deepEqual(actions, ['start', 'install-shell']);
-    assert.match(output, /Shared gateway enabled/u);
+    assert.deepEqual(actions.map(({ action }) => action), ['migrate-shell', 'start']);
+    assert.deepEqual(actions[1].env, env);
+    assert.match(output, /cleanup-only mode/u);
+    assert.match(output, /Source the migrated rc or open a new shell/u);
+  }
+);
+
+test(
+  'shared setup migrates inherited routing and starts the daemon from a clean environment',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-inherited-routing-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const managedBaseUrl = 'http://127.0.0.1:4318';
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES:
+        'ANTHROPIC_BASE_URL CLAUDE_CODE_SUBAGENT_MODEL',
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_SET_NAMES:
+        'ANTHROPIC_BASE_URL CLAUDE_CODE_SUBAGENT_MODEL',
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_ANTHROPIC_BASE_URL: managedBaseUrl,
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_CLAUDE_CODE_SUBAGENT_MODEL: 'codex-terra',
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN: 'managed-auth',
+      ANTHROPIC_BASE_URL: managedBaseUrl,
+      CLAUDE_CODE_SUBAGENT_MODEL: 'codex-terra',
+      ANTHROPIC_API_KEY: 'managed-auth',
+      KIMI_API_KEY: 'preserved-gateway-credential',
+    });
+    const actions = [];
+    let output = '';
+
+    runSetupCommand(['--shared'], {
+      env,
+      stdout: {
+        write(chunk) {
+          output += String(chunk);
+          return true;
+        },
+      },
+      runGatewayAction(action, actionOptions) {
+        actions.push({ action, env: actionOptions.env });
+      },
+    });
+
+    assert.deepEqual(actions.map(({ action }) => action), ['migrate-shell', 'start']);
+    assert.equal(actions[0].env, env);
+    assert.equal(actions[1].env.ANTHROPIC_BASE_URL, undefined);
+    assert.equal(actions[1].env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
+    assert.equal(actions[1].env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN, undefined);
+    assert.equal(actions[1].env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(actions[1].env.KIMI_API_KEY, 'preserved-gateway-credential');
+    assert.match(output, /will be migrated/u);
+  }
+);
+
+test(
+  'doctor rejects inherited workflow routing with parent-shell migration guidance',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-doctor-routing-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4318',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'codex-terra',
+    });
+    let output = '';
+
+    assert.throws(
+      () =>
+        runDoctorCommand([], {
+          env,
+          stdout: {
+            write(chunk) {
+              output += String(chunk);
+              return true;
+            },
+          },
+        }),
+      /diagnostics failed/u
+    );
+    assert.match(output, /Inherited workflow-managed Claude routing/u);
+    assert.match(output, /cannot change its parent shell/u);
+    assert.match(output, /claude-workflow-gateway migrate-shell/u);
+    assert.match(output, /open a new shell/u);
   }
 );
 
@@ -667,6 +892,16 @@ test(
     assert.match(show.stdout, /Reasoning\s+high/u);
     assert.match(show.stdout, /Permissions\s+prompt/u);
 
+    const opus = runCli(['config', '--main', 'opus'], { env });
+    assert.equal(opus.status, 0, opus.stderr);
+    assert.match(
+      await fsp.readFile(configPath, 'utf8'),
+      /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-opus-5\[1m\]/u
+    );
+    const opusShow = runCli(['config'], { env });
+    assert.equal(opusShow.status, 0, opusShow.stderr);
+    assert.match(opusShow.stdout, /Main\s+Opus 5 -> anthropic \(claude-opus-5\[1m\]\)/u);
+
     const reset = runCli(['config', '--reset'], { env });
     assert.equal(reset.status, 0, reset.stderr);
     assert.equal(await fsp.readFile(configPath, 'utf8'), '');
@@ -690,9 +925,9 @@ test(
     const content = await fsp.readFile(configPath, 'utf8');
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=kimi/u);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3\[1m\]/u);
-    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=/u);
-    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=/u);
-    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=k3/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=max/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=1048576/u);
     assert.doesNotMatch(content, /KIMI_API_KEY=/u);
 
     const moderate = runCli(['config', '--main', 'k3'], { env });
@@ -705,7 +940,7 @@ test(
     assert.equal(oneMillion.status, 0, oneMillion.stderr);
     const oneMillionContent = await fsp.readFile(configPath, 'utf8');
     assert.match(oneMillionContent, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3\[1m\]/u);
-    assert.doesNotMatch(oneMillionContent, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=/u);
+    assert.match(oneMillionContent, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=1048576/u);
 
     const fakeKey = 'test-kimi-config-key';
     await fsp.appendFile(
@@ -745,8 +980,8 @@ test(
     const content = await fsp.readFile(configPath, 'utf8');
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=codex/u);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=codex/u);
-    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=/u);
-    assert.doesNotMatch(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=gpt-5\.6-sol/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=max/u);
     assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5\.6-sol/u);
 
     const show = runCli(['config'], { env });
@@ -760,8 +995,106 @@ test(
     assert.equal(resetMain.status, 0, resetMain.stderr);
     const resetContent = await fsp.readFile(configPath, 'utf8');
     assert.match(resetContent, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=anthropic/u);
-    assert.doesNotMatch(resetContent, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=/u);
+    assert.match(resetContent, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=claude-fable-5/u);
     assert.doesNotMatch(resetContent, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=/u);
+  }
+);
+
+test(
+  'config selects Qwen 3.8 Max at 1M/xhigh without storing or resetting its credential',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-qwen-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    await fsp.writeFile(
+      path.join(home, '.ultrathink.env'),
+      [
+        'ULTRATHINK_GATEWAY_MAIN_PROVIDER=anthropic',
+        'ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5[1m]',
+        'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=claude-fable-5',
+        'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=low',
+        'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-fable-5*',
+        'ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS=4096',
+        'ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS=1024',
+        'ULTRATHINK_GATEWAY_QWEN_MODEL=stale-qwen-model',
+        'ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT=low',
+        '',
+      ].join('\n'),
+      { mode: 0o600 }
+    );
+    const env = isolatedEnvironment(home);
+
+    const update = runCli(['config', '--main', 'qwen'], { env });
+    assert.equal(update.status, 0, update.stderr);
+    assert.match(update.stdout, /ULTRATHINK_GATEWAY_QWEN_API_KEY/u);
+    assert.match(update.stdout, /setup --prepare-claude/u);
+
+    const configPath = path.join(home, '.claude-workflow.env');
+    await fsp.appendFile(
+      configPath,
+      'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-fable-5*\n',
+      'utf8'
+    );
+    const ignoredAmbient = runCli(['config', '--main', 'qwen'], {
+      env: { ...env, DASHSCOPE_API_KEY: 'sk-test-payg-key' },
+    });
+    assert.equal(ignoredAmbient.status, 0, ignoredAmbient.stderr);
+    assert.match(ignoredAmbient.stdout, /ULTRATHINK_GATEWAY_QWEN_API_KEY/u);
+
+    const content = await fsp.readFile(configPath, 'utf8');
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=qwen/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max\[1m\]/u);
+    assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=qwen3\.8-max$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=xhigh$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS=983616$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS=131072$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_QWEN_MODEL=qwen3\.8-max$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT=xhigh$/mu);
+    assert.match(content, /^ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=none$/mu);
+    assert.doesNotMatch(
+      content,
+      /^ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=claude-fable-5\*$/mu
+    );
+    assert.doesNotMatch(content, /(?:QWEN|BAILIAN|DASHSCOPE).*API_KEY=/u);
+
+    const fakeKey = 'sk-sp-test-qwen-config-key';
+    await fsp.appendFile(
+      configPath,
+      `ULTRATHINK_GATEWAY_QWEN_API_KEY=${fakeKey}\n`,
+      'utf8'
+    );
+    const insecure = runCli(['config', '--main', 'qwen'], {
+      env: {
+        ...env,
+        ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey,
+        QWEN_BASE_URL: 'http://api.example.com/compatible-mode/v1',
+      },
+    });
+    assert.equal(insecure.status, 0, insecure.stderr);
+    assert.match(insecure.stdout, /use an HTTPS Qwen base URL/u);
+    assert.doesNotMatch(insecure.stdout, /add ULTRATHINK_GATEWAY_QWEN_API_KEY/u);
+
+    const show = runCli(['config'], {
+      env: { ...env, ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey },
+    });
+    assert.equal(show.status, 0, show.stderr);
+    assert.match(
+      show.stdout,
+      /Main\s+Qwen 3\.8 Max -> qwen \(qwen3\.8-max\[1m\]\)/u
+    );
+    const json = runCli(['config', '--json'], {
+      env: { ...env, ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey },
+    });
+    assert.equal(json.status, 0, json.stderr);
+    assert.equal(JSON.parse(json.stdout).main.target, 'qwen:qwen3.8-max/xhigh');
+
+    const reset = runCli(['config', '--reset'], { env });
+    assert.equal(reset.status, 0, reset.stderr);
+    assert.equal(
+      (await fsp.readFile(configPath, 'utf8')).trim(),
+      `ULTRATHINK_GATEWAY_QWEN_API_KEY=${fakeKey}`
+    );
   }
 );
 
@@ -831,6 +1164,27 @@ test(
   }
 );
 
+test('launcher rejects background Claude lifecycle flags before dispatch', function () {
+  for (const args of [
+    ['--', '--background'],
+    ['--', '--bg'],
+    ['--', '--background=true'],
+    ['run', '--', '--background'],
+    ['run', '--', '--bg'],
+  ]) {
+    const result = runCli(args, {
+      env: isolatedEnvironment(os.tmpdir(), { PATH: '/usr/bin:/bin' }),
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /is not supported because claude-workflow owns a per-session gateway/u
+    );
+    assert.match(result.stderr, /explicit durable gateway integration/u);
+    assert.doesNotMatch(result.stderr, /claude CLI not found/u);
+  }
+});
+
 test(
   'Kimi credentials stay gateway-only while Claude receives the 1M/max profile',
   { skip: process.platform === 'win32' },
@@ -875,6 +1229,7 @@ test(
     assert.notEqual(values[6], 'unset');
     assert.equal(values[7], values[6]);
     assert.equal(values[8], values[6]);
+    assert.equal(values[13], '1');
     assert.equal(`${result.stdout}\n${result.stderr}`.includes(fakeKey), false);
     const args = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
     assert.ok(args.includes('--settings'));
@@ -887,6 +1242,7 @@ test(
     assert.equal(privateSettings.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
     assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '1048576');
     assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '1048576');
+    assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
     assert.equal(privateSettings.env.CLAUDE_CODE_SUBAGENT_MODEL, 'codex-terra');
     assert.equal(privateSettings.env.ULTRATHINK_GATEWAY_KIMI_API_KEY, '');
     assert.equal(privateSettings.env.KIMI_API_KEY, '');
@@ -921,10 +1277,86 @@ test(
 );
 
 test(
-  'switching from Kimi to Fable removes stale Kimi client settings',
+  'Qwen credentials stay gateway-only while Claude receives the 1M/xhigh single-request profile',
   { skip: process.platform === 'win32' },
   async function (t) {
-    const root = await temporaryDirectory(t, 'claude-workflow-fable-child-env-');
+    const root = await temporaryDirectory(t, 'claude-workflow-qwen-child-env-');
+    const home = path.join(root, 'home');
+    const envFile = path.join(root, 'claude env.txt');
+    const nativeEnvFile = path.join(root, 'native child env.txt');
+    const argsFile = path.join(root, 'claude args.txt');
+    const settingsCapture = path.join(root, 'private settings.json');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const fakeKey = 'sk-sp-test-qwen-child-secret';
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      FAKE_CLAUDE_ENV_FILE: envFile,
+      FAKE_CLAUDE_ARGS_FILE: argsFile,
+      FAKE_CLAUDE_SETTINGS_CAPTURE_FILE: settingsCapture,
+      FAKE_NATIVE_ENV_FILE: nativeEnvFile,
+      ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'qwen',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'qwen3.8-max[1m]',
+      ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey,
+      QWEN_API_KEY: 'sk-sp-test-qwen-ambient-secret',
+      BAILIAN_TOKEN_PLAN_API_KEY: 'sk-sp-test-bailian-ambient-secret',
+      DASHSCOPE_API_KEY: 'sk-test-dashscope-ambient-secret',
+    });
+    prepareClaudeThirdPartyModelSupport(env);
+
+    const result = runCli(['Reply with exactly OK.'], { env });
+    assert.equal(result.status, 0, result.stderr);
+    const values = (await fsp.readFile(envFile, 'utf8')).trim().split('\n');
+    assert.deepEqual(values.slice(2, 6), [
+      'qwen3.8-max[1m]',
+      'max',
+      '983616',
+      '983616',
+    ]);
+    assert.notEqual(values[6], 'unset');
+    assert.equal(values[7], values[6]);
+    assert.equal(values[8], values[6]);
+    assert.deepEqual(values.slice(9, 13), ['unset', 'unset', 'unset', 'unset']);
+    assert.equal(values[13], '1');
+    assert.equal(`${result.stdout}\n${result.stderr}`.includes(fakeKey), false);
+
+    const args = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
+    assert.deepEqual(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2), [
+      '--effort',
+      'max',
+    ]);
+    const privateSettings = JSON.parse(await fsp.readFile(settingsCapture, 'utf8'));
+    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'qwen3.8-max[1m]');
+    assert.equal(privateSettings.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '983616');
+    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '983616');
+    assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+    for (const name of [
+      'ULTRATHINK_GATEWAY_QWEN_API_KEY',
+      'QWEN_API_KEY',
+      'BAILIAN_TOKEN_PLAN_API_KEY',
+      'DASHSCOPE_API_KEY',
+    ]) {
+      assert.equal(privateSettings.env[name], '');
+    }
+
+    const nativeChildRecords = (await fsp.readFile(nativeEnvFile, 'utf8'))
+      .trim()
+      .split('\n');
+    assert.equal(nativeChildRecords.some((record) => record.startsWith('claude:')), true);
+    assert.equal(nativeChildRecords.some((record) => record.startsWith('codex:')), true);
+    for (const record of nativeChildRecords) {
+      assert.match(record, /\|{6}$/u);
+      assert.equal(record.includes(fakeKey), false);
+    }
+  }
+);
+
+test(
+  'switching from Kimi to the Anthropic default removes stale Kimi client settings',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-opus-child-env-');
     const home = path.join(root, 'home');
     const envFile = path.join(root, 'claude env.txt');
     const settingsCapture = path.join(root, 'private settings.json');
@@ -948,7 +1380,12 @@ test(
     assert.deepEqual(values, [
       'unset',
       'unset',
-      'claude-fable-5[1m]',
+      'claude-opus-5[1m]',
+      'unset',
+      'unset',
+      'unset',
+      'unset',
+      'unset',
       'unset',
       'unset',
       'unset',
@@ -957,7 +1394,7 @@ test(
       'unset',
     ]);
     const privateSettings = JSON.parse(await fsp.readFile(settingsCapture, 'utf8'));
-    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'claude-fable-5[1m]');
+    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'claude-opus-5[1m]');
     assert.equal(Object.hasOwn(privateSettings.env, 'ANTHROPIC_AUTH_TOKEN'), false);
     assert.equal(Object.hasOwn(privateSettings.env, 'ANTHROPIC_API_KEY'), false);
   }

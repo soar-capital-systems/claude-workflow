@@ -13,6 +13,7 @@ function filesUnder(directory, extension) {
   if (!fs.existsSync(directory)) {
     return files;
   }
+
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     const target = path.join(directory, entry.name);
     if (entry.isDirectory()) {
@@ -37,14 +38,22 @@ function run(command, args) {
   }
 }
 
-for (const file of [...filesUnder(path.join(ROOT, 'js'), '.js'), ...filesUnder(path.join(ROOT, 'test'), '.js')]) {
+for (const file of [
+  ...filesUnder(path.join(ROOT, 'js'), '.js'),
+  ...filesUnder(path.join(ROOT, 'test'), '.js'),
+  ...filesUnder(path.join(ROOT, 'scripts'), '.mjs'),
+]) {
   run(process.execPath, ['--check', file]);
 }
 
 for (const file of [
-  path.join(ROOT, 'scripts', 'claude-workflow-daemon.sh'),
+  ...filesUnder(path.join(ROOT, 'scripts'), '.sh'),
+  ...filesUnder(path.join(ROOT, 'test'), '.sh'),
+  path.join(ROOT, 'cleanup.sh'),
+  path.join(ROOT, 'ui', 'start-test.sh'),
+  path.join(ROOT, 'ui', 'bin', 'ultrathink-ui'),
   path.join(ROOT, 'scripts', 'claude-workflow-gateway.bashrc'),
-]) {
+].filter((file) => fs.existsSync(file))) {
   run('bash', ['-n', file]);
 }
 

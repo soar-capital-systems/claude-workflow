@@ -55,9 +55,9 @@ export function buildClaudeSettingsOverrideEnvironment(extraEnv, childEnv) {
     const value = extraEnv[name];
     settingsEnv[name] = value === null || value === undefined ? '' : String(value);
   }
-  // Terminal-title suppression belongs only to the direct Codex preset. Do
-  // not publish a blank value for other routes: their parent environment and
-  // persistent Claude settings remain the user's preference.
+  // Direct non-Anthropic routes suppress Claude's auxiliary terminal-title
+  // request. Do not publish a blank value for other routes: their parent
+  // environment and persistent Claude settings remain the user's preference.
   if (
     Object.hasOwn(extraEnv, CLAUDE_TERMINAL_TITLE_ENV_NAME) &&
     extraEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] !== null &&
@@ -265,67 +265,6 @@ function parseJsonObject(source, target, label) {
   return value;
 }
 
-function settingsEnvironment(settings, target) {
-  if (settings.env === undefined || settings.env === null) {
-    return null;
-  }
-  if (typeof settings.env !== 'object' || Array.isArray(settings.env)) {
-    throw new Error(`Claude settings env must contain a JSON object: ${target}`);
-  }
-  return settings.env;
-}
-
-function conflictingSettingsEnvironmentNames(settings, target) {
-  const settingsEnv = settingsEnvironment(settings, target);
-  if (!settingsEnv) {
-    return [];
-  }
-  return CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES.filter((name) =>
-    Object.hasOwn(settingsEnv, name)
-  );
-}
-
-export function inspectClaudeRoutingSettingsConflicts(
-  env = process.env,
-  cwd = process.cwd()
-) {
-  const requestedRoot = path.resolve(cwd);
-  let projectRoot = requestedRoot;
-  for (let candidate = requestedRoot; ; candidate = path.dirname(candidate)) {
-    if (fs.existsSync(path.join(candidate, '.git'))) {
-      projectRoot = candidate;
-      break;
-    }
-    const parent = path.dirname(candidate);
-    if (parent === candidate) {
-      break;
-    }
-  }
-  const candidates = [
-    { source: 'user', path: claudeUserSettingsPath(env) },
-    { source: 'project', path: path.join(projectRoot, '.claude', 'settings.json') },
-    { source: 'local', path: path.join(projectRoot, '.claude', 'settings.local.json') },
-  ];
-  const conflicts = [];
-  const visited = new Set();
-  for (const candidate of candidates) {
-    if (visited.has(candidate.path)) {
-      continue;
-    }
-    visited.add(candidate.path);
-    const source = optionalFile(candidate.path);
-    if (!source.stats) {
-      continue;
-    }
-    const settings = parseJsonObject(source, candidate.path, 'Claude settings file');
-    const names = conflictingSettingsEnvironmentNames(settings, candidate.path);
-    if (names.length > 0) {
-      conflicts.push({ ...candidate, names });
-    }
-  }
-  return conflicts;
-}
-
 function hardenExistingFile(target, stats) {
   if (!stats || ownerOnlyModeIsEnforced(stats)) {
     return false;
@@ -352,23 +291,14 @@ export function inspectClaudeThirdPartyModelSupport(env = process.env) {
       value.hasCompletedOnboarding === true && value.penguinModeOrgEnabled === true;
   }
 
-  const settingsPath = claudeUserSettingsPath(env);
-  const settingsSource = optionalFile(settingsPath);
-  let conflictingSettingsEnvNames = [];
-  if (settingsSource.stats) {
-    const settings = parseJsonObject(settingsSource, settingsPath, 'Claude settings file');
-    conflictingSettingsEnvNames = conflictingSettingsEnvironmentNames(settings, settingsPath);
-  }
-
   return {
-    conflictingSettingsEnvNames,
     // The launcher supplies a private, higher-precedence --settings file for
-    // every session. Persistent user/project settings therefore do not need
-    // to be changed just to use a third-party route.
+    // every session. Persistent user/project settings are irrelevant to this
+    // readiness check and may be malformed or symlinked without blocking it.
     enabled: stateEnabled,
     exists: Boolean(source.stats),
     path: target,
-    settingsPath,
+    settingsPath: claudeUserSettingsPath(env),
     stateEnabled,
   };
 }
@@ -402,7 +332,6 @@ export function prepareClaudeThirdPartyModelSupport(env = process.env) {
   return {
     backupPath,
     changed: stateChanged,
-    conflictingSettingsEnvNames: [],
     path: target,
     settingsBackupPath: null,
     settingsChanged: false,

@@ -2152,7 +2152,7 @@ class CodexGatewaySession {
     this.latestContextTokens = 0;
     this.idleTimer = null;
     this.pendingToolTimer = null;
-    this.lastUsedAt = Date.now();
+    this.lastUsedSequence = 0;
     this.disposed = false;
 
     traceLog(this.tracer, 'codex.session.created', {
@@ -2180,7 +2180,6 @@ class CodexGatewaySession {
     timeoutMs = this.config.codex.idleTimeoutMs,
     pendingToolTimeoutMs = DEFAULT_PENDING_TOOL_TIMEOUT_MS
   ) {
-    this.lastUsedAt = Date.now();
     clearTimeout(this.idleTimer);
     clearTimeout(this.pendingToolTimer);
     this.idleTimer = null;
@@ -3178,6 +3177,7 @@ export class CodexSessionManager {
     this.pendingSessionClosures = new Set();
     this.tracer = options.tracer || null;
     this.learnedContextWindows = new Map();
+    this.recencySequence = 0;
     this.createSession =
       typeof options.createSession === 'function'
         ? options.createSession
@@ -3421,6 +3421,7 @@ export class CodexSessionManager {
         requestTracer,
         options
       );
+      this.markSessionUsed(session);
       this.sessions.set(selection.sessionKey, session);
       this.watchSession(selection.sessionKey, session);
     } else {
@@ -3713,6 +3714,11 @@ export class CodexSessionManager {
     );
   }
 
+  markSessionUsed(session) {
+    this.recencySequence += 1;
+    session.lastUsedSequence = this.recencySequence;
+  }
+
   ensureSessionCapacity(incomingSessionKey, requestTracer = null) {
     const maxSessions = this.maxSessions();
     if (this.sessions.size < maxSessions) {
@@ -3724,7 +3730,7 @@ export class CodexSessionManager {
         return session.isCapacityEvictable?.() ?? session.isDisposableIdle?.();
       })
       .sort(function oldestFirst(left, right) {
-        return (left[1].lastUsedAt || 0) - (right[1].lastUsedAt || 0);
+        return (left[1].lastUsedSequence || 0) - (right[1].lastUsedSequence || 0);
       });
 
     while (this.sessions.size >= maxSessions && candidates.length > 0) {
@@ -3780,6 +3786,7 @@ export class CodexSessionManager {
       return;
     }
 
+    this.markSessionUsed(session);
     session.touch(
       this.expireSession.bind(this),
       this.sessionIdleTimeoutMs(session),
@@ -3953,7 +3960,7 @@ export class CodexSessionManager {
         );
       })
       .sort(function oldestFirst(left, right) {
-        return (left[1].lastUsedAt || 0) - (right[1].lastUsedAt || 0);
+        return (left[1].lastUsedSequence || 0) - (right[1].lastUsedSequence || 0);
       });
 
     for (const [sessionKey, session] of candidates) {

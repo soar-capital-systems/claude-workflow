@@ -1,3 +1,11 @@
+import {
+  GATEWAY_PROVIDER_IDS,
+  QWEN_TOKEN_PLAN_DEFAULTS,
+  gatewayProviderProfile,
+  qwenProfileConfigurationIssue,
+  routeProviderMetadata,
+} from './provider-profiles.js';
+
 function formatClaudeFamily(modelId) {
   if (typeof modelId !== 'string' || modelId.trim() === '') {
     return 'Claude model';
@@ -28,6 +36,7 @@ const ROUTE_PROVIDERS = Object.freeze({
   DEEPSEEK: 'deepseek',
   GLM: 'glm',
   KIMI: 'kimi',
+  QWEN: 'qwen',
   OPENAI: 'openai',
   CODEX: 'codex',
 });
@@ -37,6 +46,7 @@ const ROUTE_PROVIDER_BUILDERS = Object.freeze({
   [ROUTE_PROVIDERS.DEEPSEEK]: buildDeepSeekRoute,
   [ROUTE_PROVIDERS.GLM]: buildGlmRoute,
   [ROUTE_PROVIDERS.KIMI]: buildKimiRoute,
+  [ROUTE_PROVIDERS.QWEN]: buildQwenRoute,
   [ROUTE_PROVIDERS.OPENAI]: buildOpenAiRoute,
   [ROUTE_PROVIDERS.CODEX]: buildCodexRoute,
 });
@@ -72,7 +82,7 @@ const VALID_CODEX_APPROVAL_POLICIES = Object.freeze([
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
-const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*']);
+const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-5*']);
 const KIMI_REASONING_EFFORT_MAP = Object.freeze({
   light: 'low',
   low: 'low',
@@ -81,6 +91,22 @@ const KIMI_REASONING_EFFORT_MAP = Object.freeze({
   medium: 'high',
   max: 'max',
   ultra: 'max',
+  xhigh: 'max',
+});
+const QWEN_REASONING_EFFORT_MAP = Object.freeze({
+  light: 'low',
+  low: 'low',
+  minimal: 'low',
+  minimum: 'low',
+  medium: 'medium',
+  high: 'xhigh',
+  max: 'xhigh',
+  ultra: 'xhigh',
+  xhigh: 'xhigh',
+});
+const QWEN_CLAUDE_EFFORT_MAP = Object.freeze({
+  low: 'low',
+  medium: 'medium',
   xhigh: 'max',
 });
 
@@ -183,6 +209,7 @@ function buildAnthropicRoute(modelId, config, entry = null) {
   );
 
   return {
+    ...routeProviderMetadata(ROUTE_PROVIDERS.ANTHROPIC),
     provider: ROUTE_PROVIDERS.ANTHROPIC,
     requestedModel: modelId,
     upstreamModel,
@@ -217,6 +244,7 @@ function buildOpenAiCompatibleRoute(modelId, config, entry, options) {
   const thinking = routeObjectValue(entry, ROUTE_ENTRY_THINKING_KEYS, providerConfig.thinking);
 
   return {
+    ...routeProviderMetadata(options.provider),
     provider: options.provider,
     requestedModel: modelId,
     upstreamModel,
@@ -225,6 +253,15 @@ function buildOpenAiCompatibleRoute(modelId, config, entry, options) {
     thinking,
     maxTokensField: options.maxTokensField,
     systemRole: options.systemRole,
+    preserveAssistantThinking: options.preserveAssistantThinking === true,
+    emitReasoningContent: options.emitReasoningContent === true,
+    enableThinking: options.enableThinking === true,
+    preserveThinking: options.preserveThinking === true,
+    toolStream: options.toolStream === true,
+    supportsParallelToolCalls: options.supportsParallelToolCalls !== false,
+    explicitParallelToolCalls: options.explicitParallelToolCalls === true,
+    toolChoicePolicy: options.toolChoicePolicy || '',
+    strictThinkingReplay: options.strictThinkingReplay === true,
     displayName: buildDisplayName(
       modelId,
       entry,
@@ -270,6 +307,137 @@ function buildGlmRoute(modelId, config, entry = null) {
   });
 }
 
+function normalizedQwenReasoningEffort(modelId, value) {
+  const normalized = routeValue(
+    value,
+    QWEN_TOKEN_PLAN_DEFAULTS.reasoningEffort
+  ).toLowerCase();
+  const mapped = Object.hasOwn(QWEN_REASONING_EFFORT_MAP, normalized)
+    ? QWEN_REASONING_EFFORT_MAP[normalized]
+    : '';
+  if (mapped) {
+    return mapped;
+  }
+
+  throw new GatewayError(
+    500,
+    'api_error',
+    `Qwen route for ${modelId} must set reasoningEffort to low, medium, or xhigh`
+  );
+}
+
+function validateQwenEndpointAndCredential(providerConfig) {
+  const issue = qwenProfileConfigurationIssue(providerConfig);
+  if (issue === 'invalid_url') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Qwen routing requires a valid ULTRATHINK_GATEWAY_QWEN_BASE_URL'
+    );
+  }
+
+  if (issue === 'unsupported_protocol') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Qwen routing requires an https:// base URL; http:// is allowed only for a loopback gateway'
+    );
+  }
+
+  if (issue === 'insecure_url') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Qwen routing refuses remote http:// base URLs because they would expose the upstream credential; use https:// or a loopback HTTP gateway'
+    );
+  }
+
+  if (issue === 'anthropic_endpoint') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Qwen routing uses Alibaba\'s OpenAI-compatible transport; configure the compatible-mode/v1 endpoint, not the apps/anthropic endpoint'
+    );
+  }
+
+  if (issue === 'token_plan_key_mismatch') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'The Alibaba Token Plan endpoint requires its matching sk-sp- credential. Use ULTRATHINK_GATEWAY_QWEN_API_KEY or BAILIAN_TOKEN_PLAN_API_KEY, or configure a matching custom Qwen base URL.'
+    );
+  }
+}
+
+function buildQwenRoute(modelId, config, entry = null) {
+  const providerConfig = config.qwen || {};
+  if (!providerConfig.apiKey) {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Qwen routing is configured but ULTRATHINK_GATEWAY_QWEN_API_KEY, BAILIAN_TOKEN_PLAN_API_KEY, or QWEN_API_KEY is missing; DASHSCOPE_API_KEY requires an explicit matching QWEN_BASE_URL'
+    );
+  }
+  validateQwenEndpointAndCredential(providerConfig);
+
+  const upstreamModel = modelIdWithoutBracketQualifiers(
+    routeEntryValue(
+      entry,
+      ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
+      providerConfig.model,
+      QWEN_TOKEN_PLAN_DEFAULTS.model
+    )
+  );
+  const reasoningEffort = normalizedQwenReasoningEffort(
+    modelId,
+    routeEntryValue(
+      entry,
+      ROUTE_ENTRY_REASONING_KEYS,
+      providerConfig.reasoningEffort,
+      QWEN_TOKEN_PLAN_DEFAULTS.reasoningEffort
+    )
+  );
+
+  const route = buildOpenAiCompatibleRoute(modelId, config, entry, {
+    provider: ROUTE_PROVIDERS.QWEN,
+    configKey: 'qwen',
+    displayProvider: 'Qwen',
+    // Alibaba's Qwen Token Plan treats max_tokens as the answer budget while
+    // reasoning_effort independently selects the thinking budget. Using
+    // max_completion_tokens here would force reasoning and the answer to share
+    // Claude's typically much smaller answer allowance.
+    maxTokensField: 'max_tokens',
+    systemRole: 'system',
+    stripModelBracketQualifiers: true,
+    preserveAssistantThinking: true,
+    emitReasoningContent: true,
+    enableThinking: true,
+    preserveThinking: true,
+    toolStream: true,
+    supportsParallelToolCalls: true,
+    explicitParallelToolCalls: true,
+    toolChoicePolicy: 'auto-none',
+    strictThinkingReplay: true,
+    missingKeyMessage:
+      'Qwen routing is configured but ULTRATHINK_GATEWAY_QWEN_API_KEY, BAILIAN_TOKEN_PLAN_API_KEY, or QWEN_API_KEY is missing; DASHSCOPE_API_KEY requires an explicit matching QWEN_BASE_URL',
+  });
+
+  return {
+    ...route,
+    upstreamModel,
+    reasoningEffort,
+    contextTokens: providerConfig.contextTokens || QWEN_TOKEN_PLAN_DEFAULTS.contextTokens,
+    maxOutputTokens:
+      providerConfig.maxOutputTokens || QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens,
+    claudeEffort: QWEN_CLAUDE_EFFORT_MAP[reasoningEffort],
+    displayName: buildDisplayName(
+      modelId,
+      entry,
+      `${formatClaudeFamily(modelId)} via Qwen ${upstreamModel}/${reasoningEffort}`
+    ),
+  };
+}
+
 function normalizedKimiReasoningEffort(modelId, value) {
   const normalized = routeValue(value, 'max').toLowerCase();
   const mapped = Object.hasOwn(KIMI_REASONING_EFFORT_MAP, normalized)
@@ -305,10 +473,12 @@ function buildKimiRoute(modelId, config, entry = null) {
   );
 
   return {
+    ...routeProviderMetadata(ROUTE_PROVIDERS.KIMI),
     provider: ROUTE_PROVIDERS.KIMI,
     requestedModel: modelId,
     upstreamModel,
     reasoningEffort,
+    claudeEffort: reasoningEffort,
     contextTokens: providerConfig.contextTokens || 1_048_576,
     displayName: buildDisplayName(
       modelId,
@@ -357,6 +527,7 @@ function buildCodexRoute(modelId, config, entry = null) {
   const verbosity = routeValue(entry?.verbosity, config.codex.verbosity);
 
   return {
+    ...routeProviderMetadata(ROUTE_PROVIDERS.CODEX),
     provider: ROUTE_PROVIDERS.CODEX,
     requestedModel: modelId,
     upstreamModel,
@@ -374,19 +545,19 @@ function buildCodexRoute(modelId, config, entry = null) {
 
 function configuredProvider(entry, modelId) {
   const provider = routeValue(entry?.provider).toLowerCase();
-  if (Object.hasOwn(ROUTE_PROVIDER_BUILDERS, provider)) {
+  if (gatewayProviderProfile(provider) && Object.hasOwn(ROUTE_PROVIDER_BUILDERS, provider)) {
     return provider;
   }
 
   throw new GatewayError(
     500,
     'api_error',
-    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to "codex", "deepseek", "glm", "kimi", "openai", or "anthropic"`
+    `ULTRATHINK_GATEWAY_ROUTE_MAP_JSON entry for ${modelId} must set provider to ${GATEWAY_PROVIDER_IDS.map(function quoteProvider(value) { return `"${value}"`; }).join(', ')}`
   );
 }
 
 export function isOpusPassthroughModel(modelId) {
-  return matchesModelPattern(modelId, 'claude-opus-4-8*');
+  return matchesModelPattern(modelId, 'claude-opus-5*');
 }
 
 function matchesModelPattern(modelId, pattern) {

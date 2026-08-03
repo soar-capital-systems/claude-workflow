@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Manage the shared claude-workflow gateway daemon.
 #
-# Usage: claude-workflow-daemon.sh {ensure|start|stop|restart|status|log|install-shell|uninstall-shell}
+# Usage: claude-workflow-daemon.sh {start|stop|restart|reconcile|status|log|install-shell|uninstall-shell|migrate-shell}
 #
-# `ensure` performs a fast health/source-revision check, then hands stale or
-# missing daemon startup to the background behind a single-starter lock. It is
-# safe to call from ~/.bashrc so every shell revives or refreshes the daemon.
+# `ensure` is a fail-closed compatibility command for historical shell hooks.
+# Shell startup must never start or source the shared gateway.
 # New installs keep state in ${XDG_STATE_HOME:-~/.cache}/claude-workflow/.
 # Existing ~/.cache/ultrathink daemon state is detected for upgrade compatibility.
 set -u
@@ -23,19 +22,37 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 DAEMON_JS="$REPO_ROOT/js/cli/claude-workflow-daemon.js"
-CANONICAL_STATE_DIR="${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow"
-LEGACY_STATE_DIR="$HOME/.cache/ultrathink"
+MANAGED_STATE_HELPER="$REPO_ROOT/js/cli/claude-workflow-managed-state.js"
+normalize_directory_base() {
+  local value="$1"
+  while [ "$value" != "/" ] && [ "${value%/}" != "$value" ]; do
+    value="${value%/}"
+  done
+  printf '%s\n' "$value"
+}
+HOME_BASE="$(normalize_directory_base "$HOME")"
+STATE_HOME="$(normalize_directory_base "${XDG_STATE_HOME:-$HOME_BASE/.cache}")"
+CANONICAL_STATE_DIR="$STATE_HOME/claude-workflow"
+LEGACY_STATE_DIR="$HOME_BASE/.cache/ultrathink"
 if [ -n "${CLAUDE_WORKFLOW_GATEWAY_STATE_DIR:-}" ]; then
   STATE_DIR="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"
 elif [ ! -e "$CANONICAL_STATE_DIR" ] && {
   [ -f "$LEGACY_STATE_DIR/claude-workflow-gateway.pid" ] ||
-    [ -f "$LEGACY_STATE_DIR/claude-workflow-gateway.env" ]
+    [ -f "$LEGACY_STATE_DIR/claude-workflow-gateway.env" ] ||
+    [ -f "$LEGACY_STATE_DIR/.claude-workflow-gateway.owner" ]
 }; then
   STATE_DIR="$LEGACY_STATE_DIR"
 else
   STATE_DIR="$CANONICAL_STATE_DIR"
 fi
 ENV_FILE="${CLAUDE_WORKFLOW_GATEWAY_ENV_FILE:-$STATE_DIR/claude-workflow-gateway.env}"
+if [ "$STATE_DIR" = "$CANONICAL_STATE_DIR" ]; then
+  STATE_KIND="canonical"
+elif [ "$STATE_DIR" = "$LEGACY_STATE_DIR" ]; then
+  STATE_KIND="legacy"
+else
+  STATE_KIND="custom"
+fi
 PID_FILE="$STATE_DIR/claude-workflow-gateway.pid"
 REVISION_FILE="$STATE_DIR/claude-workflow-gateway.revision"
 LOCK_FILE="$STATE_DIR/claude-workflow-gateway.start.lock"
@@ -62,28 +79,35 @@ validate_managed_port() {
 
 ensure_private_state_dir() {
   local node_bin
-  if [ -L "$STATE_DIR" ]; then
-    echo "claude-workflow-gateway: state directory must not be a symlink: $STATE_DIR" >&2
-    return 1
-  fi
-  mkdir -p "$STATE_DIR" || return 1
-  if [ ! -d "$STATE_DIR" ]; then
-    echo "claude-workflow-gateway: state path is not a directory: $STATE_DIR" >&2
-    return 1
-  fi
-  if ! chmod 700 "$STATE_DIR" 2>/dev/null; then
-    echo "claude-workflow-gateway: could not make state directory owner-only: $STATE_DIR" >&2
-    return 1
-  fi
   node_bin="$(find_node)" || {
     echo "claude-workflow-gateway: node not found" >&2
     return 1
   }
-  if ! path_has_owner_only_mode "$node_bin" "$STATE_DIR"; then
-    echo "claude-workflow-gateway: state directory does not enforce owner-only permissions: $STATE_DIR" >&2
-    echo "claude-workflow-gateway: on WSL, use the Linux filesystem or enable DrvFS metadata" >&2
+  "$node_bin" "$MANAGED_STATE_HELPER" claim "$STATE_DIR" "$STATE_KIND"
+}
+
+verify_or_migrate_existing_state() {
+  local node_bin
+  [ -e "$STATE_DIR" ] || return 2
+  node_bin="$(find_node)" || {
+    echo "claude-workflow-gateway: node not found" >&2
     return 1
-  fi
+  }
+  "$node_bin" "$MANAGED_STATE_HELPER" verify-or-migrate "$STATE_DIR" "$STATE_KIND"
+}
+
+verify_managed_replacement() {
+  local target="$1"
+  local node_bin
+  node_bin="$(find_node)" || return 1
+  "$node_bin" "$MANAGED_STATE_HELPER" verify-replacement "$STATE_DIR" "${target##*/}"
+}
+
+remove_managed_runtime_files() {
+  local node_bin
+  node_bin="$(find_node)" || return 1
+  "$node_bin" "$MANAGED_STATE_HELPER" remove "$STATE_DIR" \
+    "${PID_FILE##*/}" "${REVISION_FILE##*/}" "${ENV_FILE##*/}"
 }
 
 find_node() {
@@ -135,6 +159,7 @@ NODE
 }
 
 validate_manager_paths() {
+  local node_bin
   local trace_dir_normalized
   case "$STATE_DIR" in
     /*) ;;
@@ -150,21 +175,30 @@ validate_manager_paths() {
       return 1
       ;;
   esac
+  if [ "$ENV_FILE" != "$STATE_DIR/claude-workflow-gateway.env" ]; then
+    echo "claude-workflow-gateway: CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be exactly $STATE_DIR/claude-workflow-gateway.env (inside the managed state directory)" >&2
+    return 1
+  fi
   if [ "${ULTRATHINK_GATEWAY_TRACE_DIR+x}" = "x" ]; then
     case "${ULTRATHINK_GATEWAY_TRACE_DIR:-}" in
-      ''|/*) ;;
+      ''|"$STATE_DIR/gateway-trace") ;;
       *)
         trace_dir_normalized="$(printf '%s' "$ULTRATHINK_GATEWAY_TRACE_DIR" | tr '[:upper:]' '[:lower:]')"
         case "$trace_dir_normalized" in
           0|false|no|off) ;;
           *)
-            echo "claude-workflow-gateway: ULTRATHINK_GATEWAY_TRACE_DIR must be absolute or disabled with off/false/no/0" >&2
+            echo "claude-workflow-gateway: shared-daemon ULTRATHINK_GATEWAY_TRACE_DIR must be $STATE_DIR/gateway-trace or disabled with off/false/no/0" >&2
             return 1
             ;;
         esac
         ;;
-    esac
+      esac
   fi
+  node_bin="$(find_node)" || {
+    echo "claude-workflow-gateway: node not found" >&2
+    return 1
+  }
+  "$node_bin" "$MANAGED_STATE_HELPER" validate-paths "$STATE_DIR" "$ENV_FILE"
 }
 
 validate_shared_project_env() {
@@ -249,7 +283,9 @@ for (const configName of ['.claude-workflow.env', '.ultrathink.env']) {
 const revisionEnvPrefixes = ['CLAUDE_WORKFLOW_', 'ULTRATHINK_'];
 const revisionEnvNames = new Set([
   'ANTHROPIC_API_KEY',
+  'BAILIAN_TOKEN_PLAN_API_KEY',
   'CODEX_HOME',
+  'DASHSCOPE_API_KEY',
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_BASE_URL',
   'DEEPSEEK_DEFAULT_MODEL_ID',
@@ -259,6 +295,10 @@ const revisionEnvNames = new Set([
   'KIMI_API_KEY',
   'OPENAI_API_KEY',
   'PATH',
+  'QWEN_API_KEY',
+  'QWEN_BASE_URL',
+  'QWEN_MODEL',
+  'QWEN_REASONING_EFFORT',
   'ZAI_API_KEY',
   'ZAI_BASE_URL',
   'ZAI_DEFAULT_MODEL_ID',
@@ -417,6 +457,10 @@ write_atomic_state_file() {
     rm -f "$temp_file"
     return 1
   fi
+  if ! verify_managed_replacement "$target"; then
+    rm -f "$temp_file"
+    return 1
+  fi
   if ! mv -f "$temp_file" "$target"; then
     rm -f "$temp_file"
     return 1
@@ -434,33 +478,54 @@ write_atomic_state_file() {
 
 spawn_detached_daemon() {
   local node_bin="$1"
-  "$node_bin" - "$DAEMON_JS" "$LOG_FILE" <<'NODE'
+  "$node_bin" - "$DAEMON_JS" "$LOG_FILE" "$STATE_DIR" "$PORT" <<'NODE'
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 
 const daemonPath = process.argv[2];
 const logPath = process.argv[3];
+const statePath = process.argv[4];
+const port = process.argv[5];
 if (fs.existsSync(logPath)) {
   const existingLogStats = fs.lstatSync(logPath);
   if (existingLogStats.isSymbolicLink() || !existingLogStats.isFile()) {
     throw new Error(`gateway log path must be a regular file: ${logPath}`);
   }
 }
-const logFd = fs.openSync(logPath, 'a', 0o600);
-fs.chmodSync(logPath, 0o600);
-const logStats = fs.lstatSync(logPath);
-if (!logStats.isFile() || logStats.isSymbolicLink() || (logStats.mode & 0o077) !== 0) {
+const logFlags =
+  fs.constants.O_WRONLY |
+  fs.constants.O_CREAT |
+  fs.constants.O_APPEND |
+  (fs.constants.O_NOFOLLOW || 0);
+const logFd = fs.openSync(logPath, logFlags, 0o600);
+fs.fchmodSync(logFd, 0o600);
+const logStats = fs.fstatSync(logFd);
+if (
+  !logStats.isFile() ||
+  (logStats.mode & 0o077) !== 0 ||
+  (typeof process.getuid === 'function' && logStats.uid !== process.getuid())
+) {
   fs.closeSync(logFd);
   throw new Error(
     `gateway log does not enforce owner-only permissions: ${logPath}. ` +
       'On WSL, use the Linux filesystem or enable DrvFS metadata.'
   );
 }
-const child = spawn(process.execPath, [daemonPath], {
+const child = spawn(
+  process.execPath,
+  [
+    daemonPath,
+    '--claude-workflow-managed-state',
+    statePath,
+    '--claude-workflow-managed-port',
+    port,
+  ],
+  {
   detached: true,
   env: process.env,
   stdio: ['ignore', logFd, logFd],
-});
+  }
+);
 child.unref();
 fs.closeSync(logFd);
 process.stdout.write(`${child.pid}\n`);
@@ -469,8 +534,9 @@ NODE
 
 health_payload() {
   local node_bin
+  local health_url="${1:-$HEALTH_URL}"
   node_bin="$(find_node)" || return 1
-  "$node_bin" - "$HEALTH_URL" <<'NODE'
+  "$node_bin" - "$health_url" <<'NODE'
 const http = require('node:http');
 const url = process.argv[2];
 const request = http.get(url, { timeout: 1000 }, (response) => {
@@ -501,9 +567,10 @@ healthy() {
 health_matches_runtime() {
   local expected_pid="$1"
   local expected_revision="${2:-}"
+  local health_url="${3:-$HEALTH_URL}"
   local payload
   local node_bin
-  payload="$(health_payload 2>/dev/null)" || return 1
+  payload="$(health_payload "$health_url" 2>/dev/null)" || return 1
   node_bin="$(find_node)" || return 1
   "$node_bin" -e '
 const expectedPid = Number(process.argv[1]);
@@ -538,12 +605,13 @@ pid_is_daemon() {
 
   if [ -r "/proc/$pid/cmdline" ]; then
     node_bin="$(find_node)" || return 1
-    command_kind="$("$node_bin" - "$pid" "$DAEMON_JS" <<'NODE'
+    command_kind="$("$node_bin" - "$pid" "$DAEMON_JS" "$STATE_DIR" "$PORT" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
 
 const pid = process.argv[2];
 const expectedDaemon = fs.realpathSync(process.argv[3]);
+const expectedState = process.argv[4];
 const commandLine = fs.readFileSync(`/proc/${pid}/cmdline`);
 const args = commandLine.toString('utf8').split('\0').filter(Boolean);
 if (args.length < 2) {
@@ -567,7 +635,16 @@ try {
   process.exit(1);
 }
 if (daemonArgument === expectedDaemon) {
-  process.stdout.write('current');
+  const stateIndex = args.indexOf('--claude-workflow-managed-state');
+  const portIndex = args.indexOf('--claude-workflow-managed-port');
+  const hasManagedBinding = stateIndex !== -1 || portIndex !== -1;
+  if (stateIndex !== -1 && args[stateIndex + 1] === expectedState) {
+    process.stdout.write('current');
+  } else if (hasManagedBinding) {
+    process.exit(1);
+  } else {
+    process.stdout.write('legacy');
+  }
 } else if (path.basename(daemonArgument) === 'claude-workflow-daemon.js') {
   process.stdout.write('legacy');
 } else {
@@ -583,9 +660,24 @@ NODE
   fi
 
   command_line="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
-  if printf '%s\n' "$command_line" | grep -Fq -- "node $DAEMON_JS" ||
-    printf '%s\n' "$command_line" | grep -Fq -- "nodejs $DAEMON_JS"; then
-    return 0
+  local managed_marker
+  local recorded_port
+  managed_marker="$DAEMON_JS --claude-workflow-managed-state $STATE_DIR --claude-workflow-managed-port "
+  case "$command_line" in
+    *"$managed_marker"*)
+      recorded_port="${command_line#*"$managed_marker"}"
+      recorded_port="${recorded_port%% *}"
+      case "$recorded_port" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      health_matches_runtime "$pid" "" "http://127.0.0.1:$recorded_port/healthz"
+      return
+      ;;
+  esac
+  if printf '%s\n' "$command_line" | grep -Fq -- "$DAEMON_JS"; then
+    # Legacy managed daemons did not carry state/port identity arguments.
+    health_matches_runtime "$pid"
+    return
   fi
   printf '%s\n' "$command_line" | grep -Fq 'claude-workflow-daemon.js' &&
     health_matches_runtime "$pid"
@@ -598,6 +690,7 @@ pid_running() {
 daemon_is_current() {
   local expected_revision
   local pid
+  verify_or_migrate_existing_state >/dev/null 2>&1 || return 1
   if ! healthy || ! pid_running; then
     return 1
   fi
@@ -650,7 +743,7 @@ terminate_daemon_pid() {
 cleanup_failed_start() {
   local pid="$1"
   terminate_daemon_pid "$pid" >/dev/null 2>&1 || true
-  rm -f "$PID_FILE" "$REVISION_FILE" "$ENV_FILE"
+  remove_managed_runtime_files
 }
 
 acquire_start_lock() {
@@ -658,6 +751,9 @@ acquire_start_lock() {
   # each spawn a gateway that loses the port race. Linux/WSL normally have
   # flock; macOS does not, so fall back to atomic mkdir with a stale-pid check.
   if command -v flock >/dev/null 2>&1; then
+    if ! verify_managed_replacement "$LOCK_FILE"; then
+      return 1
+    fi
     START_LOCK_MODE="flock"
     exec 9>"$LOCK_FILE"
     if flock -n 9; then
@@ -669,16 +765,37 @@ acquire_start_lock() {
 
   START_LOCK_MODE="directory"
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "$$" >"$LOCK_DIR/pid"
+    chmod 700 "$LOCK_DIR" 2>/dev/null || {
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      return 1
+    }
+    (umask 077 && printf '%s\n' "$$" >"$LOCK_DIR/pid") || {
+      rm -f "$LOCK_DIR/pid"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      return 1
+    }
     return 0
   fi
 
   local lock_pid
-  lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+  local node_bin
+  node_bin="$(find_node)" || return 1
+  lock_pid="$("$node_bin" "$MANAGED_STATE_HELPER" read-lock-pid "$STATE_DIR" 2>/dev/null)" || {
+    echo "claude-workflow-gateway: existing start lock is not a verified managed lock; refusing removal" >&2
+    return 1
+  }
   if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-    rm -rf "$LOCK_DIR"
+    "$node_bin" "$MANAGED_STATE_HELPER" remove-lock "$STATE_DIR" "$lock_pid" || return 1
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      echo "$$" >"$LOCK_DIR/pid"
+      chmod 700 "$LOCK_DIR" 2>/dev/null || {
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        return 1
+      }
+      (umask 077 && printf '%s\n' "$$" >"$LOCK_DIR/pid") || {
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        return 1
+      }
       return 0
     fi
   fi
@@ -693,7 +810,9 @@ release_start_lock() {
       flock -u 9 2>/dev/null || true
       ;;
     directory)
-      rm -rf "$LOCK_DIR"
+      local node_bin
+      node_bin="$(find_node)" || return 1
+      "$node_bin" "$MANAGED_STATE_HELPER" remove-lock "$STATE_DIR" "$$" || return 1
       ;;
   esac
   START_LOCK_MODE=""
@@ -754,6 +873,10 @@ start_daemon_locked() {
     echo "claude-workflow-gateway: node not found" >&2
     return 1
   }
+  if ! verify_managed_replacement "$LOG_FILE"; then
+    echo "claude-workflow-gateway: refusing unverified log collision: $LOG_FILE" >&2
+    return 1
+  fi
 
   local trace_dir
   if [ "${ULTRATHINK_GATEWAY_TRACE_DIR+x}" = "x" ]; then
@@ -766,6 +889,7 @@ start_daemon_locked() {
   runtime_started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   local started_pid
   started_pid="$(ULTRATHINK_GATEWAY_DAEMON_PORT="$PORT" \
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$STATE_DIR" \
     CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="$ENV_FILE" \
     ULTRATHINK_GATEWAY_CODEX_CWD="$STATE_DIR" \
     ULTRATHINK_GATEWAY_RUNTIME_REVISION="$runtime_revision" \
@@ -806,19 +930,56 @@ start_daemon_locked() {
 
 stop_daemon() {
   local pid
+  local state_result
+  verify_or_migrate_existing_state
+  state_result=$?
+  if [ "$state_result" -ne 0 ]; then
+    if [ "$state_result" -eq 2 ]; then
+      echo "claude-workflow-gateway: not running"
+      return 0
+    fi
+    return "$state_result"
+  fi
   pid="$(daemon_pid)"
   if pid_is_daemon "$pid"; then
     if terminate_daemon_pid "$pid"; then
-      rm -f "$PID_FILE" "$REVISION_FILE" "$ENV_FILE"
+      remove_managed_runtime_files || return 1
       echo "claude-workflow-gateway: stopped"
     else
       echo "claude-workflow-gateway: could not stop verified daemon pid $pid" >&2
       return 1
     fi
   else
-    rm -f "$PID_FILE" "$REVISION_FILE" "$ENV_FILE"
+    remove_managed_runtime_files || return 1
     echo "claude-workflow-gateway: not running"
   fi
+}
+
+reconcile_daemon() {
+  local pid
+  local state_result
+  verify_or_migrate_existing_state
+  state_result=$?
+  if [ "$state_result" -ne 0 ]; then
+    if [ "$state_result" -eq 2 ]; then
+      echo "claude-workflow-gateway: no running owned daemon to reconcile"
+      return 0
+    fi
+    return "$state_result"
+  fi
+  pid="$(daemon_pid)"
+  if ! pid_is_daemon "$pid"; then
+    remove_managed_runtime_files || return 1
+    echo "claude-workflow-gateway: no running owned daemon to reconcile"
+    return 0
+  fi
+
+  start_daemon || return 1
+  if ! daemon_is_current; then
+    echo "claude-workflow-gateway: reconciliation did not load the installed runtime revision" >&2
+    return 1
+  fi
+  echo "claude-workflow-gateway: running daemon matches the installed runtime revision"
 }
 
 shell_rc_path() {
@@ -855,7 +1016,20 @@ resolve_shell_rc_target() {
   local target="$1"
   local link_dir
   local link_target
+  local link_count=0
+  case "$target" in
+    /*) ;;
+    *)
+      echo "claude-workflow-gateway: shell rc must resolve from an absolute path: $target" >&2
+      return 1
+      ;;
+  esac
   while [ -h "$target" ]; do
+    link_count=$((link_count + 1))
+    if [ "$link_count" -gt 40 ]; then
+      echo "claude-workflow-gateway: shell rc contains a symlink cycle: $target" >&2
+      return 1
+    fi
     link_dir="$(cd "$(dirname "$target")" && pwd)"
     link_target="$(readlink "$target")"
     case "$link_target" in
@@ -868,21 +1042,29 @@ resolve_shell_rc_target() {
 
 rewrite_shell_blocks() {
   local shell_rc="$1"
-  local operation="${2:-remove}"
   local temp_file
+  local transition_file
+  local rendered_file
   local node_bin
   local shell_rc_mode
+  local backup_file
   [ -f "$shell_rc" ] || return 0
   temp_file="$(mktemp "${shell_rc}.claude-workflow.XXXXXX")" || return 1
   if ! awk '
     index($0, "# >>> ultrathink claude-workflow gateway >>>") == 1 ||
-    index($0, "# >>> claude-workflow gateway >>>") == 1 {
+    index($0, "# >>> claude-workflow gateway >>>") == 1 ||
+    index($0, "# >>> claude-workflow shell cleanup >>>") == 1 {
       if (skipping) malformed = 1
+      if (!inserted) {
+        print "# __CLAUDE_WORKFLOW_SHELL_CLEANUP_TRANSITION__"
+        inserted = 1
+      }
       skipping = 1
       next
     }
     index($0, "# <<< ultrathink claude-workflow gateway <<<") == 1 ||
-    index($0, "# <<< claude-workflow gateway <<<") == 1 {
+    index($0, "# <<< claude-workflow gateway <<<") == 1 ||
+    index($0, "# <<< claude-workflow shell cleanup <<<") == 1 {
       if (!skipping) malformed = 1
       skipping = 0
       next
@@ -894,205 +1076,54 @@ rewrite_shell_blocks() {
     echo "claude-workflow-gateway: refusing to edit malformed shell hook markers in $shell_rc" >&2
     return 1
   fi
-  if [ "$operation" = "install" ]; then
-    if ! {
-      echo ''
-      echo '# >>> claude-workflow gateway >>>'
-      cat <<'EOF'
-case $- in
-  *x*) _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE=1; set +x ;;
-  *) _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE=0 ;;
-esac
-_claude_workflow_gateway_restore_environment() {
-  case $- in
-    *x*) _CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE=1; set +x ;;
-    *) _CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE=0 ;;
-  esac
-  case $- in
-    *a*) _CLAUDE_WORKFLOW_GATEWAY_RESTORE_ALLEXPORT=1; set +a ;;
-    *) _CLAUDE_WORKFLOW_GATEWAY_RESTORE_ALLEXPORT=0 ;;
-  esac
-  _CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES="${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES-}"
-  _CLAUDE_WORKFLOW_GATEWAY_MANAGED_SET_NAMES="${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_SET_NAMES-}"
-  _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_SET_NAMES="${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_SET_NAMES-}"
-  _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_EXPORTED_NAMES="${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_EXPORTED_NAMES-}"
-  while [ -n "$_CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES" ]; do
-    case "$_CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES" in
-      *" "*)
-        _CLAUDE_WORKFLOW_GATEWAY_ENV_NAME="${_CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES%% *}"
-        _CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES="${_CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES#* }"
-        ;;
-      *)
-        _CLAUDE_WORKFLOW_GATEWAY_ENV_NAME="$_CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES"
-        _CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES=''
-        ;;
-    esac
-    case "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" in
-      ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
-    esac
-    _CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_NAME="CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_${_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME}"
-    _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_NAME="CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_${_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME}"
-    eval "_CLAUDE_WORKFLOW_GATEWAY_CURRENT_SET=\${${_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME}+x}"
-    _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED=0
-    case " $_CLAUDE_WORKFLOW_GATEWAY_MANAGED_SET_NAMES " in
-      *" $_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME "*)
-        eval "_CLAUDE_WORKFLOW_GATEWAY_CURRENT_VALUE=\${${_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME}-}"
-        eval "_CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE=\${${_CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_NAME}-}"
-        if [ "$_CLAUDE_WORKFLOW_GATEWAY_CURRENT_SET" = x ] &&
-          [ "$_CLAUDE_WORKFLOW_GATEWAY_CURRENT_VALUE" = "$_CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE" ]; then
-          if _CLAUDE_WORKFLOW_GATEWAY_ENV_DECLARATION="$(typeset -p "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null)"; then
-            case "$_CLAUDE_WORKFLOW_GATEWAY_ENV_DECLARATION" in
-              export\ *) _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED=1 ;;
-              declare\ *|typeset\ *)
-                _CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES="${_CLAUDE_WORKFLOW_GATEWAY_ENV_DECLARATION#* }"
-                _CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES="${_CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES%% *}"
-                case "$_CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES" in -*x*) _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED=1 ;; esac
-                ;;
-            esac
-          else
-            # Shells without typeset cannot distinguish the export attribute.
-            _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED=1
-          fi
-          unset _CLAUDE_WORKFLOW_GATEWAY_ENV_DECLARATION 2>/dev/null || :
-          unset _CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES 2>/dev/null || :
-        fi
-        ;;
-      *)
-        if [ "$_CLAUDE_WORKFLOW_GATEWAY_CURRENT_SET" != x ]; then
-          _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED=1
-        fi
-        ;;
-    esac
-    if [ "$_CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED" = 1 ]; then
-      case " $_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_SET_NAMES " in
-        *" $_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME "*)
-          eval "_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_SET=\${${_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_NAME}+x}"
-          if [ "$_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_SET" = x ]; then
-            eval "_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE=\${${_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_NAME}-}"
-            case " $_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_EXPORTED_NAMES " in
-              *" $_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME "*)
-                eval 'export '"$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME"'="${_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE}"' 2>/dev/null || :
-                ;;
-              *)
-                if [ -n "${BASH_VERSION-}" ]; then
-                  export -n "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null || :
-                elif [ -n "${ZSH_VERSION-}" ]; then
-                  typeset -g +x "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null || :
-                else
-                  unset "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null || :
-                fi
-                eval "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME=\${_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE}" 2>/dev/null || :
-                ;;
-            esac
-          else
-            unset "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null || :
-          fi
-          ;;
-        *) unset "$_CLAUDE_WORKFLOW_GATEWAY_ENV_NAME" 2>/dev/null || : ;;
-      esac
-    fi
-    unset "$_CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_NAME" 2>/dev/null || :
-    unset "$_CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_NAME" 2>/dev/null || :
-  done
-  unset CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES 2>/dev/null || :
-  unset CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_SET_NAMES 2>/dev/null || :
-  unset CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_SET_NAMES 2>/dev/null || :
-  unset CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_ENV_EXPORTED_NAMES 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_MANAGED_NAMES _CLAUDE_WORKFLOW_GATEWAY_MANAGED_SET_NAMES 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_SET_NAMES _CLAUDE_WORKFLOW_GATEWAY_ENV_NAME 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_EXPORTED_NAMES 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE_NAME _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_NAME 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_CURRENT_SET _CLAUDE_WORKFLOW_GATEWAY_CURRENT_VALUE 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_ENV_DECLARATION 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_ENV_ATTRIBUTES 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_MANAGED_VALUE _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_VALUE_SET 2>/dev/null || :
-  unset _CLAUDE_WORKFLOW_GATEWAY_VALUE_OWNED 2>/dev/null || :
-  if [ "$_CLAUDE_WORKFLOW_GATEWAY_RESTORE_ALLEXPORT" = 1 ]; then set -a; fi
-  unset _CLAUDE_WORKFLOW_GATEWAY_RESTORE_ALLEXPORT 2>/dev/null || :
-  if [ "$_CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE" = 1 ]; then
-    unset _CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE 2>/dev/null || :
-    set -x
-  else
-    unset _CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE 2>/dev/null || :
-  fi
-  return 0
-}
-_claude_workflow_gateway_restore_environment || :
-unset -f _claude_workflow_gateway_restore_environment 2>/dev/null || :
-
-if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN:-}" ]; then
-  if [ "${ANTHROPIC_AUTH_TOKEN-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN" ]; then
-    unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || :
-  fi
-  if [ "${ANTHROPIC_API_KEY-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN" ]; then
-    unset ANTHROPIC_API_KEY 2>/dev/null || :
-  fi
-fi
-unset CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN 2>/dev/null || :
-
-if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE:-}" ]; then
-  if [ "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE" ]; then
-    if [ "${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET-}" = '1' ]; then
-      export CLAUDE_CODE_DISABLE_TERMINAL_TITLE="${CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE-}" 2>/dev/null || :
-    else
-      unset CLAUDE_CODE_DISABLE_TERMINAL_TITLE 2>/dev/null || :
-    fi
-  fi
-fi
-unset CLAUDE_WORKFLOW_GATEWAY_MANAGED_TERMINAL_TITLE 2>/dev/null || :
-unset CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE 2>/dev/null || :
-unset CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_TERMINAL_TITLE_SET 2>/dev/null || :
-
-if [ "$_CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE" = 1 ]; then
-  unset _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE 2>/dev/null || :
-  set -x
-else
-  unset _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE 2>/dev/null || :
-fi
-
-if command -v claude-workflow-gateway >/dev/null 2>&1; then
-  _CLAUDE_WORKFLOW_GATEWAY_MANAGER="$(command -v claude-workflow-gateway)"
-  if "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" ensure >/dev/null 2>&1; then
-    _CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR="${XDG_STATE_HOME:-${HOME-}/.cache}/claude-workflow"
-    _CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR="${HOME-}/.cache/ultrathink"
-    if [ -n "${CLAUDE_WORKFLOW_GATEWAY_STATE_DIR:-}" ]; then
-      _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"
-    elif [ ! -e "$_CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR" ] && {
-      [ -f "$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR/claude-workflow-gateway.pid" ] ||
-        [ -f "$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR/claude-workflow-gateway.env" ]
-    }; then
-      _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR"
-    else
-      _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$_CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR"
-    fi
-    _CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="${CLAUDE_WORKFLOW_GATEWAY_ENV_FILE:-$_CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/claude-workflow-gateway.env}"
-    _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT=0
-    while [ "$_CLAUDE_WORKFLOW_GATEWAY_ATTEMPT" -lt 20 ]; do
-      if "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" status >/dev/null 2>&1 && [ -r "$_CLAUDE_WORKFLOW_GATEWAY_ENV_FILE" ]; then
-        if . "$_CLAUDE_WORKFLOW_GATEWAY_ENV_FILE"; then
-          break
-        fi
-      fi
-      _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT=$((_CLAUDE_WORKFLOW_GATEWAY_ATTEMPT + 1))
-      sleep 0.1
-    done
-  fi
-  unset _CLAUDE_WORKFLOW_GATEWAY_MANAGER
-  unset _CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR
-  unset _CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR
-  unset _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR
-  unset _CLAUDE_WORKFLOW_GATEWAY_ENV_FILE
-  unset _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT
-fi
-EOF
-      echo '# <<< claude-workflow gateway <<<'
-    } >>"$temp_file"; then
+  if [ ! -r "$SCRIPT_DIR/claude-workflow-gateway.bashrc" ]; then
       rm -f "$temp_file"
-      echo "claude-workflow-gateway: could not build shell hook update for $shell_rc" >&2
+      echo "claude-workflow-gateway: cleanup transition source is unavailable" >&2
+      return 1
+  fi
+    if ! grep -Fq '# __CLAUDE_WORKFLOW_SHELL_CLEANUP_TRANSITION__' "$temp_file"; then
+      {
+        echo ''
+        echo '# __CLAUDE_WORKFLOW_SHELL_CLEANUP_TRANSITION__'
+      } >>"$temp_file" || {
+        rm -f "$temp_file"
+        return 1
+      }
+    fi
+    transition_file="$(mktemp "${shell_rc}.claude-workflow-transition.XXXXXX")" || {
+      rm -f "$temp_file"
+      return 1
+    }
+    rendered_file="$(mktemp "${shell_rc}.claude-workflow-rendered.XXXXXX")" || {
+      rm -f "$temp_file" "$transition_file"
+      return 1
+    }
+    if ! {
+      echo '# >>> claude-workflow shell cleanup >>>'
+      cat "$SCRIPT_DIR/claude-workflow-gateway.bashrc"
+      echo '# <<< claude-workflow shell cleanup <<<'
+    } >"$transition_file"; then
+      rm -f "$temp_file" "$transition_file" "$rendered_file"
+      echo "claude-workflow-gateway: could not build shell cleanup transition for $shell_rc" >&2
       return 1
     fi
-  fi
+    if ! awk -v transition_file="$transition_file" '
+      $0 == "# __CLAUDE_WORKFLOW_SHELL_CLEANUP_TRANSITION__" {
+        while ((getline transition_line < transition_file) > 0) print transition_line
+        close(transition_file)
+        next
+      }
+      { print }
+    ' "$temp_file" >"$rendered_file"; then
+      rm -f "$temp_file" "$transition_file" "$rendered_file"
+      echo "claude-workflow-gateway: could not render shell cleanup transition for $shell_rc" >&2
+      return 1
+    fi
+    if ! mv -f "$rendered_file" "$temp_file"; then
+      rm -f "$temp_file" "$transition_file" "$rendered_file"
+      return 1
+    fi
+  rm -f "$transition_file"
   if [ -e "$shell_rc" ]; then
     node_bin="$(find_node)" || {
       rm -f "$temp_file"
@@ -1109,7 +1140,17 @@ EOF
       echo "claude-workflow-gateway: could not preserve shell rc mode: $shell_rc" >&2
       return 1
     fi
-    cp -p "$shell_rc" "${shell_rc}.claude-workflow.bak" 2>/dev/null || true
+    backup_file="${shell_rc}.claude-workflow.bak"
+    if [ -h "$backup_file" ] || { [ -e "$backup_file" ] && [ ! -f "$backup_file" ]; }; then
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: refusing unsafe shell rc backup collision: $backup_file" >&2
+      return 1
+    fi
+    if [ ! -e "$backup_file" ] && ! ln "$shell_rc" "$backup_file" 2>/dev/null; then
+      rm -f "$temp_file"
+      echo "claude-workflow-gateway: could not create shell rc backup: $backup_file" >&2
+      return 1
+    fi
   fi
   if ! mv -f "$temp_file" "$shell_rc"; then
     rm -f "$temp_file"
@@ -1128,37 +1169,126 @@ install_shell() {
     echo "claude-workflow-gateway: shell rc must be a regular file: $shell_rc" >&2
     return 1
   fi
-  rewrite_shell_blocks "$shell_rc" install || return 1
-  echo "claude-workflow-gateway: installed or refreshed shell hook in $shell_rc"
+  rewrite_shell_blocks "$shell_rc" || return 1
+  echo "claude-workflow-gateway: installed cleanup-only shell transition in $shell_rc"
+  echo "claude-workflow-gateway: open a new shell, or source that file once, to clear historical workflow exports"
 }
 
 uninstall_shell() {
   local shell_rc
   shell_rc="$(shell_rc_path)" || return 1
   shell_rc="$(resolve_shell_rc_target "$shell_rc")" || return 1
+  if [ -e "$shell_rc" ] && [ ! -f "$shell_rc" ]; then
+    echo "claude-workflow-gateway: shell rc must be a regular file: $shell_rc" >&2
+    return 1
+  fi
+  [ -f "$shell_rc" ] || {
+    echo "claude-workflow-gateway: no shell rc to migrate at $shell_rc"
+    return 0
+  }
   rewrite_shell_blocks "$shell_rc" || return 1
-  echo "claude-workflow-gateway: removed shell hook from $shell_rc"
+  echo "claude-workflow-gateway: replaced shell routing with a cleanup-only transition in $shell_rc"
+  echo "claude-workflow-gateway: open a new shell, or source that file once, before removing the transition block"
 }
 
-validate_manager_paths || exit 1
+inherited_workflow_routing_present() {
+  if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES:-}" ]; then
+    return 0
+  fi
+  [ "${ANTHROPIC_BASE_URL:-}" = "http://127.0.0.1:4318" ] && {
+    [ "${CLAUDE_CODE_SUBAGENT_MODEL:-}" = "codex-terra" ] ||
+      [ "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" = "codex-terra" ] ||
+      [ "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" = "codex-terra" ] ||
+      [ "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" = "codex-terra" ]
+  }
+}
+
+migrate_shell() {
+  if [ -n "${CLAUDE_WORKFLOW_SHELL_RC:-}" ]; then
+    install_shell
+    return
+  fi
+  case "$(basename "${SHELL:-}")" in
+    bash|zsh) install_shell ;;
+    *)
+      if inherited_workflow_routing_present; then
+        echo "claude-workflow-gateway: inherited workflow routing is active, but no Bash/zsh rc was selected; set CLAUDE_WORKFLOW_SHELL_RC to the absolute rc path and retry" >&2
+        return 1
+      fi
+      echo "claude-workflow-gateway: no active Bash/zsh rc selected; shell migration skipped"
+      ;;
+  esac
+}
+
+migrate_shell_upgrade() {
+  local shell_rc
+  local migrated=0
+
+  migrate_shell_upgrade_path() {
+    local candidate="$1"
+    candidate="$(resolve_shell_rc_target "$candidate")" || return 1
+    if [ -e "$candidate" ] && [ ! -f "$candidate" ]; then
+      echo "claude-workflow-gateway: shell rc must be a regular file: $candidate" >&2
+      return 1
+    fi
+    if [ -f "$candidate" ] && grep -Eq \
+      '^# >>> (ultrathink claude-workflow gateway|claude-workflow gateway|claude-workflow shell cleanup) >>>$' \
+      "$candidate"; then
+      rewrite_shell_blocks "$candidate" || return 1
+      echo "claude-workflow-gateway: replaced shell routing with a cleanup-only transition in $candidate"
+      migrated=1
+    fi
+  }
+
+  if [ -n "${CLAUDE_WORKFLOW_SHELL_RC:-}" ]; then
+    shell_rc="$(shell_rc_path)" || return 1
+    migrate_shell_upgrade_path "$shell_rc" || return 1
+  else
+    migrate_shell_upgrade_path "$HOME_BASE/.bashrc" || return 1
+    migrate_shell_upgrade_path "${ZDOTDIR:-$HOME_BASE}/.zshrc" || return 1
+  fi
+  if [ "$migrated" = 1 ]; then
+    echo "claude-workflow-gateway: open a new shell, or source the migrated rc once, to clear historical workflow exports"
+    return 0
+  fi
+  if inherited_workflow_routing_present; then
+    case "$(basename "${SHELL:-}")" in
+      bash|zsh) install_shell; return ;;
+      *)
+        echo "claude-workflow-gateway: inherited workflow routing is active, but no Bash/zsh rc was selected; set CLAUDE_WORKFLOW_SHELL_RC to the absolute rc path and retry" >&2
+        return 1
+        ;;
+    esac
+  fi
+  echo "claude-workflow-gateway: no historical shell routing to migrate"
+}
 
 case "${1:-status}" in
   ensure)
-    if ! daemon_is_current; then
-      # Never block an interactive shell: hand off to a background start.
-      (start_daemon >/dev/null 2>&1 &)
-    fi
+    # Retained only so old hooks fail closed instead of starting a gateway
+    # after a manager upgrade. Shell-wide routing is no longer supported.
+    echo "claude-workflow-gateway: automatic shell routing was removed; use claude-workflow for scoped routing" >&2
+    exit 1
     ;;
   start)
-    start_daemon
+    validate_manager_paths && start_daemon
     ;;
   stop)
-    stop_daemon
+    validate_manager_paths && stop_daemon
     ;;
   restart)
-    stop_daemon && start_daemon
+    validate_manager_paths && stop_daemon && start_daemon
+    ;;
+  reconcile)
+    # Package install/setup hook: refresh only a daemon the recorded pid and
+    # health endpoint prove is ours. A stopped daemon stays stopped.
+    validate_manager_paths && reconcile_daemon
     ;;
   status)
+    validate_manager_paths || exit 1
+    if [ -e "$STATE_DIR" ]; then
+      verify_or_migrate_existing_state || exit 1
+    fi
     if daemon_is_current; then
       echo "claude-workflow-gateway: healthy and current on port $PORT"
     elif healthy && pid_running; then
@@ -1176,6 +1306,8 @@ case "${1:-status}" in
     fi
     ;;
   log)
+    validate_manager_paths || exit 1
+    verify_or_migrate_existing_state || exit 1
     tail -n "${2:-50}" "$LOG_FILE"
     ;;
   install-shell)
@@ -1184,8 +1316,14 @@ case "${1:-status}" in
   uninstall-shell)
     uninstall_shell
     ;;
+  migrate-shell)
+    migrate_shell
+    ;;
+  migrate-shell-upgrade)
+    migrate_shell_upgrade
+    ;;
   *)
-    echo "Usage: $0 {ensure|start|stop|restart|status|log|install-shell|uninstall-shell}" >&2
+    echo "Usage: $0 {ensure|start|stop|restart|reconcile|status|log|install-shell|uninstall-shell|migrate-shell|migrate-shell-upgrade}" >&2
     exit 2
     ;;
 esac

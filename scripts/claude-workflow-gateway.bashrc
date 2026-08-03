@@ -1,16 +1,17 @@
-# Sourceable shell hook for the shared claude-workflow gateway daemon.
-# Installed into the current shell's rc file by:
-# scripts/claude-workflow-daemon.sh install-shell
+# Cleanup-only transition hook for historical claude-workflow shell routing.
 #
-# Ensures the daemon is running (non-blocking) and exports its published env
-# so plain, resumed, and background Claude Code sessions can use the configured
-# route when their user/project/organization settings do not override these
-# environment values. The claude-workflow launcher supplies a higher-precedence
-# per-session settings layer when deterministic routing is required.
+# This file never starts a gateway and never sources gateway settings. It only
+# restores values owned by managed historical overlays and clears one bounded
+# markerless signature used by older releases. Bare `claude` remains native.
 case $- in
   *x*) _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE=1; set +x ;;
   *) _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE=0 ;;
 esac
+if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_ENV_NAMES-}" ]; then
+  _CLAUDE_WORKFLOW_GATEWAY_HAD_MANAGED_OVERLAY=1
+else
+  _CLAUDE_WORKFLOW_GATEWAY_HAD_MANAGED_OVERLAY=0
+fi
 _claude_workflow_gateway_restore_environment() {
   case $- in
     *x*) _CLAUDE_WORKFLOW_GATEWAY_RESTORE_XTRACE=1; set +x ;;
@@ -129,6 +130,55 @@ _claude_workflow_gateway_restore_environment() {
 _claude_workflow_gateway_restore_environment || :
 unset -f _claude_workflow_gateway_restore_environment 2>/dev/null || :
 
+_claude_workflow_gateway_cleanup_markerless_environment() {
+  case $- in
+    *x*) _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE=1; set +x ;;
+    *) _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE=0 ;;
+  esac
+  _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE=0
+  if [ "${ANTHROPIC_BASE_URL-}" = http://127.0.0.1:4318 ] && {
+    [ "${CLAUDE_CODE_SUBAGENT_MODEL-}" = codex-terra ] ||
+      [ "${ANTHROPIC_DEFAULT_SONNET_MODEL-}" = codex-terra ] ||
+      [ "${ANTHROPIC_DEFAULT_HAIKU_MODEL-}" = codex-terra ] ||
+      [ "${ANTHROPIC_DEFAULT_OPUS_MODEL-}" = codex-terra ]
+  }; then
+    _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE=1
+  fi
+  if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE" = 1 ]; then
+    unset ANTHROPIC_BASE_URL 2>/dev/null || :
+    for _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME in CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+      eval "_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE=\${${_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME}-}"
+      if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE" = codex-terra ]; then
+        unset "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME" 2>/dev/null || :
+      fi
+    done
+    case "${ANTHROPIC_MODEL-}" in
+      codex|'claude-fable-5[1m]') unset ANTHROPIC_MODEL 2>/dev/null || : ;;
+    esac
+    if [ "${ANTHROPIC_DEFAULT_FABLE_MODEL-}" = 'claude-fable-5[1m]' ]; then
+      unset ANTHROPIC_DEFAULT_FABLE_MODEL 2>/dev/null || :
+    fi
+    if [ "${CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY-}" = 0 ]; then
+      unset CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY 2>/dev/null || :
+    fi
+  fi
+  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_SIGNATURE 2>/dev/null || :
+  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_NAME 2>/dev/null || :
+  unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_VALUE 2>/dev/null || :
+  if [ "$_CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE" = 1 ]; then
+    unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE 2>/dev/null || :
+    set -x
+  else
+    unset _CLAUDE_WORKFLOW_GATEWAY_MARKERLESS_XTRACE 2>/dev/null || :
+  fi
+  return 0
+}
+if [ "${_CLAUDE_WORKFLOW_GATEWAY_HAD_MANAGED_OVERLAY:-0}" != 1 ]; then
+  _claude_workflow_gateway_cleanup_markerless_environment || :
+fi
+unset -f _claude_workflow_gateway_cleanup_markerless_environment 2>/dev/null || :
+unset _CLAUDE_WORKFLOW_GATEWAY_HAD_MANAGED_OVERLAY 2>/dev/null || :
+
 if [ -n "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN:-}" ]; then
   if [ "${ANTHROPIC_AUTH_TOKEN-}" = "$CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN" ]; then
     unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || :
@@ -159,52 +209,4 @@ else
   unset _CLAUDE_WORKFLOW_GATEWAY_HOOK_XTRACE 2>/dev/null || :
 fi
 
-if [ -n "${BASH_SOURCE:-}" ]; then
-  _CLAUDE_WORKFLOW_GATEWAY_SOURCE="${BASH_SOURCE[0]}"
-elif [ -n "${ZSH_VERSION:-}" ]; then
-  _CLAUDE_WORKFLOW_GATEWAY_SOURCE="$(eval 'printf "%s" "${(%):-%x}"')"
-else
-  _CLAUDE_WORKFLOW_GATEWAY_SOURCE=""
-fi
-
-if ! _CLAUDE_WORKFLOW_GATEWAY_DIR="$(
-  cd "$(dirname "$_CLAUDE_WORKFLOW_GATEWAY_SOURCE")" 2>/dev/null && pwd
-)"; then
-  _CLAUDE_WORKFLOW_GATEWAY_DIR=""
-fi
-if [ -n "$_CLAUDE_WORKFLOW_GATEWAY_DIR" ] && [ -x "$_CLAUDE_WORKFLOW_GATEWAY_DIR/claude-workflow-daemon.sh" ]; then
-  _CLAUDE_WORKFLOW_GATEWAY_MANAGER="$_CLAUDE_WORKFLOW_GATEWAY_DIR/claude-workflow-daemon.sh"
-  _CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR="${XDG_STATE_HOME:-${HOME-}/.cache}/claude-workflow"
-  _CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR="${HOME-}/.cache/ultrathink"
-  if [ -n "${CLAUDE_WORKFLOW_GATEWAY_STATE_DIR:-}" ]; then
-    _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$CLAUDE_WORKFLOW_GATEWAY_STATE_DIR"
-  elif [ ! -e "$_CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR" ] && {
-    [ -f "$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR/claude-workflow-gateway.pid" ] ||
-      [ -f "$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR/claude-workflow-gateway.env" ]
-  }; then
-    _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$_CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR"
-  else
-    _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$_CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR"
-  fi
-  _CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="${CLAUDE_WORKFLOW_GATEWAY_ENV_FILE:-$_CLAUDE_WORKFLOW_GATEWAY_STATE_DIR/claude-workflow-gateway.env}"
-  if "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" ensure >/dev/null 2>&1; then
-    _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT=0
-    while [ "$_CLAUDE_WORKFLOW_GATEWAY_ATTEMPT" -lt 20 ]; do
-      if "$_CLAUDE_WORKFLOW_GATEWAY_MANAGER" status >/dev/null 2>&1 && [ -r "$_CLAUDE_WORKFLOW_GATEWAY_ENV_FILE" ]; then
-        if . "$_CLAUDE_WORKFLOW_GATEWAY_ENV_FILE"; then
-          break
-        fi
-      fi
-      _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT=$((_CLAUDE_WORKFLOW_GATEWAY_ATTEMPT + 1))
-      sleep 0.1
-    done
-  fi
-fi
-unset _CLAUDE_WORKFLOW_GATEWAY_SOURCE
-unset _CLAUDE_WORKFLOW_GATEWAY_DIR
-unset _CLAUDE_WORKFLOW_GATEWAY_MANAGER
-unset _CLAUDE_WORKFLOW_GATEWAY_CANONICAL_STATE_DIR
-unset _CLAUDE_WORKFLOW_GATEWAY_LEGACY_STATE_DIR
-unset _CLAUDE_WORKFLOW_GATEWAY_STATE_DIR
-unset _CLAUDE_WORKFLOW_GATEWAY_ENV_FILE
-unset _CLAUDE_WORKFLOW_GATEWAY_ATTEMPT
+:

@@ -47,6 +47,7 @@ const CLAUDE_MODEL_FLAGS = new Set(['--model', '-m']);
 const CLAUDE_PERMISSION_MODE_FLAGS = new Set(['--permission-mode']);
 const CLAUDE_SETTINGS_FLAGS = new Set(['--settings']);
 const CLAUDE_EFFORT_FLAGS = new Set(['--effort']);
+const CLAUDE_BACKGROUND_FLAGS = new Set(['--background', '--bg']);
 
 function usage() {
   return [
@@ -60,7 +61,7 @@ function usage() {
     '  claude-workflow -- <claude options or command>',
     '',
     'Commands:',
-    '  setup    Check requirements and authentication; optionally enable shared mode',
+    '  setup    Check requirements; optionally migrate shell routing and start the shared daemon',
     '  doctor   Re-run the read-only prerequisite and routing checks',
     '  config   Show or update main model, agent model, reasoning, and permissions',
     '  run      Launch a prompt whose first word is a command name',
@@ -72,6 +73,7 @@ function usage() {
     '  --version  Show the installed package version',
     '',
     'Use -- before native Claude options. Resume flags may be passed directly.',
+    'Claude background flags (--background and --bg) are not supported.',
     'Run only in trusted repositories: permission bypass is enabled by default.',
   ].join('\n');
 }
@@ -243,6 +245,21 @@ function parseCliArgs(rawArgs) {
     promptArgs,
     skipPermissions,
   };
+}
+
+function assertForegroundClaudeLifecycle(rawArgs) {
+  const backgroundFlag = rawArgs.find((arg) =>
+    CLAUDE_BACKGROUND_FLAGS.has(String(arg).split('=', 1)[0])
+  );
+  if (!backgroundFlag) {
+    return;
+  }
+
+  throw new Error(
+    `${backgroundFlag} is not supported because claude-workflow owns a per-session gateway ` +
+      'and private settings that are removed when the foreground Claude process exits. ' +
+      'Run Claude in the foreground, or configure an explicit durable gateway integration.'
+  );
 }
 
 function isHelpRequest(rawArgs) {
@@ -418,6 +435,40 @@ async function closeGateway(runtime) {
   }
 }
 
+function stopClaudeChild(child, signal, timeoutMs = 2_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+
+  return new Promise(function waitForClaudeExit(resolve) {
+    let settled = false;
+    let forceTimer = null;
+    let finalTimer = null;
+
+    function finish() {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(finalTimer);
+      child.off('close', finish);
+      resolve();
+    }
+
+    child.once('close', finish);
+    if (!child.kill(signal)) {
+      finish();
+      return;
+    }
+
+    forceTimer = setTimeout(function forceClaudeExit() {
+      child.kill('SIGKILL');
+      finalTimer = setTimeout(finish, 1_000);
+    }, timeoutMs);
+  });
+}
+
 async function main() {
   let rawArgs = process.argv.slice(2);
 
@@ -429,6 +480,8 @@ async function main() {
     process.stdout.write(`${packageVersion()}\n`);
     return;
   }
+
+  assertForegroundClaudeLifecycle(rawArgs);
 
   const command = rawArgs[0];
   if (command === 'setup') {
@@ -522,10 +575,10 @@ async function main() {
       buildClaudeSettingsOverrideEnvironment(claudeEnvironment, claudeChildEnvironment)
     );
     const managedClaudeOptions = ['--settings', claudeSettingsOverride.path];
-    if (routeProvider(resolvedMainRoute) === 'kimi') {
+    if (resolvedMainRoute.claudeEffort) {
       managedClaudeOptions.unshift(
         '--effort',
-        String(resolvedMainRoute.reasoningEffort || 'max')
+        String(resolvedMainRoute.claudeEffort)
       );
     }
 
@@ -561,11 +614,10 @@ function installSignalHandlers(runtimeProvider, childProvider, cleanupProvider) 
     shuttingDown = true;
 
     const child = childProvider();
-    if (child && !child.killed) {
-      child.kill(signal);
-    }
-
-    closeGateway(runtimeProvider()).finally(function exitAfterCleanup() {
+    Promise.allSettled([
+      stopClaudeChild(child, signal),
+      closeGateway(runtimeProvider()),
+    ]).finally(function exitAfterCleanup() {
       try {
         cleanupProvider?.();
       } finally {

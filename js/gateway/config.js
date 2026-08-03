@@ -4,14 +4,15 @@ import path from 'node:path';
 import '../utils/env-loader.js';
 import { environmentWithoutManagedGatewayAuth } from '../utils/child-env.js';
 import { expandHomePath } from '../utils/safe-path.js';
+import { QWEN_TOKEN_PLAN_DEFAULTS } from './provider-profiles.js';
 
 const DEFAULT_EXPOSED_MODELS = Object.freeze([
-  'claude-opus-4-8',
+  'claude-opus-5',
   'claude-sonnet-4-7',
   'claude-sonnet-4-5',
   'claude-haiku-4-5',
 ]);
-const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*']);
+const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-5*']);
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
@@ -47,6 +48,13 @@ const GLM_PROFILE_ENV = Object.freeze({
 const KIMI_PROFILE_ENV = Object.freeze({
   model: ['ULTRATHINK_GATEWAY_KIMI_MODEL'],
   reasoningEffort: ['ULTRATHINK_GATEWAY_KIMI_REASONING_EFFORT'],
+});
+const QWEN_PROFILE_ENV = Object.freeze({
+  model: ['ULTRATHINK_GATEWAY_QWEN_MODEL', 'QWEN_MODEL'],
+  reasoningEffort: [
+    'ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT',
+    'QWEN_REASONING_EFFORT',
+  ],
 });
 
 function firstDefinedString(...values) {
@@ -175,6 +183,10 @@ function kimiProfileValue(key, fallback) {
   return firstEnvString(KIMI_PROFILE_ENV[key], fallback);
 }
 
+function qwenProfileValue(key, fallback) {
+  return firstEnvString(QWEN_PROFILE_ENV[key], fallback);
+}
+
 function thinkingForProvider(provider) {
   const thinkingLevel = firstEnvString(['ULTRATHINK_THINKING_LEVEL']).toUpperCase();
   if (thinkingLevel === 'OFF') {
@@ -211,6 +223,19 @@ export function loadGatewayConfig() {
   });
   const defaultExposedModels =
     exactRouteMapModels.length > 0 ? exactRouteMapModels : DEFAULT_EXPOSED_MODELS;
+  const explicitQwenBaseUrl = firstDefinedString(
+    process.env.ULTRATHINK_GATEWAY_QWEN_BASE_URL,
+    process.env.QWEN_BASE_URL
+  );
+  const qwenBaseUrl =
+    explicitQwenBaseUrl || QWEN_TOKEN_PLAN_DEFAULTS.baseUrl;
+  const qwenApiKey = firstDefinedString(
+    process.env.ULTRATHINK_GATEWAY_QWEN_API_KEY,
+    process.env.BAILIAN_TOKEN_PLAN_API_KEY,
+    process.env.QWEN_API_KEY,
+    explicitQwenBaseUrl ? process.env.DASHSCOPE_API_KEY : '',
+    ''
+  );
 
   return {
     host: firstDefinedString(process.env.ULTRATHINK_GATEWAY_HOST, '127.0.0.1'),
@@ -383,6 +408,25 @@ export function loadGatewayConfig() {
         { min: 1, max: 1_048_576 }
       ),
       version: firstEnvString(['ULTRATHINK_GATEWAY_KIMI_VERSION'], '2023-06-01'),
+    },
+    qwen: {
+      apiKey: qwenApiKey,
+      baseUrl: qwenBaseUrl,
+      model: qwenProfileValue('model', QWEN_TOKEN_PLAN_DEFAULTS.model),
+      reasoningEffort: qwenProfileValue(
+        'reasoningEffort',
+        QWEN_TOKEN_PLAN_DEFAULTS.reasoningEffort
+      ),
+      contextTokens: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS,
+        QWEN_TOKEN_PLAN_DEFAULTS.contextTokens,
+        { min: 1, max: QWEN_TOKEN_PLAN_DEFAULTS.contextTokens }
+      ),
+      maxOutputTokens: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS,
+        QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens,
+        { min: 1, max: QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens }
+      ),
     },
     anthropic: {
       apiKey: firstDefinedString(

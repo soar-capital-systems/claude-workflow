@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   daemonPort,
   managedWorkflowEnvironmentCleanupShell,
+  markerlessWorkflowEnvironmentCleanupShell,
   quotePosixShellValue,
   serializeWorkflowEnvironment,
   writeWorkflowEnvironmentFile,
@@ -99,6 +100,10 @@ test('child credential cleanup removes gateway upstream keys and only workflow-o
     ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'gateway-anthropic-key',
     KIMI_API_KEY: 'gateway-only-kimi-key',
     ULTRATHINK_GATEWAY_KIMI_API_KEY: 'preferred-gateway-only-kimi-key',
+    BAILIAN_TOKEN_PLAN_API_KEY: 'gateway-only-bailian-key',
+    DASHSCOPE_API_KEY: 'gateway-only-dashscope-key',
+    QWEN_API_KEY: 'gateway-only-qwen-key',
+    ULTRATHINK_GATEWAY_QWEN_API_KEY: 'preferred-gateway-only-qwen-key',
     ULTRATHINK_GATEWAY_SHARED_SECRET: 'gateway-only-shared-secret',
     PRESERVED_VALUE: 'yes',
   });
@@ -114,6 +119,14 @@ test('child credential cleanup removes gateway upstream keys and only workflow-o
   assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY'), false);
   assert.equal(Object.hasOwn(cleaned, 'KIMI_API_KEY'), false);
   assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_KIMI_API_KEY'), false);
+  for (const name of [
+    'BAILIAN_TOKEN_PLAN_API_KEY',
+    'DASHSCOPE_API_KEY',
+    'QWEN_API_KEY',
+    'ULTRATHINK_GATEWAY_QWEN_API_KEY',
+  ]) {
+    assert.equal(Object.hasOwn(cleaned, name), false);
+  }
   assert.equal(Object.hasOwn(cleaned, 'ULTRATHINK_GATEWAY_SHARED_SECRET'), false);
   assert.equal(cleaned.PRESERVED_VALUE, 'yes');
 
@@ -340,13 +353,30 @@ test(
     }
 
     for (const shell of shells) {
+      const cleanShellEnvironment = { ...process.env };
+      for (const name of [
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL',
+        'ANTHROPIC_MODEL',
+        'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
+        'CLAUDE_CODE_SUBAGENT_MODEL',
+      ]) {
+        delete cleanShellEnvironment[name];
+      }
       const result = spawnSync(
         shell.command,
         [...shell.args, probe, '_', directPath, routedPath, cleanupPath, process.execPath],
-        { encoding: 'utf8' }
+        { encoding: 'utf8', env: cleanShellEnvironment }
       );
       assert.equal(result.status, 0, `${shell.command}: ${result.stderr}`);
       const [restoredJson, mutatedModel] = result.stdout.trim().split('\n');
+      assert.ok(
+        restoredJson?.startsWith('{'),
+        `${shell.command}: unexpected stdout ${JSON.stringify(result.stdout)}`
+      );
       assert.deepEqual(JSON.parse(restoredJson), {
         apiKey: 'user-api-key',
         authToken: 'user-auth-token',
@@ -546,15 +576,24 @@ test('documented user credential files are ignored by Git', async function () {
   assert.equal(patterns.has('.ultrathink.env'), true);
 });
 
-test('published shell hooks share the generated managed-overlay cleanup', async function () {
+test('published shell cleanup has one canonical managed-overlay source', async function () {
   const expected = managedWorkflowEnvironmentCleanupShell();
-  for (const relativePath of [
-    'scripts/claude-workflow-gateway.bashrc',
-    'scripts/claude-workflow-daemon.sh',
-  ]) {
-    const source = await fsp.readFile(path.join(REPO_ROOT, relativePath), 'utf8');
-    assert.equal(embeddedManagedEnvironmentCleanup(source), expected, relativePath);
-  }
+  const sourceHook = await fsp.readFile(
+    path.join(REPO_ROOT, 'scripts/claude-workflow-gateway.bashrc'),
+    'utf8'
+  );
+  assert.equal(embeddedManagedEnvironmentCleanup(sourceHook), expected);
+  assert.equal(sourceHook.includes(markerlessWorkflowEnvironmentCleanupShell()), true);
+  const manager = await fsp.readFile(
+    path.join(REPO_ROOT, 'scripts/claude-workflow-daemon.sh'),
+    'utf8'
+  );
+  assert.equal(manager.includes('_claude_workflow_gateway_restore_environment() {'), false);
+  assert.equal(
+    manager.includes('cat "$SCRIPT_DIR/claude-workflow-gateway.bashrc"'),
+    true
+  );
+  assert.equal(manager.includes('claude-workflow-gateway ensure'), false);
 });
 
 test(
@@ -634,12 +673,9 @@ test(
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-shell-security-');
     const stateDirectory = path.join(root, 'state');
-    const target = path.join(stateDirectory, 'gateway.env');
+    const target = path.join(stateDirectory, 'claude-workflow-gateway.env');
     const commandSubstitutionMarker = path.join(root, 'command-substitution-ran');
     const backtickMarker = path.join(root, 'backtick-ran');
-    await fsp.mkdir(stateDirectory, { mode: 0o755 });
-    await fsp.writeFile(target, 'stale=true\n', { mode: 0o644 });
-
     const dangerousValue =
       `literal ' quote $HOME $(touch ${commandSubstitutionMarker}) ` +
       `\`touch ${backtickMarker}\`\nsecond line`;
@@ -661,7 +697,7 @@ test(
     assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
     assert.deepEqual(
       (await fsp.readdir(stateDirectory)).sort(),
-      ['gateway.env'],
+      ['.claude-workflow-gateway.owner', 'claude-workflow-gateway.env'],
       'atomic writer must not leave temporary files behind'
     );
 
@@ -689,26 +725,39 @@ test(
     assert.equal(fs.existsSync(commandSubstitutionMarker), false);
     assert.equal(fs.existsSync(backtickMarker), false);
 
-    const failedPublishTarget = path.join(stateDirectory, 'failed-publish.env');
-    const originalChmodSync = fs.chmodSync;
-    fs.chmodSync = function failPublishedFileChmod(targetPath, mode) {
-      if (path.resolve(targetPath) === path.resolve(failedPublishTarget)) {
-        throw new Error('simulated chmod failure');
+    const failedPublishState = path.join(root, 'failed-publish-state');
+    const failedPublishTarget = path.join(
+      failedPublishState,
+      'claude-workflow-gateway.env'
+    );
+    writeWorkflowEnvironmentFile(failedPublishTarget, { VALUE: 'previous' });
+    const previousPublishedEnvironment = await fsp.readFile(failedPublishTarget, 'utf8');
+    const originalFchmodSync = fs.fchmodSync;
+    let hardeningFailureInjected = false;
+    fs.fchmodSync = function failTemporaryFileHardening(descriptor, mode) {
+      if (!hardeningFailureInjected) {
+        hardeningFailureInjected = true;
+        throw new Error('simulated fchmod failure');
       }
-      return originalChmodSync(targetPath, mode);
+      return originalFchmodSync(descriptor, mode);
     };
     try {
       assert.throws(
         () => writeWorkflowEnvironmentFile(failedPublishTarget, { VALUE: 'safe' }),
-        /simulated chmod failure/u
+        /simulated fchmod failure/u
       );
     } finally {
-      fs.chmodSync = originalChmodSync;
+      fs.fchmodSync = originalFchmodSync;
     }
     assert.equal(
-      fs.existsSync(failedPublishTarget),
-      false,
-      'a post-rename hardening failure must remove the published env file'
+      await fsp.readFile(failedPublishTarget, 'utf8'),
+      previousPublishedEnvironment,
+      'a pre-publication hardening failure must retain the previous environment'
+    );
+    assert.deepEqual(
+      (await fsp.readdir(failedPublishState)).sort(),
+      ['.claude-workflow-gateway.owner', 'claude-workflow-gateway.env'],
+      'a failed update must remove its unpublished temporary file'
     );
 
     const unsafeCustomDirectory = path.join(root, 'unsafe-custom-state');
@@ -717,12 +766,41 @@ test(
     assert.throws(
       () =>
         writeWorkflowEnvironmentFile(
-          path.join(unsafeCustomDirectory, 'gateway.env'),
-          { VALUE: 'safe' },
-          { hardenExistingDirectory: false }
+          path.join(unsafeCustomDirectory, 'claude-workflow-gateway.env'),
+          { VALUE: 'safe' }
         ),
       /must not be accessible by group or other users/u
     );
+
+    const arbitraryTarget = path.join(root, 'arbitrary-sentinel');
+    await fsp.writeFile(arbitraryTarget, 'keep-me\n', { mode: 0o644 });
+    assert.throws(
+      () => writeWorkflowEnvironmentFile(arbitraryTarget, { VALUE: 'unsafe' }),
+      /must be exactly/u
+    );
+    assert.equal(await fsp.readFile(arbitraryTarget, 'utf8'), 'keep-me\n');
+    assert.equal((await fsp.stat(arbitraryTarget)).mode & 0o777, 0o644);
+
+    const symlinkState = path.join(root, 'symlink-state');
+    const symlinkTarget = path.join(symlinkState, 'claude-workflow-gateway.env');
+    writeWorkflowEnvironmentFile(symlinkTarget, { VALUE: 'managed' });
+    await fsp.unlink(symlinkTarget);
+    await fsp.symlink(arbitraryTarget, symlinkTarget);
+    assert.throws(
+      () => writeWorkflowEnvironmentFile(symlinkTarget, { VALUE: 'unsafe' }),
+      /must be a regular file/u
+    );
+    assert.equal(await fsp.readFile(arbitraryTarget, 'utf8'), 'keep-me\n');
+
+    const collisionState = path.join(root, 'collision-state');
+    const collisionTarget = path.join(collisionState, 'claude-workflow-gateway.env');
+    await fsp.mkdir(collisionState, { mode: 0o700 });
+    await fsp.writeFile(collisionTarget, 'unowned\n', { mode: 0o600 });
+    assert.throws(
+      () => writeWorkflowEnvironmentFile(collisionTarget, { VALUE: 'unsafe' }),
+      /nonempty and has no ownership marker/u
+    );
+    assert.equal(await fsp.readFile(collisionTarget, 'utf8'), 'unowned\n');
   }
 );
 

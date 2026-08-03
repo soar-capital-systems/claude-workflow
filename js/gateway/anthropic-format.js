@@ -234,6 +234,13 @@ function translateAssistantMessage(message, options = {}) {
     }
 
     if (block?.type === 'redacted_thinking') {
+      if (options.strictThinkingReplay) {
+        throw new GatewayError(
+          400,
+          'invalid_request_error',
+          'Qwen cannot replay redacted_thinking without changing the preserved reasoning; start a new turn or remove the incompatible history block'
+        );
+      }
       continue;
     }
 
@@ -241,6 +248,14 @@ function translateAssistantMessage(message, options = {}) {
       400,
       'invalid_request_error',
       `unsupported assistant content block type: ${String(block?.type)}`
+    );
+  }
+
+  if (options.strictThinkingReplay && reasoningParts.length > 1) {
+    throw new GatewayError(
+      400,
+      'invalid_request_error',
+      'Qwen requires one unmodified thinking block per assistant message; multiple thinking blocks cannot be merged safely'
     );
   }
 
@@ -404,6 +419,22 @@ function translateToolChoice(toolChoice) {
   );
 }
 
+function validateRouteToolChoice(route, toolChoice) {
+  if (route.toolChoicePolicy !== 'auto-none' || toolChoice === undefined || toolChoice === null) {
+    return;
+  }
+
+  if (typeof toolChoice === 'object' && ['auto', 'none'].includes(toolChoice.type)) {
+    return;
+  }
+
+  throw new GatewayError(
+    400,
+    'invalid_request_error',
+    'Qwen deep-thinking routes support only tool_choice auto or none; required and named tool choices cannot be preserved'
+  );
+}
+
 function shouldTranslateToolChoice(route) {
   return !(route.provider === 'deepseek' && route.thinking?.type === 'enabled');
 }
@@ -489,7 +520,11 @@ export function translateAnthropicMessagesRequestWithOptions(requestBody, route,
 
   if (typeof requestBody.max_tokens === 'number') {
     const maxTokensField = route.maxTokensField || 'max_completion_tokens';
-    translated[maxTokensField] = requestBody.max_tokens;
+    const routeMaximum = Number(route.maxOutputTokens);
+    translated[maxTokensField] =
+      Number.isFinite(routeMaximum) && routeMaximum > 0
+        ? Math.min(requestBody.max_tokens, routeMaximum)
+        : requestBody.max_tokens;
   }
   if (typeof requestBody.temperature === 'number') {
     translated.temperature = requestBody.temperature;
@@ -507,11 +542,19 @@ export function translateAnthropicMessagesRequestWithOptions(requestBody, route,
   }
 
   if (shouldTranslateToolChoice(route)) {
+    validateRouteToolChoice(route, requestBody.tool_choice);
     const toolChoice = translateToolChoice(requestBody.tool_choice);
     if (toolChoice !== undefined) {
       translated.tool_choice = toolChoice;
     }
-    if (requestBody.tool_choice?.disable_parallel_tool_use === true) {
+    if (route.explicitParallelToolCalls && tools) {
+      translated.parallel_tool_calls =
+        requestBody.tool_choice?.type !== 'none' &&
+        requestBody.tool_choice?.disable_parallel_tool_use !== true;
+    } else if (
+      requestBody.tool_choice?.disable_parallel_tool_use === true &&
+      route.supportsParallelToolCalls !== false
+    ) {
       translated.parallel_tool_calls = false;
     }
   }
@@ -525,8 +568,17 @@ export function translateAnthropicMessagesRequestWithOptions(requestBody, route,
   if (route.thinking) {
     translated.thinking = route.thinking;
   }
+  if (route.enableThinking) {
+    translated.enable_thinking = true;
+  }
+  if (route.preserveThinking) {
+    translated.preserve_thinking = true;
+  }
   if (translated.stream) {
     translated.stream_options = { include_usage: true };
+    if (route.toolStream && tools) {
+      translated.tool_stream = true;
+    }
   }
 
   return translated;
@@ -582,6 +634,9 @@ export function translateOpenAiResponseToAnthropic(
   }
 
   const content = [
+    ...(options.emitReasoningContent && reasoningContent
+      ? [{ type: 'thinking', thinking: reasoningContent, signature: '' }]
+      : []),
     ...textBlocksFromMessageContent(choice.message.content),
     ...toolCalls.map(function toToolUse(toolCall) {
       return {

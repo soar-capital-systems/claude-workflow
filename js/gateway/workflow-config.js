@@ -19,6 +19,10 @@ import {
 } from './model-routing.js';
 import { proxyExclusionEnvForHost } from './proxy.js';
 import {
+  QWEN_TOKEN_PLAN_DEFAULTS,
+  providerRequiresGatewayAuth,
+} from './provider-profiles.js';
+import {
   CLAUDE_TERMINAL_TITLE_ENV_NAME,
   MANAGED_GATEWAY_AUTH_ENV_NAME,
 } from '../utils/child-env.js';
@@ -40,10 +44,11 @@ const MANAGED_PROVIDER_CLIENT_ENV_NAMES = Object.freeze([
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
 ]);
-export const DEFAULT_MAIN_MODEL_ID = 'claude-fable-5[1m]';
+export const DEFAULT_MAIN_MODEL_ID = 'claude-opus-5[1m]';
+export const FABLE_MAIN_MODEL_ID = 'claude-fable-5[1m]';
 export const DEFAULT_SUBAGENT_REASONING_EFFORT = 'max';
 export const KIMI_MAIN_MODEL_ID = 'k3[1m]';
-const DEFAULT_FABLE_PASSTHROUGH_PATTERN = 'claude-fable-5*';
+export const QWEN_MAIN_MODEL_ID = `${QWEN_TOKEN_PLAN_DEFAULTS.model}[1m]`;
 
 export function envString(name, fallback = '') {
   const value = process.env[name];
@@ -74,11 +79,10 @@ function workflowAutoCompactTokenLimit(inputMaxTokens) {
 }
 
 function defaultAnthropicPassthroughPattern(mainModelId) {
-  if (String(mainModelId || '').startsWith('claude-fable-5')) {
-    return DEFAULT_FABLE_PASSTHROUGH_PATTERN;
-  }
-
-  return `${mainModelId}*`;
+  // Family wildcard for the configured main model: strips client-side bracket
+  // qualifiers (e.g. [1m]) so dated variants stay on Anthropic as well.
+  const family = modelIdWithoutBracketQualifiers(String(mainModelId || '').trim());
+  return `${family}*`;
 }
 
 function routeModelAliases(modelId) {
@@ -87,14 +91,13 @@ function routeModelAliases(modelId) {
   return dedupeStrings([normalized, strippedBracketQualifiers]);
 }
 
-function isFableModelAlias(modelId) {
-  return modelId.startsWith('claude-fable-5');
-}
-
 function routeModelPatterns(modelId) {
   const aliases = routeModelAliases(modelId);
-  if (aliases.some(isFableModelAlias)) {
-    return dedupeStrings([...aliases, DEFAULT_FABLE_PASSTHROUGH_PATTERN]);
+  const family = aliases[aliases.length - 1];
+  // Dated variants of a Claude main model (e.g. claude-opus-5-20260724)
+  // follow the main route through the family wildcard.
+  if (family.startsWith('claude-')) {
+    return dedupeStrings([...aliases, `${family}*`]);
   }
 
   return aliases;
@@ -164,6 +167,8 @@ function mainRouteDefaultModel(provider, mainModelId, baseConfig) {
       return baseConfig.glm.model;
     case 'kimi':
       return baseConfig.kimi.model;
+    case 'qwen':
+      return baseConfig.qwen.model;
     case 'openai':
       return baseConfig.openai.model;
     default:
@@ -181,6 +186,8 @@ function mainRouteDefaultReasoningEffort(provider, baseConfig) {
       return baseConfig.glm.reasoningEffort;
     case 'kimi':
       return baseConfig.kimi.reasoningEffort;
+    case 'qwen':
+      return baseConfig.qwen.reasoningEffort;
     case 'openai':
       return baseConfig.openai.reasoningEffort;
     default:
@@ -200,6 +207,8 @@ function mainRouteDisplayName(provider) {
       return 'GLM Main Route';
     case 'kimi':
       return 'Kimi K3 Main Route';
+    case 'qwen':
+      return 'Qwen 3.8 Max Main Route';
     case 'openai':
       return 'OpenAI-Compatible Main Route';
     default:
@@ -342,10 +351,19 @@ export function buildWorkflowGatewayConfig({
   const hasKimiRoute = Object.values(routeMap).some(function usesKimi(route) {
     return routeProvider(route, '') === 'kimi';
   });
+  const hasQwenRoute = Object.values(routeMap).some(function usesQwen(route) {
+    return routeProvider(route, '') === 'qwen';
+  });
+  const hasProtectedProviderRoute = Object.values(routeMap).some(function usesProtectedProvider(
+    route
+  ) {
+    return providerRequiresGatewayAuth(routeProvider(route, ''));
+  });
   // Keep only an Anthropic-backed main model family on Anthropic. Every other
-  // Claude id (Opus, Sonnet, Haiku, ...) falls through to the configured Codex
-  // route unless the operator pins a passthrough list. Dated Fable variants
-  // (e.g. claude-fable-5[1m]-20260601) stay on Anthropic via the wildcard.
+  // Claude id (Sonnet, Haiku, Fable, ...) falls through to the configured Codex
+  // route unless the operator pins a passthrough list. Dated variants of the
+  // main model (e.g. claude-opus-5-20260724) stay on Anthropic via the family
+  // wildcard.
   const passthroughEnvProvided =
     envString('ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS') !== '' ||
     envString('ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS') !== '';
@@ -360,7 +378,7 @@ export function buildWorkflowGatewayConfig({
       return routeProvider(route, '') === 'anthropic';
     });
   const requiresClientGatewayCredential =
-    hasKimiRoute || resolvedMainProvider !== 'anthropic';
+    hasProtectedProviderRoute || resolvedMainProvider !== 'anthropic';
   const sharedSecret =
     baseConfig.sharedSecret ||
     (requiresClientGatewayCredential ? crypto.randomBytes(32).toString('base64url') : '');
@@ -372,6 +390,16 @@ export function buildWorkflowGatewayConfig({
   ) {
     throw new Error(
       'A Kimi route combined with an Anthropic route requires a dedicated gateway-side Anthropic API key. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY so the upstream credential remains gateway-only.'
+    );
+  }
+  if (
+    sharedSecret &&
+    hasQwenRoute &&
+    hasAnthropicRoute &&
+    !envString('ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY')
+  ) {
+    throw new Error(
+      'A Qwen route combined with an Anthropic route requires a dedicated gateway-side Anthropic API key. Set ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY so the upstream credential remains gateway-only.'
     );
   }
   if (
@@ -446,10 +474,10 @@ export function buildWorkflowClientEnv(
   }
 
   const mainRoute = resolveModelRoute(mainModelId, config);
-  if (routeProvider(mainRoute, '') === 'codex') {
+  if (mainRoute.suppressTerminalTitleRequest) {
     // Claude Code otherwise spends a second provider request generating a
-    // terminal title. Direct Codex mode should make one request for a plain
-    // no-tool prompt and return that response unchanged.
+    // terminal title. Direct third-party routes should make one request for a
+    // plain no-tool prompt and return that response unchanged.
     clientEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] = '1';
   }
   if (routeProvider(mainRoute, '') === 'kimi') {
@@ -457,6 +485,14 @@ export function buildWorkflowClientEnv(
     clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;
     clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = contextTokens;
     clientEnv.CLAUDE_CODE_EFFORT_LEVEL = routeReasoningEffort(mainRoute, 'max');
+  }
+  if (routeProvider(mainRoute, '') === 'qwen') {
+    const contextTokens = String(
+      mainRoute.contextTokens || QWEN_TOKEN_PLAN_DEFAULTS.contextTokens
+    );
+    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;
+    clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = contextTokens;
+    clientEnv.CLAUDE_CODE_EFFORT_LEVEL = mainRoute.claudeEffort || 'max';
   }
 
   if (config.sharedSecret) {
@@ -474,27 +510,47 @@ function routeMapUsesProvider(config, provider) {
   });
 }
 
+function mainModelAliasSlotName(mainModelId) {
+  const normalized = String(mainModelId || '').trim();
+  if (normalized.startsWith('claude-opus-')) {
+    return 'ANTHROPIC_DEFAULT_OPUS_MODEL';
+  }
+  if (normalized.startsWith('claude-fable-')) {
+    return 'ANTHROPIC_DEFAULT_FABLE_MODEL';
+  }
+  return '';
+}
+
 export function buildWorkflowClaudeEnv(
   gatewayBaseUrl,
   subagentModelId,
   mainModelId = DEFAULT_MAIN_MODEL_ID
 ) {
+  // Newer Claude Code resolves agent-definition models through the
+  // sonnet/haiku/opus/fable alias slots and shows those labels in the TUI.
+  // Remap the slots to the routed subagent model id so alias-pinned agents
+  // display and request the Codex-backed id instead of raw Anthropic model
+  // ids. The slot matching the main model's own family points at the main
+  // model id instead. These are managed outputs, so a value exported by an
+  // older shared daemon cannot override a route change.
+  const aliasSlots = {
+    ANTHROPIC_DEFAULT_SONNET_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: subagentModelId,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: subagentModelId,
+  };
+  const mainSlot = mainModelAliasSlotName(mainModelId);
+  if (mainSlot) {
+    aliasSlots[mainSlot] = mainModelId;
+  }
+
   return {
     ANTHROPIC_BASE_URL: gatewayBaseUrl,
     // The managed main-route setting must win over stale exports from a
     // previously configured shared daemon.
     ANTHROPIC_MODEL: mainModelId,
     CLAUDE_CODE_SUBAGENT_MODEL: subagentModelId,
-    // Newer Claude Code resolves agent-definition models through the
-    // sonnet/haiku/opus alias slots and shows those labels in the TUI.
-    // Remap the slots to the routed subagent model id so alias-pinned
-    // agents display and request the Codex-backed id instead of raw
-    // Anthropic sonnet/haiku ids. These are managed outputs, so a value
-    // exported by an older shared daemon cannot override a route change.
-    ANTHROPIC_DEFAULT_SONNET_MODEL: subagentModelId,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: subagentModelId,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: subagentModelId,
-    ANTHROPIC_DEFAULT_FABLE_MODEL: mainModelId,
+    ...aliasSlots,
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '0',
   };
 }

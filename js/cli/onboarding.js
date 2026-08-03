@@ -6,14 +6,29 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_CODEX_MODEL, envFlag, isGatewayLoopbackHost } from '../gateway/config.js';
-import { resolveModelRoute } from '../gateway/model-routing.js';
+import { unsafeWslInstallPaths } from '../../scripts/validate-local-install.mjs';
+import {
+  DEFAULT_CODEX_MODEL,
+  envFlag,
+  isGatewayLoopbackHost,
+  loadGatewayConfig,
+} from '../gateway/config.js';
+import {
+  modelIdWithoutBracketQualifiers,
+  resolveModelRoute,
+} from '../gateway/model-routing.js';
+import {
+  QWEN_TOKEN_PLAN_DEFAULTS,
+  qwenProfileConfigurationIssue,
+} from '../gateway/provider-profiles.js';
 import {
   environmentWithoutGatewayAndAnthropicCredentials,
   environmentWithoutGatewayCredentials,
+  environmentWithoutLegacyWorkflowRouting,
+  environmentWithoutManagedGatewayAuth,
 } from '../utils/child-env.js';
 import {
-  inspectClaudeRoutingSettingsConflicts,
+  CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
   inspectClaudeThirdPartyModelSupport,
   prepareClaudeThirdPartyModelSupport,
 } from '../utils/claude-config.js';
@@ -21,7 +36,9 @@ import {
   buildWorkflowGatewayConfig,
   DEFAULT_MAIN_MODEL_ID,
   DEFAULT_SUBAGENT_REASONING_EFFORT,
+  FABLE_MAIN_MODEL_ID,
   KIMI_MAIN_MODEL_ID,
+  QWEN_MAIN_MODEL_ID,
   routeProvider,
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
@@ -43,6 +60,23 @@ const REASONING_EFFORTS = new Set([
 ]);
 const AGENT_TIERS = new Set(['sol', 'terra', 'luna']);
 const PERMISSION_MODES = new Set(['bypass', 'prompt']);
+const MAIN_PRESETS = Object.freeze({
+  opus: Object.freeze({ model: DEFAULT_MAIN_MODEL_ID, provider: 'anthropic' }),
+  fable: Object.freeze({ model: FABLE_MAIN_MODEL_ID, provider: 'anthropic' }),
+  codex: Object.freeze({ model: 'codex', provider: 'codex' }),
+  kimi: Object.freeze({ model: KIMI_MAIN_MODEL_ID, provider: 'kimi' }),
+  'k3[1m]': Object.freeze({ model: KIMI_MAIN_MODEL_ID, provider: 'kimi' }),
+  k3: Object.freeze({ model: 'k3', provider: 'kimi', kimiContextTokens: '262144' }),
+  qwen: Object.freeze({ model: QWEN_MAIN_MODEL_ID, provider: 'qwen' }),
+  'qwen3.8': Object.freeze({ model: QWEN_MAIN_MODEL_ID, provider: 'qwen' }),
+  'qwen3.8-max': Object.freeze({ model: QWEN_MAIN_MODEL_ID, provider: 'qwen' }),
+  'qwen3.8-max[1m]': Object.freeze({ model: QWEN_MAIN_MODEL_ID, provider: 'qwen' }),
+});
+const SHELL_ROUTING_ENV_NAMES = Object.freeze([
+  ...CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+]);
 const CODEX_LOGIN_FAILURE_PATTERN =
   /not\s+logged\s+in|logged\s+out|not\s+authenticated|not\s+signed\s+in/iu;
 const CODEX_LOGIN_SUCCESS_PATTERN = /logged in|authenticated|signed in/iu;
@@ -52,7 +86,12 @@ const MANAGED_CONFIG_KEYS = Object.freeze([
   'CLAUDE_WORKFLOW_MAIN_PROVIDER',
   'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL',
   'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT',
+  'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS',
   'ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS',
+  'ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS',
+  'ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS',
+  'ULTRATHINK_GATEWAY_QWEN_MODEL',
+  'ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT',
   'ULTRATHINK_GATEWAY_CODEX_MODEL',
   'ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT',
   'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL',
@@ -158,9 +197,21 @@ export function isWsl(env = process.env) {
   }
 }
 
-export function isWindowsMountedPath(value) {
+export function isWindowsMountedPath(value, mountInfo = null) {
   const normalized = String(value || '').replaceAll('\\', '/');
-  return /^\/mnt\/[a-z](?:\/|$)/iu.test(normalized) || /\.exe$/iu.test(normalized);
+  if (/^\/mnt\/[a-z](?:\/|$)/iu.test(normalized) || /\.exe$/iu.test(normalized)) {
+    return true;
+  }
+  if (process.platform !== 'linux' || !path.isAbsolute(normalized)) {
+    return false;
+  }
+  try {
+    const content =
+      mountInfo ?? fs.readFileSync('/proc/self/mountinfo', 'utf8');
+    return unsafeWslInstallPaths([['candidate', normalized]], content).length !== 0;
+  } catch {
+    return false;
+  }
 }
 
 function platformCheck(env = process.env, codexCommand = 'codex') {
@@ -336,6 +387,36 @@ function claudeThirdPartyModelCheck(env = process.env, prepareRequested = false)
   }
 }
 
+function inheritedWorkflowRoutingCheck(
+  env = process.env,
+  { migrationRequested = false } = {}
+) {
+  const cleaned = environmentWithoutManagedGatewayAuth(env);
+  const activeNames = SHELL_ROUTING_ENV_NAMES.filter(
+    (name) =>
+      Object.hasOwn(env, name) !== Object.hasOwn(cleaned, name) ||
+      env[name] !== cleaned[name]
+  );
+  if (activeNames.length === 0) {
+    return {
+      ok: true,
+      label: 'No inherited workflow-managed Claude routing',
+    };
+  }
+
+  return {
+    ok: migrationRequested,
+    label: migrationRequested
+      ? 'Inherited workflow-managed Claude routing will be migrated'
+      : 'Inherited workflow-managed Claude routing',
+    detail:
+      `Active inherited values: ${activeNames.join(', ')}. ` +
+      (migrationRequested
+        ? 'The shell cleanup transition will remove them from new shells; source the migrated rc or open a new shell before relying on plain `claude` to be direct.'
+        : 'This command cannot change its parent shell. Run `claude-workflow-gateway migrate-shell`, then source the migrated rc or open a new shell before relying on plain `claude` to be direct.'),
+  };
+}
+
 function codexCheck(commandName, run = commandResult, env = process.env) {
   if (!findExecutable(commandName, env)) {
     return {
@@ -382,16 +463,40 @@ function codexCheck(commandName, run = commandResult, env = process.env) {
 }
 
 function friendlyMainName(modelId) {
+  if (/^claude-opus-5(?:\[|$)/u.test(modelId)) {
+    return 'Opus 5';
+  }
   if (/^claude-fable-5(?:\[|$)/u.test(modelId)) {
     return 'Fable 5';
   }
   if (/^k3(?:\[|$)/u.test(modelId)) {
     return 'Kimi K3';
   }
+  if (/^qwen3\.8-max(?:\[|$)/u.test(modelId)) {
+    return 'Qwen 3.8 Max';
+  }
   if (modelId === 'codex') {
     return 'Codex direct';
   }
   return modelId;
+}
+
+function qwenConfigurationGuidance(issue) {
+  switch (issue) {
+    case 'missing_key':
+      return `add ULTRATHINK_GATEWAY_QWEN_API_KEY to ${configurationPath()} and keep that file owner-only.`;
+    case 'anthropic_endpoint':
+      return 'replace the Qwen /apps/anthropic base URL with its OpenAI-compatible compatible-mode/v1 endpoint.';
+    case 'token_plan_key_mismatch':
+      return 'use a matching sk-sp- Token Plan key, or configure the HTTPS base URL that belongs to the current Qwen credential.';
+    case 'insecure_url':
+    case 'unsupported_protocol':
+      return 'use an HTTPS Qwen base URL; plain HTTP is accepted only for a loopback gateway.';
+    case 'invalid_url':
+      return 'set QWEN_BASE_URL or ULTRATHINK_GATEWAY_QWEN_BASE_URL to a valid HTTPS URL.';
+    default:
+      return '';
+  }
 }
 
 function friendlyAgentName(modelId) {
@@ -533,7 +638,12 @@ function assertSafeConfigurationValues(updates) {
     if (!MANAGED_CONFIG_KEYS.includes(key)) {
       throw new Error(`refusing to manage unsupported configuration key ${key}`);
     }
-    if (!SAFE_CONFIG_VALUE.test(value)) {
+    const safeValue =
+      key === 'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS'
+        ? value === 'none' ||
+          (value.endsWith('*') && SAFE_CONFIG_VALUE.test(value.slice(0, -1)))
+        : SAFE_CONFIG_VALUE.test(value);
+    if (!safeValue) {
       throw new Error(`invalid value for ${key}`);
     }
   }
@@ -773,13 +883,15 @@ function configUsage() {
     'Usage:',
     '  claude-workflow config',
     '  claude-workflow config --agents terra --effort max',
-    '  claude-workflow config --main fable --permissions bypass',
+    '  claude-workflow config --main opus --permissions bypass',
+    '  claude-workflow config --main fable',
     '  claude-workflow config --main codex',
     '  claude-workflow config --main kimi',
+    '  claude-workflow config --main qwen',
     '  claude-workflow config --reset',
     '',
     'Options:',
-    '  --main <fable|codex|kimi|k3|id>  Main route (codex: direct; kimi: 1M; k3: 256K)',
+    '  --main <opus|fable|codex|kimi|k3|qwen|id>  Main route (qwen: Qwen 3.8 Max with 1M/xhigh; kimi: K3 1M; k3: K3 256K)',
     '  --agents <sol|terra|luna|id>  Shared Codex model for agents and direct main',
     '  --effort <level>              Shared Codex effort: minimal through ultra',
     '  --permissions <mode>          bypass or prompt',
@@ -820,13 +932,10 @@ export function runConfigCommand(args, options = {}) {
   }
 
   const writeOptions = ['main', 'agents', 'effort', 'permissions'].filter((name) => parsed[name]);
-  const selectsKimiMain = ['kimi', 'k3', 'k3[1m]'].includes(
-    String(parsed.main || '').trim().toLowerCase()
-  );
-  const selectsCodexMain = String(parsed.main || '').trim().toLowerCase() === 'codex';
-  const selectsKimiOneMillion = ['kimi', 'k3[1m]'].includes(
-    String(parsed.main || '').trim().toLowerCase()
-  );
+  const selectedMainPreset = MAIN_PRESETS[String(parsed.main || '').trim().toLowerCase()] || null;
+  const selectsKimiMain = selectedMainPreset?.provider === 'kimi';
+  const selectsQwenMain = selectedMainPreset?.provider === 'qwen';
+  const selectsCodexMain = selectedMainPreset?.provider === 'codex';
   if (parsed.reset && writeOptions.length > 0) {
     throw new Error('--reset cannot be combined with configuration values');
   }
@@ -853,41 +962,67 @@ export function runConfigCommand(args, options = {}) {
       removals.add(key);
     }
   } else {
-    const current = parsed.agents ? effectiveConfigurationSummary() : null;
+    const current =
+      parsed.agents || selectsCodexMain ? effectiveConfigurationSummary() : null;
     const selectedAgentModel = parsed.agents
       ? agentModel(parsed.agents, current.agents.model)
       : null;
     if (parsed.main) {
-      const mainChoice = parsed.main.trim().toLowerCase();
-      updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = selectsKimiMain
-        ? selectsKimiOneMillion
-          ? KIMI_MAIN_MODEL_ID
-          : 'k3'
-        : selectsCodexMain
-          ? 'codex'
-          : mainChoice === 'fable'
-            ? DEFAULT_MAIN_MODEL_ID
-            : normalizeModel(parsed.main, '--main');
-      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectsKimiMain
-        ? 'kimi'
-        : selectsCodexMain
-          ? 'codex'
-          : 'anthropic';
+      const selectedMainModel = selectedMainPreset
+        ? selectedMainPreset.model
+        : normalizeModel(parsed.main, '--main');
+      const selectedMainProvider = selectedMainPreset?.provider || 'anthropic';
+      updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = selectedMainModel;
+      updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectedMainProvider;
+      updates.ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL =
+        selectedMainProvider === 'codex'
+          ? selectedAgentModel || current?.agents.model || DEFAULT_CODEX_MODEL
+          : modelIdWithoutBracketQualifiers(selectedMainModel);
+      updates.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS =
+        selectedMainProvider === 'anthropic'
+          ? `${modelIdWithoutBracketQualifiers(selectedMainModel)}*`
+          : 'none';
       removals.add('CLAUDE_WORKFLOW_MAIN_PROVIDER');
-      // The provider profile supplies its model and effort. Removing stale
-      // route-specific overrides keeps later agent-profile changes effective
-      // for a direct Codex main route.
-      removals.add('ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL');
-      removals.add('ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT');
-      if (selectsKimiMain && !selectsKimiOneMillion) {
-        updates.ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS = '262144';
+      // Main presets own the passthrough family. Writing it explicitly shadows
+      // older values in the legacy ~/.ultrathink.env fallback.
+      // Explicit route values also shadow older values in ~/.ultrathink.env.
+      // Agent changes below keep a direct Codex main route in sync.
+      if (selectedMainProvider === 'qwen') {
+        updates.ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT =
+          QWEN_TOKEN_PLAN_DEFAULTS.reasoningEffort;
+      } else if (selectedMainProvider === 'kimi') {
+        updates.ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT = 'max';
+      } else if (selectedMainProvider === 'codex') {
+        updates.ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT =
+          parsed.effort || current?.agents.effort || DEFAULT_SUBAGENT_REASONING_EFFORT;
+      } else {
+        removals.add('ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT');
+      }
+      if (selectedMainPreset?.kimiContextTokens) {
+        updates.ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS = selectedMainPreset.kimiContextTokens;
+      } else if (selectedMainProvider === 'kimi') {
+        updates.ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS = '1048576';
       } else {
         removals.add('ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS');
+      }
+      if (selectsQwenMain) {
+        updates.ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS = String(
+          QWEN_TOKEN_PLAN_DEFAULTS.contextTokens
+        );
+        updates.ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS = String(
+          QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens
+        );
+        updates.ULTRATHINK_GATEWAY_QWEN_MODEL = QWEN_TOKEN_PLAN_DEFAULTS.model;
+        updates.ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT =
+          QWEN_TOKEN_PLAN_DEFAULTS.reasoningEffort;
       }
     }
     if (parsed.agents) {
       updates.ULTRATHINK_GATEWAY_CODEX_MODEL = selectedAgentModel;
       updates.ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL = selectedAgentModel;
+      if (selectsCodexMain) {
+        updates.ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL = selectedAgentModel;
+      }
       removals.add('CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID');
     }
     if (parsed.effort) {
@@ -897,6 +1032,9 @@ export function runConfigCommand(args, options = {}) {
       }
       updates.ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT = effort;
       updates.ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT = effort;
+      if (selectsCodexMain) {
+        updates.ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT = effort;
+      }
     }
     if (parsed.permissions) {
       const permissions = parsed.permissions.toLowerCase();
@@ -930,7 +1068,16 @@ export function runConfigCommand(args, options = {}) {
         `Next: add ULTRATHINK_GATEWAY_KIMI_API_KEY to ${configurationPath()} and keep that file owner-only.`
       );
     }
-    if (selectsKimiMain || selectsCodexMain) {
+    const qwenConfigurationIssue = selectsQwenMain
+      ? qwenProfileConfigurationIssue(loadGatewayConfig().qwen)
+      : '';
+    if (qwenConfigurationIssue) {
+      writeLine(
+        stdout,
+        `Next: ${qwenConfigurationGuidance(qwenConfigurationIssue)}`
+      );
+    }
+    if (selectsKimiMain || selectsQwenMain || selectsCodexMain) {
       writeLine(
         stdout,
         'Next: run `claude-workflow setup --prepare-claude`, then start a new `claude-workflow` session.'
@@ -938,7 +1085,10 @@ export function runConfigCommand(args, options = {}) {
     }
     writeLine(stdout, 'These settings apply to new commands. Exported environment variables take precedence.');
     writeLine(stdout, 'Custom route-map entries can override the common agent settings.');
-    writeLine(stdout, 'Shared mode picks up changes in a new shell or after `claude-workflow-gateway restart`.');
+    writeLine(
+      stdout,
+      'Shared daemon changes require `claude-workflow-gateway restart`; opening a new shell does not reload a running daemon.'
+    );
   }
 }
 
@@ -972,6 +1122,9 @@ function diagnosticReport(options = {}) {
     const checks = [
       platformCheck(env, codexCommand),
       nodeCheck(),
+      inheritedWorkflowRoutingCheck(env, {
+        migrationRequested: options.migrateShell === true,
+      }),
       claudeCheck(run, env, summary?.main?.provider === 'anthropic'),
       codexCheck(codexCommand, run, env),
       routeCheck,
@@ -999,14 +1152,17 @@ function setupUsage() {
     '  claude-workflow setup --prepare-claude',
     '  claude-workflow setup --shared',
     '',
-    'Checks Node.js, Claude Code, Codex, authentication, platform paths, and routing.',
+    'Checks Node.js, Claude Code, Codex, authentication, platform paths, routing, and inherited shell routing.',
     'Setup is read-only unless --prepare-claude or --shared is supplied.',
     '',
     'Options:',
     '  --prepare-claude  Back up and safely enable Claude Code third-party-model support',
-    '  --shared  Start the shared gateway and install its zsh/Bash hook',
+    '  --shared  Migrate historical shell routing, then start the shared gateway',
     '  --json    Print diagnostics as JSON (cannot be combined with --shared or --prepare-claude)',
     '  --help, -h Show this help',
+    '',
+    'Shared state owns claude-workflow-gateway.env and gateway-trace directly below',
+    'CLAUDE_WORKFLOW_GATEWAY_STATE_DIR; external env/trace paths are rejected.',
   ].join('\n');
 }
 
@@ -1034,21 +1190,6 @@ function managerPathSetting(env, name) {
     throw new Error(`${name} must be an absolute path`);
   }
   return value;
-}
-
-function nearestExistingDirectory(value) {
-  let candidate = path.resolve(value);
-  while (!fs.existsSync(candidate)) {
-    const parent = path.dirname(candidate);
-    if (parent === candidate) {
-      break;
-    }
-    candidate = parent;
-  }
-  if (!fs.lstatSync(candidate).isDirectory()) {
-    throw new Error(`shared shell rc parent is not a directory: ${candidate}`);
-  }
-  return candidate;
 }
 
 function resolveThroughExistingAncestor(value, visited = new Set()) {
@@ -1095,31 +1236,7 @@ function resolveThroughExistingAncestor(value, visited = new Set()) {
   return candidate;
 }
 
-function sharedShellHookPath(env) {
-  const customPath = managerPathSetting(env, 'CLAUDE_WORKFLOW_SHELL_RC');
-  if (customPath) {
-    return customPath;
-  }
-
-  const shellName = path.basename(String(env.SHELL || ''));
-  const home = env.HOME || env.USERPROFILE || os.homedir();
-  if (shellName === 'bash') {
-    return path.join(home, '.bashrc');
-  }
-  if (shellName === 'zsh') {
-    const zDotDirectory = String(env.ZDOTDIR || home);
-    if (!path.isAbsolute(zDotDirectory)) {
-      throw new Error('ZDOTDIR must be an absolute path for shared setup');
-    }
-    return path.join(zDotDirectory, '.zshrc');
-  }
-  throw new Error(
-    `shared setup does not support shell ${shellName || 'unknown'}; ` +
-      'set CLAUDE_WORKFLOW_SHELL_RC to an absolute zsh or Bash rc path'
-  );
-}
-
-function validateSharedSetup(env = process.env, cwd = process.cwd()) {
+export function validateSharedSetup(env = process.env) {
   if (!findExecutable('bash', env)) {
     throw new Error('shared setup requires bash on PATH');
   }
@@ -1132,55 +1249,55 @@ function validateSharedSetup(env = process.env, cwd = process.cwd()) {
     );
   }
 
-  const routingConflicts = inspectClaudeRoutingSettingsConflicts(env, cwd);
-  if (routingConflicts.length > 0) {
-    const details = routingConflicts
-      .map((conflict) => `${conflict.path} (${conflict.names.join(', ')})`)
-      .join('; ');
-    throw new Error(
-      `shared mode cannot safely override Claude routing settings in ${details}. ` +
-        'Use the `claude-workflow` launcher, or update those settings explicitly before enabling plain `claude` routing'
-    );
-  }
-
   managerPathSetting(env, 'CLAUDE_WORKFLOW_GATEWAY_STATE_DIR');
   managerPathSetting(env, 'CLAUDE_WORKFLOW_GATEWAY_ENV_FILE');
+  const homeDirectory = env.HOME || os.homedir();
+  const canonicalStateDirectory = path.join(
+    env.XDG_STATE_HOME || path.join(homeDirectory, '.cache'),
+    'claude-workflow'
+  );
+  const legacyStateDirectory = path.join(homeDirectory, '.cache', 'ultrathink');
+  const legacyHasPriorState =
+    !fs.existsSync(canonicalStateDirectory) &&
+    [
+      'claude-workflow-gateway.pid',
+      'claude-workflow-gateway.env',
+      '.claude-workflow-gateway.owner',
+    ].some((entry) => fs.existsSync(path.join(legacyStateDirectory, entry)));
+  const sharedStateDirectory =
+    env.CLAUDE_WORKFLOW_GATEWAY_STATE_DIR ||
+    (legacyHasPriorState ? legacyStateDirectory : canonicalStateDirectory);
+  const sharedEnvironmentFile =
+    env.CLAUDE_WORKFLOW_GATEWAY_ENV_FILE ||
+    path.join(sharedStateDirectory, 'claude-workflow-gateway.env');
+  const expectedEnvironmentFile = path.join(
+    sharedStateDirectory,
+    'claude-workflow-gateway.env'
+  );
+  if (
+    path.resolve(sharedStateDirectory) !== sharedStateDirectory ||
+    path.resolve(sharedEnvironmentFile) !== sharedEnvironmentFile ||
+    sharedEnvironmentFile !== expectedEnvironmentFile
+  ) {
+    throw new Error(
+      `CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be exactly ${expectedEnvironmentFile} inside the normalized shared gateway state directory`
+    );
+  }
   const traceDirectory = String(env.ULTRATHINK_GATEWAY_TRACE_DIR || '').trim();
+  const disabledTraceValues = new Set(['0', 'false', 'no', 'off']);
   if (
     traceDirectory &&
-    !new Set(['0', 'false', 'no', 'off']).has(traceDirectory.toLowerCase()) &&
-    !path.isAbsolute(traceDirectory)
+    !disabledTraceValues.has(traceDirectory.toLowerCase()) &&
+    traceDirectory !== path.join(sharedStateDirectory, 'gateway-trace')
   ) {
-    throw new Error('ULTRATHINK_GATEWAY_TRACE_DIR must be absolute or disabled');
-  }
-
-  const hookPath = resolveThroughExistingAncestor(sharedShellHookPath(env));
-  let hookStats = null;
-  try {
-    hookStats = fs.lstatSync(hookPath);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      throw error;
-    }
-  }
-  if (hookStats) {
-    const stats = hookStats;
-    if (!stats.isFile()) {
-      throw new Error(`shared shell rc must be a regular file: ${hookPath}`);
-    }
-    fs.accessSync(hookPath, fs.constants.R_OK | fs.constants.W_OK);
-    fs.accessSync(path.dirname(hookPath), fs.constants.W_OK | fs.constants.X_OK);
-  } else {
-    fs.accessSync(
-      nearestExistingDirectory(path.dirname(hookPath)),
-      fs.constants.W_OK | fs.constants.X_OK
+    throw new Error(
+      `shared-daemon ULTRATHINK_GATEWAY_TRACE_DIR must be ${path.join(sharedStateDirectory, 'gateway-trace')} or disabled`
     );
   }
 
   if (isWsl(env)) {
     for (const [label, candidate] of [
       ['Claude Workflow installation', GATEWAY_MANAGER],
-      ['Shared shell rc', hookPath],
       ['Shared gateway state', env.CLAUDE_WORKFLOW_GATEWAY_STATE_DIR || ''],
       ['Shared gateway env file', env.CLAUDE_WORKFLOW_GATEWAY_ENV_FILE || ''],
       ['Shared gateway trace directory', traceDirectory],
@@ -1213,6 +1330,7 @@ export function runSetupCommand(args, options = {}) {
 
   const report = diagnosticReport({
     ...options,
+    migrateShell: parsed.shared === true,
     prepareClaude: parsed['prepare-claude'] === true,
   });
   if (parsed.json) {
@@ -1227,7 +1345,7 @@ export function runSetupCommand(args, options = {}) {
   }
 
   if (parsed.shared) {
-    validateSharedSetup(options.env || process.env, options.cwd || process.cwd());
+    validateSharedSetup(options.env || process.env);
   }
 
   if (parsed['prepare-claude']) {
@@ -1255,16 +1373,15 @@ export function runSetupCommand(args, options = {}) {
 
   if (parsed.shared) {
     const gatewayAction = options.runGatewayAction || runGatewayAction;
-    gatewayAction('start', options);
-    try {
-      gatewayAction('install-shell', options);
-    } catch (error) {
-      throw new Error(
-        `${error.message}. The gateway may still be running; use ` +
-          '`claude-workflow-gateway stop` if you do not want it left active.'
-      );
-    }
-    writeLine(stdout, 'Shared gateway enabled. Open a new shell before using plain `claude` commands.');
+    gatewayAction('migrate-shell', options);
+    gatewayAction('start', {
+      ...options,
+      env: environmentWithoutManagedGatewayAuth(options.env || process.env),
+    });
+    writeLine(
+      stdout,
+      'Historical Bash/zsh routing was migrated to cleanup-only mode. Shared gateway started from a clean environment for explicit clients. Source the migrated rc or open a new shell before using plain `claude`; use `claude-workflow` for scoped routing.'
+    );
   } else if (!parsed.json) {
     writeLine(stdout);
     writeLine(stdout, 'Ready. Run `claude-workflow` in a trusted repository.');
@@ -1284,7 +1401,7 @@ export function runDoctorCommand(args, options = {}) {
   if (parsed.help) {
     writeLine(
       stdout,
-      'Usage: claude-workflow doctor [--json]\n\nRe-runs the read-only prerequisite and routing checks.\n\nOptions:\n  --json     Print diagnostics as JSON\n  --help, -h Show this help'
+      'Usage: claude-workflow doctor [--json]\n\nRe-runs the read-only prerequisite, routing, and inherited shell-routing checks.\n\nOptions:\n  --json     Print diagnostics as JSON\n  --help, -h Show this help'
     );
     return;
   }

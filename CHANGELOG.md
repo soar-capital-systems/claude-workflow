@@ -20,6 +20,8 @@
   calls, typed errors, compaction, cache-write usage, and model rerouting.
 - Capability discovery through `codex debug models`, with `standard`, `long`,
   and exact-window configuration for Codex routes.
+- Public contribution guidance and issue templates with an explicit private
+  vulnerability-reporting path.
 
 ### Changed
 
@@ -74,6 +76,10 @@
 - Shared-daemon upgrades use managed-state ownership, runtime-revision
   reconciliation, bounded shell cleanup, and self-contained global-install
   checks. The standalone gateway accepts request bodies up to 32 MiB.
+- Stable GitHub installation examples pin the `v0.2.0` release.
+  `yshaaban/claude-workflow` is the canonical public project home;
+  `soar-capital-systems/claude-workflow` is a synchronized mirror.
+- GitHub Actions dependencies are pinned to reviewed commit SHAs.
 
 ### Fixed
 

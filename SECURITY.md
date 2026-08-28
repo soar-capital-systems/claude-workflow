@@ -2,10 +2,12 @@
 
 ## Reporting a vulnerability
 
-Please use the repository's private GitHub security-advisory flow rather than a
-public issue. Include the affected revision, reproduction steps, impact, and a
-minimal redacted trace when useful. Do not include API keys, OAuth tokens,
-published gateway env files, or complete private prompts/transcripts.
+Please use the canonical repository's
+[private GitHub security-advisory flow](https://github.com/yshaaban/claude-workflow/security/advisories/new)
+rather than a public issue or the Soar mirror. Include the affected release or
+revision, reproduction steps, impact, and a minimal redacted trace when useful.
+Do not include API keys, OAuth tokens, generated gateway environment files, or
+complete private prompts or transcripts.
 
 ## Security model
 

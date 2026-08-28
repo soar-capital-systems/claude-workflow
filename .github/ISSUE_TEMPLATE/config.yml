@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/yshaaban/claude-workflow/security/advisories/new
+    about: Report vulnerabilities without exposing sensitive details publicly.
+  - name: Support guide
+    url: https://github.com/yshaaban/claude-workflow/blob/main/SUPPORT.md
+    about: Check supported environments, diagnostics, and known boundaries.

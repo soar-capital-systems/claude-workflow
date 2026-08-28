@@ -37,16 +37,16 @@ installing under WSL.
 
 ## Getting started
 
-Install directly from GitHub:
+Install release `v0.2.0` from the canonical GitHub repository:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow
+npm install --global github:yshaaban/claude-workflow#v0.2.0
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
 global install would otherwise require `sudo`. Do not run this package as root.
 
-For a source checkout instead:
+For development from source instead:
 
 ```bash
 git clone https://github.com/yshaaban/claude-workflow.git
@@ -553,9 +553,28 @@ global installation. Live provider calls are excluded from CI.
 
 See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
 
-Update or remove a GitHub installation with:
+Reinstall this release or remove Claude Workflow with:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow
+npm install --global github:yshaaban/claude-workflow#v0.2.0
 npm uninstall --global @onetool/claude-workflow
 ```
+
+Replace `v0.2.0` with another published tag when you intentionally select a
+different release. npm registry publication is not required for GitHub
+installation.
+
+## Project links
+
+[`yshaaban/claude-workflow`](https://github.com/yshaaban/claude-workflow) is the
+canonical public repository for releases, issues, pull requests, and private
+security reports.
+[`soar-capital-systems/claude-workflow`](https://github.com/soar-capital-systems/claude-workflow)
+is a synchronized mirror.
+
+- [Releases](https://github.com/yshaaban/claude-workflow/releases)
+- [Changelog](CHANGELOG.md)
+- [Support policy](SUPPORT.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [MIT License](LICENSE)

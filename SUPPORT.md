@@ -1,5 +1,13 @@
 # Support
 
+## Where to ask for help
+
+Use the canonical repository for
+[questions and bug reports](https://github.com/yshaaban/claude-workflow/issues).
+The Soar Capital Systems repository is a synchronized mirror and does not have
+a separate support queue. Report vulnerabilities through the private channel
+described in [SECURITY.md](SECURITY.md), not in an issue.
+
 ## Supported environment
 
 - Node.js 20 or newer.

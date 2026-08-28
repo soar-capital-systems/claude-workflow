@@ -66,6 +66,7 @@
     "scripts",
     ".env.example",
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "SECURITY.md",
     "SUPPORT.md",
     "docs",

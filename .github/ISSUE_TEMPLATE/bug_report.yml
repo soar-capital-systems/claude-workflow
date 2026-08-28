@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible Claude Workflow failure
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, OAuth tokens, generated gateway environment files, private prompts, or unredacted traces. Report security issues through the private advisory link instead.
+  - type: input
+    id: workflow-version
+    attributes:
+      label: Claude Workflow version
+      description: Paste the output of `claude-workflow --version`.
+    validations:
+      required: true
+  - type: input
+    id: client-versions
+    attributes:
+      label: Claude Code and Codex versions
+      description: Paste the outputs of `claude --version` and `codex --version`.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, WSL version if applicable, shell, and Node.js version.
+    validations:
+      required: true
+  - type: input
+    id: route
+    attributes:
+      label: Route
+      description: Main route, delegated-agent model, reasoning effort, and context profile.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest sequence of commands and inputs that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the first relevant error and sanitized diagnostic output.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I ran `claude-workflow doctor` and removed all credentials and private data from the output.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

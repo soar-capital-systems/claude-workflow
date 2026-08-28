@@ -8197,11 +8197,11 @@ await runTest(
           "import fs from 'node:fs';\n" +
           "const settingsIndex = process.argv.indexOf('--settings');\n" +
           "if (settingsIndex >= 0) fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_SETTINGS_PATH, process.argv[settingsIndex + 1], 'utf8');\n" +
-          'fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_STARTED_PATH, "started", "utf8");\n' +
           "process.on('SIGTERM', function onSigterm() {\n" +
           '  fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_STOPPED_PATH, "stopped", "utf8");\n' +
           '  process.exit(0);\n' +
           '});\n' +
+          'fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_STARTED_PATH, "started", "utf8");\n' +
           'setInterval(function keepAlive() {}, 1000);\n'
       );
       await makeCodexLoginStatusCommand(codexPath);

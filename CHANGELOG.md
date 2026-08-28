@@ -4,8 +4,8 @@
 
 ### Changed
 
-- Shared-secret comparisons now use fixed-length SHA-256 digests and
-  constant-time equality checks.
+- Shared-secret comparisons now use constant-time byte equality checks for
+  equal-length credentials.
 - Missing or incorrect `/v1` credentials and incorrect credentials supplied to
   `/healthz` are rate-limited per direct socket peer, including alternate route
   casing and trailing slashes. Valid credentials,

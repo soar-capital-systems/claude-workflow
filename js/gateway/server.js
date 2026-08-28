@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 
 import express from 'express';
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
@@ -114,9 +114,12 @@ function secretsEqual(candidate, expected) {
   if (typeof expected !== 'string' || expected === '') {
     return false;
   }
-  const candidateDigest = createHash('sha256').update(String(candidate || '')).digest();
-  const expectedDigest = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(candidateDigest, expectedDigest);
+  const candidateBytes = Buffer.from(String(candidate || ''), 'utf8');
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  return (
+    candidateBytes.length === expectedBytes.length &&
+    timingSafeEqual(candidateBytes, expectedBytes)
+  );
 }
 
 function requireGatewayAuth(config) {

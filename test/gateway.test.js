@@ -7,6 +7,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { translateAnthropicMessagesRequestWithOptions } from '../js/gateway/anthropic-format.js';
 import { serializeWorkflowEnvironment } from '../js/cli/claude-workflow-daemon.js';
@@ -16,7 +17,11 @@ import {
   buildWorkflowClientEnv,
   buildWorkflowGatewayConfig,
 } from '../js/gateway/workflow-config.js';
-import { GatewayError, resolveModelRoute } from '../js/gateway/model-routing.js';
+import {
+  GatewayError,
+  modelIdWithoutBracketQualifiers,
+  resolveModelRoute,
+} from '../js/gateway/model-routing.js';
 import {
   noProxyMatchesUrl,
   proxyExclusionEnvForHost,
@@ -1038,6 +1043,9 @@ await runTest('gateway treats blank numeric env values as unset', async function
     {
       ULTRATHINK_GATEWAY_PORT: '',
       ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS: '   ',
+      ULTRATHINK_GATEWAY_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS: '',
+      ULTRATHINK_GATEWAY_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS: '',
+      ULTRATHINK_GATEWAY_MAX_CONCURRENT_REQUESTS: '',
       ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '',
       ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS: '',
       ULTRATHINK_GATEWAY_CODEX_PENDING_TOOL_TIMEOUT_MS: '',
@@ -1047,6 +1055,9 @@ await runTest('gateway treats blank numeric env values as unset', async function
       const config = loadGatewayConfig();
       assert.equal(config.port, 4319);
       assert.equal(config.requestTimeoutMs, 5 * 60_000);
+      assert.equal(config.authFailureRateLimitWindowMs, 60_000);
+      assert.equal(config.authFailureRateLimitMaxRequests, 60);
+      assert.equal(config.maxConcurrentRequests, 32);
       assert.equal(config.codex.inputMaxTokens, 0);
       assert.equal(config.codex.capabilities.inputBudgetTokens > 0, true);
       assert.equal(config.codex.maxSessions, 16);
@@ -1114,6 +1125,33 @@ await runTest('gateway strips client-only [1m] qualifiers before Anthropic passt
   assert.equal(fableRoute.upstreamModel, 'claude-fable-5');
   ok('client-visible [1m] aliases use the plain Anthropic API model id upstream');
 });
+
+await runTest(
+  'model qualifier stripping stays linear on unmatched attacker input',
+  async function testLinearModelQualifierStripping() {
+    const examples = new Map([
+      [' model[1m] ', 'model'],
+      ['model[one][two]', 'model'],
+      ['model[]', 'model[]'],
+      ['model[[]tail', 'modeltail'],
+      ['model[unfinished', 'model[unfinished'],
+    ]);
+    for (const [modelId, expected] of examples) {
+      assert.equal(modelIdWithoutBracketQualifiers(modelId), expected);
+    }
+
+    const adversarialModelId = `model-${'['.repeat(50_000)}`;
+    const startedAt = performance.now();
+    assert.equal(modelIdWithoutBracketQualifiers(adversarialModelId), adversarialModelId);
+    const elapsedMs = performance.now() - startedAt;
+    assert.equal(
+      elapsedMs < 500,
+      true,
+      `unmatched bracket scan took ${elapsedMs.toFixed(1)}ms`
+    );
+    ok('untrusted model IDs are processed in one pass without regex backtracking');
+  }
+);
 
 await runTest('workflow defaults use the canonical Opus 5 model id', async function testWorkflowMainAliasStripping() {
   await withTemporaryEnv(CLEAN_WORKFLOW_ENV, async function assertWorkflowMainAlias() {
@@ -2152,7 +2190,7 @@ await runTest('Codex session manager forks unrelated side requests while a tool_
   );
 
   assert.equal(createdSessionKeys.length, 2);
-  assert.match(createdSessionKeys[1], /:fork:/u);
+  assert.match(createdSessionKeys[1], /:fork:[0-9a-f]{64}$/u);
   ok('side requests no longer collide with a pending tool_result in the canonical Codex session');
 });
 
@@ -2821,8 +2859,14 @@ await runTest('Codex session identity keys cannot collide through raw header sep
   );
 
   assert.equal(createdSessionKeys.length, 2);
+  for (const sessionKey of createdSessionKeys) {
+    assert.match(
+      sessionKey,
+      /^identity:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$/u
+    );
+  }
   assert.notEqual(createdSessionKeys[0], createdSessionKeys[1]);
-  ok('structured session identity hashing prevents colon-separated header collisions');
+  ok('full SHA-256 session digests prevent weak-hash and raw-header separator collisions');
 });
 
 await runTest(

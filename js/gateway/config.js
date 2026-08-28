@@ -22,6 +22,9 @@ const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
 export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
 const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'total';
+const DEFAULT_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS = 60;
+const DEFAULT_MAX_CONCURRENT_REQUESTS = 32;
 const DISABLED_FLAG_VALUES = new Set(['0', 'false', 'no', 'off']);
 const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]']);
 const CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES = new Set(['total', 'body_after_prefix']);
@@ -300,6 +303,21 @@ export function loadGatewayConfig() {
       process.env.ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS,
       5 * 60_000,
       { min: 1_000, max: 30 * 60_000 }
+    ),
+    authFailureRateLimitWindowMs: clampNumber(
+      process.env.ULTRATHINK_GATEWAY_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS,
+      DEFAULT_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS,
+      { min: 1_000, max: 60 * 60_000 }
+    ),
+    authFailureRateLimitMaxRequests: clampNumber(
+      process.env.ULTRATHINK_GATEWAY_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS,
+      DEFAULT_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS,
+      { min: 1, max: 10_000 }
+    ),
+    maxConcurrentRequests: clampNumber(
+      process.env.ULTRATHINK_GATEWAY_MAX_CONCURRENT_REQUESTS,
+      DEFAULT_MAX_CONCURRENT_REQUESTS,
+      { min: 1, max: 256 }
     ),
     exposedModels: splitCsv(process.env.ULTRATHINK_GATEWAY_EXPOSED_MODELS, defaultExposedModels),
     routeMap,

@@ -132,7 +132,40 @@ export function modelIdWithoutBracketQualifiers(modelId) {
     return '';
   }
 
-  return modelId.trim().replace(/\[[^\]]+\]/gu, '');
+  const normalized = modelId.trim();
+  const retained = [];
+  let retainedStart = 0;
+  let qualifierStart = -1;
+
+  // Scan once instead of using a backtracking expression. Model IDs cross the
+  // HTTP trust boundary, and a long unmatched run of '[' characters makes the
+  // equivalent global regular expression retry from every opening bracket.
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index];
+    if (qualifierStart === -1) {
+      if (character === '[') {
+        qualifierStart = index;
+      }
+      continue;
+    }
+
+    if (character !== ']') {
+      continue;
+    }
+
+    if (index === qualifierStart + 1) {
+      // Empty brackets were never treated as a qualifier.
+      qualifierStart = -1;
+      continue;
+    }
+
+    retained.push(normalized.slice(retainedStart, qualifierStart));
+    retainedStart = index + 1;
+    qualifierStart = -1;
+  }
+
+  retained.push(normalized.slice(retainedStart));
+  return retained.join('');
 }
 
 function formatAllowedValues(values) {

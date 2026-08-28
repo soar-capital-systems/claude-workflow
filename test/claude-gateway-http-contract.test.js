@@ -98,6 +98,9 @@ async function startGateway(upstreamBaseUrl, options = {}) {
     traceDir: '',
     sharedSecret: GATEWAY_SECRET,
     requestTimeoutMs: 5_000,
+    authFailureRateLimitWindowMs: 60_000,
+    authFailureRateLimitMaxRequests: 10_000,
+    maxConcurrentRequests: 64,
     exposedModels: [TEST_MODEL],
     routeMap: {},
     anthropicPassthroughModels: [TEST_MODEL],
@@ -303,6 +306,204 @@ test('shared-secret Anthropic routes reject a generic upstream credential', func
   );
 });
 
+test('invalid credentials are rate-limited without throttling valid model requests', async function (t) {
+  let upstreamRequests = 0;
+  const upstream = http.createServer(async function respond(request, response) {
+    await readBody(request);
+    upstreamRequests += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(anthropicMessage()));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => closeServer(upstream));
+
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    authFailureRateLimitMaxRequests: 2,
+  });
+  t.after(() => gateway.runtime.close());
+  const body = JSON.stringify({
+    model: TEST_MODEL,
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 16,
+  });
+
+  const unrelated = await fetch(`${gateway.url}/v1evil`, {
+    headers: { authorization: 'Bearer wrong-secret' },
+  });
+  assert.equal(unrelated.status, 404);
+
+  const wrong = await rawPost(
+    `${gateway.url}/V1/MESSAGES/`,
+    gatewayHeaders({ authorization: 'Bearer wrong-secret' }),
+    body
+  );
+  assert.equal(wrong.status, 401);
+
+  const missing = await rawPost(
+    `${gateway.url}/v1/messages`,
+    { 'content-type': 'application/json' },
+    body
+  );
+  assert.equal(missing.status, 401);
+
+  const limited = await rawPost(
+    `${gateway.url}/v1/messages`,
+    gatewayHeaders({ authorization: 'Bearer another-wrong-secret' }),
+    `{"model":"${TEST_MODEL}"`
+  );
+  assert.equal(limited.status, 429);
+  assert.equal(Number(limited.headers['retry-after']) >= 1, true);
+  assert.equal(JSON.parse(limited.body).error.type, 'rate_limit_error');
+  assert.equal(upstreamRequests, 0);
+
+  for (let index = 0; index < 4; index += 1) {
+    const valid = await rawPost(`${gateway.url}/v1/messages`, gatewayHeaders(), body);
+    assert.equal(valid.status, 200);
+  }
+  assert.equal(upstreamRequests, 4);
+});
+
+test('anonymous health polling stays unlimited while wrong health credentials are bounded', async function (t) {
+  const gateway = await startGateway('http://127.0.0.1:1/', {
+    host: '0.0.0.0',
+    authFailureRateLimitMaxRequests: 1,
+  });
+  t.after(() => gateway.runtime.close());
+
+  for (let index = 0; index < 4; index += 1) {
+    const health = await fetch(`${gateway.url}/healthz`);
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).ok, true);
+  }
+
+  const firstWrong = await fetch(`${gateway.url}/HEALTHZ/`, {
+    headers: { authorization: 'Bearer wrong-secret' },
+  });
+  assert.equal(firstWrong.status, 200);
+  assert.deepEqual(await firstWrong.json(), {
+    ok: true,
+    service: 'claude-workflow-gateway',
+  });
+
+  const limitedWrong = await fetch(`${gateway.url}/healthz`, {
+    headers: { authorization: 'Bearer another-wrong-secret' },
+  });
+  assert.equal(limitedWrong.status, 429);
+  assert.equal((await limitedWrong.json()).error.type, 'rate_limit_error');
+
+  const valid = await fetch(`${gateway.url}/healthz`, {
+    headers: gatewayHeaders(),
+  });
+  assert.equal(valid.status, 200);
+  assert.equal((await valid.json()).runtime_pid, process.pid);
+});
+
+test('no-secret loopback routes do not acquire an authentication-failure quota', async function (t) {
+  let upstreamRequests = 0;
+  const upstream = http.createServer(async function respond(request, response) {
+    await readBody(request);
+    upstreamRequests += 1;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(anthropicMessage()));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => closeServer(upstream));
+
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    sharedSecret: '',
+    authFailureRateLimitMaxRequests: 1,
+  });
+  t.after(() => gateway.runtime.close());
+  const body = JSON.stringify({
+    model: TEST_MODEL,
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 16,
+  });
+
+  for (let index = 0; index < 3; index += 1) {
+    const response = await rawPost(
+      `${gateway.url}/v1/messages`,
+      { 'content-type': 'application/json' },
+      body
+    );
+    assert.equal(response.status, 200);
+  }
+  assert.equal(upstreamRequests, 3);
+});
+
+test('concurrent admission is held through the response and runs before JSON buffering', async function (t) {
+  let releaseFirst;
+  const firstRelease = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  let markFirstReceived;
+  const firstReceived = new Promise((resolve) => {
+    markFirstReceived = resolve;
+  });
+  let upstreamRequests = 0;
+  const upstream = http.createServer(async function respond(request, response) {
+    const requestBody = JSON.parse((await readBody(request)).toString('utf8'));
+    upstreamRequests += 1;
+    if (upstreamRequests === 1) {
+      assert.equal(requestBody.stream, true);
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.flushHeaders();
+      response.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      markFirstReceived();
+      await firstRelease;
+      response.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(anthropicMessage()));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => {
+    releaseFirst();
+    return closeServer(upstream);
+  });
+
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    maxConcurrentRequests: 1,
+  });
+  t.after(() => gateway.runtime.close());
+  const streamedBody = JSON.stringify({
+    model: TEST_MODEL,
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 16,
+    stream: true,
+  });
+  const body = JSON.stringify({
+    model: TEST_MODEL,
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 16,
+    stream: false,
+  });
+
+  const first = rawPost(`${gateway.url}/v1/messages`, gatewayHeaders(), streamedBody);
+  await firstReceived;
+
+  const limited = await rawPost(
+    `${gateway.url}/v1/messages`,
+    gatewayHeaders(),
+    `{"model":"${TEST_MODEL}"`
+  );
+  assert.equal(limited.status, 429);
+  assert.equal(JSON.parse(limited.body).error.type, 'rate_limit_error');
+  assert.equal(upstreamRequests, 1);
+
+  releaseFirst();
+  assert.equal((await first).status, 200);
+
+  const afterRelease = await rawPost(
+    `${gateway.url}/v1/messages`,
+    gatewayHeaders(),
+    body
+  );
+  assert.equal(afterRelease.status, 200);
+  assert.equal(upstreamRequests, 2);
+});
+
 test('health reports resolved Codex context capabilities and only active compact overrides', async function (t) {
   const gateway = await startGateway('http://127.0.0.1:1/');
   t.after(() => gateway.runtime.close());
@@ -311,6 +512,10 @@ test('health reports resolved Codex context capabilities and only active compact
   const initial = await fetch(`${gateway.url}/healthz`);
   assert.equal(initial.status, 200);
   const health = await initial.json();
+  assert.equal(health.auth_failure_rate_limit_window_ms, 60_000);
+  assert.equal(health.auth_failure_rate_limit_max_requests, 10_000);
+  assert.equal(health.request_max_concurrent_requests, 64);
+  assert.equal(health.request_active_operations, 0);
   assert.equal(health.codex_context_profile, capabilities.profile);
   assert.equal(health.codex_context_source, capabilities.source);
   assert.equal(

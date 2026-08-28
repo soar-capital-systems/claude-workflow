@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 - 2026-08-28
+
+### Changed
+
+- Shared-secret comparisons now use fixed-length SHA-256 digests and
+  constant-time equality checks.
+- Missing or incorrect `/v1` credentials and incorrect credentials supplied to
+  `/healthz` are rate-limited per direct socket peer, including alternate route
+  casing and trailing slashes. Valid credentials,
+  anonymous health polling, and no-secret loopback traffic have no rolling
+  quota.
+- Model and token-count requests share a configurable process-wide concurrency
+  cap. Admission runs before the 32 MiB JSON parser and remains held until a
+  complete JSON or streaming response closes.
+- Stable GitHub installation examples pin the `v0.2.1` release.
+
+### Fixed
+
+- Bracket-qualified model IDs are parsed in one pass, preventing quadratic
+  backtracking on long, unmatched input.
+- Codex request, session, tool-schema, and system-prompt routing keys use full
+  SHA-256 digests instead of truncated SHA-1 values.
+- Daemon test executables and child working directories are anchored to the
+  test module location instead of the caller's current directory.
+
 ## 0.2.0 - 2026-08-28
 
 ### Added

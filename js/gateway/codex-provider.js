@@ -664,7 +664,7 @@ function readSanitizationTrace(readSanitization) {
 }
 
 function requestFingerprint(requestBody) {
-  return shortHash(
+  return stableDigest(
     JSON.stringify({
       model: requestBody?.model || null,
       system: requestBody?.system || null,
@@ -2384,12 +2384,15 @@ function mapReasoningEffort(reasoningEffort) {
   return normalized;
 }
 
-function shortHash(text) {
-  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 16);
+function stableDigest(text) {
+  // Session routing keys separate app-server threads that may contain
+  // different users, tools, and system prompts. Keep the complete SHA-256
+  // digest so attacker-controlled request material cannot feasibly collide.
+  return crypto.createHash('sha256').update(text).digest('hex');
 }
 
 function buildSessionIdentityKey(route, req) {
-  return `identity:${shortHash(
+  return `identity:${stableDigest(
     JSON.stringify([
       req.get('x-claude-code-session-id') || 'no-session',
       req.get('x-claude-code-agent-id') || 'root-agent',
@@ -2401,8 +2404,8 @@ function buildSessionIdentityKey(route, req) {
 
 function buildSessionBaseKey(route, req, requestBody) {
   const identityKey = buildSessionIdentityKey(route, req);
-  const toolKey = shortHash(effectiveToolSchemaSignature(requestBody));
-  const systemKey = shortHash(renderSystemPrompt(requestBody));
+  const toolKey = stableDigest(effectiveToolSchemaSignature(requestBody));
+  const systemKey = stableDigest(renderSystemPrompt(requestBody));
   return `${identityKey}:${toolKey}:${systemKey}`;
 }
 

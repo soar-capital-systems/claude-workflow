@@ -4,14 +4,16 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { claimManagedState } from '../js/cli/claude-workflow-managed-state.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 import { environmentWithoutManagedGatewayAuth } from '../js/utils/child-env.js';
 
-const DAEMON_SCRIPT = path.resolve('scripts/claude-workflow-daemon.sh');
-const DAEMON_JS = path.resolve('js/cli/claude-workflow-daemon.js');
-const POSTINSTALL_SCRIPT = path.resolve('scripts/reconcile-installed-daemon.mjs');
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DAEMON_SCRIPT = path.join(REPO_ROOT, 'scripts', 'claude-workflow-daemon.sh');
+const DAEMON_JS = path.join(REPO_ROOT, 'js', 'cli', 'claude-workflow-daemon.js');
+const POSTINSTALL_SCRIPT = path.join(REPO_ROOT, 'scripts', 'reconcile-installed-daemon.mjs');
 
 function freePort() {
   return new Promise(function reservePort(resolve, reject) {
@@ -34,7 +36,7 @@ function freePort() {
 function runProcess(command, args, env) {
   return new Promise(function waitForProcess(resolve, reject) {
     const child = spawn(command, args, {
-      cwd: process.cwd(),
+      cwd: REPO_ROOT,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

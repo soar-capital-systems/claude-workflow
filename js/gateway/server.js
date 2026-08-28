@@ -1,4 +1,7 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
+
 import express from 'express';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 import {
@@ -19,6 +22,9 @@ import { createGatewayTracer } from './trace.js';
 const proxyDispatchers = new Map();
 const TOOL_REASONING_CACHE_MAX_ENTRIES = 2_048;
 const CLAUDE_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+const DEFAULT_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS = 60;
+const DEFAULT_MAX_CONCURRENT_REQUESTS = 32;
 const DEFAULT_SSE_KEEPALIVE_INTERVAL_MS = 10_000;
 const SSE_KEEPALIVE_CHUNK = 'event: ping\ndata: {"type":"ping"}\n\n';
 const CREDENTIAL_LIKE_HEADER_PATTERN =
@@ -104,6 +110,15 @@ function authHeaderSecret(req) {
   return '';
 }
 
+function secretsEqual(candidate, expected) {
+  if (typeof expected !== 'string' || expected === '') {
+    return false;
+  }
+  const candidateDigest = createHash('sha256').update(String(candidate || '')).digest();
+  const expectedDigest = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(candidateDigest, expectedDigest);
+}
+
 function requireGatewayAuth(config) {
   return function gatewayAuth(req, res, next) {
     if (!config.sharedSecret) {
@@ -111,7 +126,8 @@ function requireGatewayAuth(config) {
       return;
     }
 
-    if (authHeaderSecret(req) !== config.sharedSecret) {
+    if (!secretsEqual(authHeaderSecret(req), config.sharedSecret)) {
+      discardUnreadRequestBody(req);
       res.status(401).json({
         type: 'error',
         error: {
@@ -124,6 +140,173 @@ function requireGatewayAuth(config) {
 
     next();
   };
+}
+
+function boundedPositiveInteger(value, fallback, maximum) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 1) {
+    return fallback;
+  }
+  return Math.min(Math.trunc(number), maximum);
+}
+
+function requestLimitConfiguration(config) {
+  return {
+    authFailureWindowMs: boundedPositiveInteger(
+      config.authFailureRateLimitWindowMs,
+      DEFAULT_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS,
+      60 * 60_000
+    ),
+    authFailureMaxRequests: boundedPositiveInteger(
+      config.authFailureRateLimitMaxRequests,
+      DEFAULT_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS,
+      10_000
+    ),
+    maxConcurrentRequests: boundedPositiveInteger(
+      config.maxConcurrentRequests,
+      DEFAULT_MAX_CONCURRENT_REQUESTS,
+      256
+    ),
+  };
+}
+
+function discardUnreadRequestBody(req) {
+  if (req.destroyed || req.readableEnded) {
+    return;
+  }
+  // These guards run before express.json(). Drain the socket without retaining
+  // the body so a rejected large request cannot consume the JSON buffer budget.
+  req.on('error', function ignoreRejectedRequestBodyError() {});
+  req.resume();
+}
+
+function sendGatewayRateLimit(res, message, retryAfterSeconds) {
+  if (!res.hasHeader('retry-after')) {
+    res.setHeader('retry-after', String(Math.max(1, retryAfterSeconds)));
+  }
+  res.status(429).json({
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      message,
+    },
+  });
+}
+
+function shouldSkipCredentialFailureLimit(req, config) {
+  if (!config.sharedSecret) {
+    return true;
+  }
+
+  const suppliedSecret = authHeaderSecret(req);
+  if (secretsEqual(suppliedSecret, config.sharedSecret)) {
+    return true;
+  }
+
+  // Express routing is case-insensitive and non-strict by default. Classify
+  // the path with the same casing and trailing-slash behavior so alternate
+  // spellings cannot reach auth while skipping its failure counter.
+  const lowerPath = req.path.toLowerCase();
+  let routeEnd = lowerPath.length;
+  while (routeEnd > 1 && lowerPath[routeEnd - 1] === '/') {
+    routeEnd -= 1;
+  }
+  const routePath = lowerPath.slice(0, routeEnd);
+
+  if (routePath === '/healthz') {
+    // Anonymous health checks expose only the fixed basic response and must
+    // remain safe for unbounded process supervisors. Supplying a wrong
+    // credential is an authentication attempt and is counted.
+    return suppliedSecret === '';
+  }
+
+  const isV1Route = routePath === '/v1' || routePath.startsWith('/v1/');
+  return !isV1Route;
+}
+
+function createCredentialFailureRateLimiter(config, limits) {
+  return rateLimit({
+    windowMs: limits.authFailureWindowMs,
+    limit: limits.authFailureMaxRequests,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    identifier: 'claude-workflow-invalid-credentials',
+    passOnStoreError: false,
+    keyGenerator(req) {
+      // Never trust caller-controlled forwarding headers for an auth throttle.
+      // The gateway keys attempts to the direct socket peer and lets the
+      // library normalize IPv4-mapped and native IPv6 addresses.
+      return ipKeyGenerator(req.socket.remoteAddress || req.ip);
+    },
+    skip(req) {
+      return shouldSkipCredentialFailureLimit(req, config);
+    },
+    handler(req, res) {
+      discardUnreadRequestBody(req);
+      sendGatewayRateLimit(
+        res,
+        'too many invalid gateway credential attempts',
+        Math.ceil(limits.authFailureWindowMs / 1_000)
+      );
+    },
+  });
+}
+
+function createConcurrentRequestLimiter(maxConcurrentRequests) {
+  let activeRequests = 0;
+
+  function concurrentRequestLimiter(req, res, next) {
+    if (activeRequests >= maxConcurrentRequests) {
+      discardUnreadRequestBody(req);
+      sendGatewayRateLimit(
+        res,
+        'gateway concurrent model-operation limit exceeded',
+        1
+      );
+      return;
+    }
+
+    activeRequests += 1;
+    let released = false;
+    function release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      activeRequests = Math.max(0, activeRequests - 1);
+    }
+    req.once('aborted', release);
+    res.once('finish', release);
+    res.once('close', release);
+    next();
+  }
+
+  concurrentRequestLimiter.activeRequests = function currentActiveRequests() {
+    return activeRequests;
+  };
+  return concurrentRequestLimiter;
+}
+
+function jsonBodyErrorHandler(error, req, res, next) {
+  if (!error) {
+    next();
+    return;
+  }
+
+  const requestTooLarge =
+    error.type === 'entity.too.large' ||
+    error.status === 413 ||
+    error.statusCode === 413;
+  const formatted = formatAnthropicError(
+    requestTooLarge
+      ? new GatewayError(
+          413,
+          'request_too_large',
+          'request body exceeds the 32 MiB limit'
+        )
+      : new GatewayError(400, 'invalid_request_error', error.message || 'invalid JSON body')
+  );
+  res.status(formatted.status).json(formatted.body);
 }
 
 export function withAbortSignal(req, res, timeoutMs) {
@@ -388,7 +571,7 @@ function openAiCompatibleTranslationOptions(req, route, toolReasoningCache) {
 }
 
 function matchesGatewaySharedSecret(value, config) {
-  return Boolean(config.sharedSecret) && value === config.sharedSecret;
+  return secretsEqual(value, config.sharedSecret);
 }
 
 function isCredentialLikeAnthropicHeader(name) {
@@ -1666,6 +1849,17 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   assertGatewayBindIsSafe(config);
   const app = express();
   const toolReasoningCache = new Map();
+  const requestLimits = requestLimitConfiguration(config);
+  const credentialFailureRateLimiter = createCredentialFailureRateLimiter(
+    config,
+    requestLimits
+  );
+  const concurrentRequestLimiter = createConcurrentRequestLimiter(
+    requestLimits.maxConcurrentRequests
+  );
+  const jsonBodyParser = express.json({ limit: CLAUDE_REQUEST_BODY_LIMIT_BYTES });
+
+  app.use(credentialFailureRateLimiter);
 
   app.get('/healthz', function healthz(req, res) {
     const basicHealth = {
@@ -1674,7 +1868,7 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
     };
     const mayExposeDiagnostics =
       isGatewayLoopbackHost(config.host) ||
-      (Boolean(config.sharedSecret) && authHeaderSecret(req) === config.sharedSecret);
+      secretsEqual(authHeaderSecret(req), config.sharedSecret);
     if (!mayExposeDiagnostics) {
       res.json(basicHealth);
       return;
@@ -1691,6 +1885,10 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       trace_max_bytes: tracer?.traceMaxBytes ?? config.traceMaxBytes ?? null,
       trace_max_files: tracer?.traceMaxFiles ?? config.traceMaxFiles ?? null,
       trace_write_failed: Boolean(tracer?.lastError),
+      auth_failure_rate_limit_window_ms: requestLimits.authFailureWindowMs,
+      auth_failure_rate_limit_max_requests: requestLimits.authFailureMaxRequests,
+      request_max_concurrent_requests: requestLimits.maxConcurrentRequests,
+      request_active_operations: concurrentRequestLimiter.activeRequests(),
       codex_target_model: config.codex?.model || null,
       codex_sandbox: config.codex?.sandbox || null,
       codex_approval_policy: config.codex?.approvalPolicy || null,
@@ -1750,28 +1948,6 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   });
 
   app.use('/v1', requireGatewayAuth(config));
-  app.use('/v1', express.json({ limit: CLAUDE_REQUEST_BODY_LIMIT_BYTES }));
-  app.use('/v1', function jsonBodyErrorHandler(error, req, res, next) {
-    if (!error) {
-      next();
-      return;
-    }
-
-    const requestTooLarge =
-      error.type === 'entity.too.large' ||
-      error.status === 413 ||
-      error.statusCode === 413;
-    const formatted = formatAnthropicError(
-      requestTooLarge
-        ? new GatewayError(
-            413,
-            'request_too_large',
-            'request body exceeds the 32 MiB limit'
-          )
-        : new GatewayError(400, 'invalid_request_error', error.message || 'invalid JSON body')
-    );
-    res.status(formatted.status).json(formatted.body);
-  });
 
   app.get('/v1/models', function listModels(req, res) {
     res.json({
@@ -1780,85 +1956,97 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
     });
   });
 
-  app.post('/v1/messages/count_tokens', async function countTokens(req, res) {
-    try {
-      await handleCountTokens(
-        req,
-        res,
-        config,
-        withAbortSignal(req, res, config.requestTimeoutMs)
-      );
-    } catch (error) {
-      const formatted = formatAnthropicError(error);
-      res.status(formatted.status).json(formatted.body);
-    }
-  });
-
-  app.post('/v1/messages', async function messages(req, res) {
-    const requestTracer =
-      tracer?.scope?.({
-        request_id: tracer.createId?.() || `${Date.now()}`,
-      }) || null;
-
-    requestTracer?.log?.('gateway.request.received', {
-      headers: summarizeGatewayHeaders(req),
-      request: summarizeRequestBody(req.body),
-    });
-
-    let route = null;
-
-    try {
-      route = resolveModelRoute(req.body?.model, config);
-      requestTracer?.log?.('gateway.route.resolved', {
-        ...summarizeGatewayTraceContext(req, route),
-        route: summarizeRoute(route),
-        response_model: responseModelForRoute(config, route),
-      });
-
-      await handleMessages(
-        req,
-        res,
-        config,
-        codexSessions,
-        route,
-        requestTracer,
-        toolReasoningCache
-      );
-      requestTracer?.log?.('gateway.request.completed', {
-        ...summarizeGatewayTraceContext(req, route),
-        status_code: res.statusCode,
-        headers_sent: res.headersSent,
-        finished: res.writableEnded,
-      });
-    } catch (error) {
-      requestTracer?.log?.(
-        isClientAbortError(error) ? 'gateway.request.aborted' : 'gateway.request.failed',
-        {
-          ...summarizeGatewayTraceContext(req, route),
-          ...summarizeError(error),
-        }
-      );
-
-      if (isClientAbortError(error) && (req.destroyed || res.destroyed)) {
-        return;
-      }
-
-      const formatted = formatAnthropicError(error);
-      if (!res.headersSent) {
+  app.post(
+    '/v1/messages/count_tokens',
+    concurrentRequestLimiter,
+    jsonBodyParser,
+    jsonBodyErrorHandler,
+    async function countTokens(req, res) {
+      try {
+        await handleCountTokens(
+          req,
+          res,
+          config,
+          withAbortSignal(req, res, config.requestTimeoutMs)
+        );
+      } catch (error) {
+        const formatted = formatAnthropicError(error);
         res.status(formatted.status).json(formatted.body);
-        return;
       }
-      if (req.body?.stream === true && responseUsesSseFraming(res)) {
-        await writeSseErrorAndClose(res, formatted.body);
-        return;
-      }
-      // A streaming request may receive a regular JSON response from an
-      // Anthropic-compatible upstream. Once those headers are committed we
-      // cannot replace or extend that body with an SSE error frame. Close the
-      // transport so the client observes a truncated response and can retry.
-      res.destroy();
     }
-  });
+  );
+
+  app.post(
+    '/v1/messages',
+    concurrentRequestLimiter,
+    jsonBodyParser,
+    jsonBodyErrorHandler,
+    async function messages(req, res) {
+      const requestTracer =
+        tracer?.scope?.({
+          request_id: tracer.createId?.() || `${Date.now()}`,
+        }) || null;
+
+      requestTracer?.log?.('gateway.request.received', {
+        headers: summarizeGatewayHeaders(req),
+        request: summarizeRequestBody(req.body),
+      });
+
+      let route = null;
+
+      try {
+        route = resolveModelRoute(req.body?.model, config);
+        requestTracer?.log?.('gateway.route.resolved', {
+          ...summarizeGatewayTraceContext(req, route),
+          route: summarizeRoute(route),
+          response_model: responseModelForRoute(config, route),
+        });
+
+        await handleMessages(
+          req,
+          res,
+          config,
+          codexSessions,
+          route,
+          requestTracer,
+          toolReasoningCache
+        );
+        requestTracer?.log?.('gateway.request.completed', {
+          ...summarizeGatewayTraceContext(req, route),
+          status_code: res.statusCode,
+          headers_sent: res.headersSent,
+          finished: res.writableEnded,
+        });
+      } catch (error) {
+        requestTracer?.log?.(
+          isClientAbortError(error) ? 'gateway.request.aborted' : 'gateway.request.failed',
+          {
+            ...summarizeGatewayTraceContext(req, route),
+            ...summarizeError(error),
+          }
+        );
+
+        if (isClientAbortError(error) && (req.destroyed || res.destroyed)) {
+          return;
+        }
+
+        const formatted = formatAnthropicError(error);
+        if (!res.headersSent) {
+          res.status(formatted.status).json(formatted.body);
+          return;
+        }
+        if (req.body?.stream === true && responseUsesSseFraming(res)) {
+          await writeSseErrorAndClose(res, formatted.body);
+          return;
+        }
+        // A streaming request may receive a regular JSON response from an
+        // Anthropic-compatible upstream. Once those headers are committed we
+        // cannot replace or extend that body with an SSE error frame. Close the
+        // transport so the client observes a truncated response and can retry.
+        res.destroy();
+      }
+    }
+  );
 
   return app;
 }

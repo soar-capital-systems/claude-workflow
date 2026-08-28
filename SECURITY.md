@@ -23,6 +23,13 @@ complete private prompts or transcripts.
   set, every Anthropic route also needs the dedicated gateway-side
   `ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY`. A generic `ANTHROPIC_API_KEY` is not
   accepted as the shared-secret upstream credential.
+- Missing or incorrect `/v1` credentials, and incorrect credentials supplied
+  to `/healthz`, are rate-limited per direct socket peer before JSON parsing.
+  Anonymous health polling, valid credentials, and no-secret loopback traffic
+  do not consume that quota. Model and token-count operations share a separate
+  configurable process-wide admission cap held until their complete JSON or
+  streaming response closes. This bounds body and upstream concurrency without
+  imposing a rolling quota on valid sessions.
 - Provider API keys, including `ULTRATHINK_GATEWAY_KIMI_API_KEY` and
   `ULTRATHINK_GATEWAY_QWEN_API_KEY`, belong in the
   owner-only `~/.claude-workflow.env` file. Do not export them from a shell

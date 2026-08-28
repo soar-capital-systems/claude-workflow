@@ -37,10 +37,10 @@ installing under WSL.
 
 ## Getting started
 
-Install release `v0.2.0` from the canonical GitHub repository:
+Install release `v0.2.1` from the canonical GitHub repository:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow#v0.2.0
+npm install --global github:yshaaban/claude-workflow#v0.2.1
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
@@ -486,6 +486,12 @@ Linux path handling, Unicode paths, and spaces in installation paths.
 - The gateway binds to loopback by default. Non-loopback binds require a shared
   secret.
 - A non-Anthropic main route uses a random per-launch gateway credential.
+- Missing or incorrect `/v1` credentials, and incorrect credentials supplied
+  to `/healthz`, are rate-limited per direct socket peer. Anonymous health
+  polling and valid or no-secret loopback traffic do not consume that quota.
+  Model and token-count requests instead share a
+  configurable process-wide concurrency cap held through complete streaming
+  responses; valid requests have no rolling quota.
 - Keep provider keys only in the owner-only user configuration. Do not put them
   in repositories, shell history, command arguments, traces, or issue reports.
 - Third-party and dedicated gateway credentials are removed from Claude,
@@ -556,11 +562,11 @@ See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
 Reinstall this release or remove Claude Workflow with:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow#v0.2.0
+npm install --global github:yshaaban/claude-workflow#v0.2.1
 npm uninstall --global @onetool/claude-workflow
 ```
 
-Replace `v0.2.0` with another published tag when you intentionally select a
+Replace `v0.2.1` with another published tag when you intentionally select a
 different release. npm registry publication is not required for GitHub
 installation.
 

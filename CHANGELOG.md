@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.2 - 2026-08-28
+
+### Changed
+
+- GitHub installs are lifecycle-free. Validation remains in CI and
+  `prepublishOnly`; the required `claude-workflow setup` step now removes
+  historical shell routing and refreshes an owned running shared daemon from
+  the final installation. It does not start a stopped daemon unless
+  `--shared` is supplied.
+- Installation examples grant npm 12 Git access only to the requested root
+  package with `--allow-git=root`.
+
+### Fixed
+
+- Global installs from a GitHub tag no longer trigger npm's temporary
+  Git-package preparation path. That checkout could run upgrade maintenance
+  and leave global command links pointing to it after npm deleted it.
+
 ## 0.2.1 - 2026-08-28
 
 ### Changed

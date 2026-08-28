@@ -379,9 +379,170 @@ test(
     assert.equal(help.status, 0, help.stderr);
     assert.match(
       help.stdout,
-      /--prepare-claude\s+Compatibility no-op; custom models use documented per-session settings/u
+      /--prepare-claude\s+Compatibility no-op for Claude state; custom models use documented per-session settings/u
     );
     assert.doesNotMatch(help.stdout, /Back up.*third-party-model support/u);
+  }
+);
+
+test(
+  'setup performs bounded upgrade maintenance without starting the shared daemon',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-maintenance-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN: 'managed-auth',
+      ANTHROPIC_API_KEY: 'managed-auth',
+    });
+    const actions = [];
+
+    runSetupCommand([], {
+      env,
+      stdout: { write() { return true; } },
+      runGatewayAction(action, actionOptions) {
+        actions.push({ action, options: actionOptions });
+      },
+    });
+
+    assert.deepEqual(
+      actions.map(({ action }) => action),
+      ['migrate-shell-upgrade', 'reconcile']
+    );
+    assert.equal(actions[0].options.quiet, true);
+    assert.equal(actions[0].options.env, env);
+    assert.equal(actions[1].options.quiet, true);
+    assert.equal(actions[1].options.env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(
+      actions.some(({ action }) => action === 'start'),
+      false,
+      'ordinary setup must not start a stopped shared daemon'
+    );
+  }
+);
+
+test(
+  'JSON setup diagnostics remain read-only',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-json-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const actions = [];
+
+    runSetupCommand(['--json'], {
+      env: isolatedEnvironment(home, {
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      }),
+      stdout: { write() { return true; } },
+      runGatewayAction(action) {
+        actions.push(action);
+      },
+    });
+
+    assert.deepEqual(actions, []);
+  }
+);
+
+test(
+  'fresh per-session setup remains available without Bash',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-no-bash-');
+    const home = path.join(root, 'home');
+    const bin = path.join(root, 'bin');
+    await fsp.mkdir(home);
+    await fsp.mkdir(bin);
+    await fsp.symlink(process.execPath, path.join(bin, 'claude'));
+    await fsp.symlink(process.execPath, path.join(bin, 'codex'));
+    const actions = [];
+
+    runSetupCommand([], {
+      env: isolatedEnvironment(home, { PATH: bin }),
+      stdout: { write() { return true; } },
+      run(command, args) {
+        if (path.basename(command) === 'claude' && args[0] === '--version') {
+          return { status: 0, stdout: '2.1.250 (Claude Code)\n', stderr: '' };
+        }
+        if (path.basename(command) === 'claude' && args[0] === 'auth') {
+          return { status: 0, stdout: '{"loggedIn":true}\n', stderr: '' };
+        }
+        if (path.basename(command) === 'codex' && args[0] === '--version') {
+          return { status: 0, stdout: 'codex-cli 0.150.1\n', stderr: '' };
+        }
+        if (path.basename(command) === 'codex' && args[0] === 'login') {
+          return { status: 0, stdout: 'Logged in using ChatGPT\n', stderr: '' };
+        }
+        return { status: 1, stdout: '', stderr: 'unexpected command' };
+      },
+      runGatewayAction(action) {
+        actions.push(action);
+      },
+    });
+
+    assert.deepEqual(actions, []);
+  }
+);
+
+test(
+  'setup stops before reconciliation when shell migration fails',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-migration-failure-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const actions = [];
+
+    assert.throws(
+      () =>
+        runSetupCommand([], {
+          env: isolatedEnvironment(home, {
+            PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          }),
+          stdout: { write() { return true; } },
+          runGatewayAction(action) {
+            actions.push(action);
+            throw new Error('migration failed');
+          },
+        }),
+      /migration failed/u
+    );
+    assert.deepEqual(actions, ['migrate-shell-upgrade']);
+  }
+);
+
+test(
+  'setup surfaces reconciliation failures',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-reconcile-failure-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const actions = [];
+
+    assert.throws(
+      () =>
+        runSetupCommand([], {
+          env: isolatedEnvironment(home, {
+            PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          }),
+          stdout: { write() { return true; } },
+          runGatewayAction(action) {
+            actions.push(action);
+            if (action === 'reconcile') {
+              throw new Error('reconciliation failed');
+            }
+          },
+        }),
+      /reconciliation failed/u
+    );
+    assert.deepEqual(actions, ['migrate-shell-upgrade', 'reconcile']);
   }
 );
 

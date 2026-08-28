@@ -410,7 +410,8 @@ for (const name of Object.keys(process.env).sort()) {
     continue;
   }
   if (name === 'ULTRATHINK_GATEWAY_RUNTIME_REVISION' ||
-      name === 'ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT') {
+      name === 'ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT' ||
+      name === 'CLAUDE_WORKFLOW_RECONCILE_INSTALL') {
     continue;
   }
   if (name.startsWith('CLAUDE_WORKFLOW_GATEWAY_MANAGED_') ||
@@ -1283,8 +1284,8 @@ case "${1:-status}" in
     validate_manager_paths && stop_daemon && start_daemon
     ;;
   reconcile)
-    # Package install/setup hook: refresh only a daemon the recorded pid and
-    # health endpoint prove is ours. A stopped daemon stays stopped.
+    # Explicit setup/reconciliation path: refresh only a daemon the recorded
+    # pid and health endpoint prove is ours. A stopped daemon stays stopped.
     validate_manager_paths && reconcile_daemon
     ;;
   status)

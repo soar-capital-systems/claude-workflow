@@ -50,11 +50,14 @@ complete private prompts or transcripts.
   It contains only local gateway credentials, never upstream provider keys,
   and is removed on normal exit, SIGINT, and SIGTERM. Claude organization
   policy has higher precedence and is not bypassed.
-- Claude Workflow does not modify `.claude.json`, user settings, or project
-  settings. Plain `setup` is read-only, and `setup --prepare-claude` remains a
-  compatibility no-op. `setup --shared` manages private daemon state and
-  removes historical shell routing; it does not enable third-party models by
-  changing Claude state.
+- Package installation has no install-time lifecycle hooks and does not modify
+  shell or daemon state. `setup` does not modify `.claude.json` or Claude user
+  or project settings. When Bash is available, it can remove historical shell
+  routing and refresh an already-running owned daemon after an upgrade. A
+  stopped daemon stays stopped. `setup --json` and `doctor` are read-only. The
+  `setup --prepare-claude` compatibility option remains a no-op for Claude
+  state and custom-model preparation; `setup --shared` explicitly starts and
+  manages private daemon state.
 - Every workflow Codex route, including per-session, shared, direct-main, and
   delegated-agent routes, starts without Codex-native execution environments
   or capability roots. Native agents, memories, MCP servers, plugins, skills,

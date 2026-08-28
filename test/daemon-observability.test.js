@@ -13,7 +13,11 @@ import { environmentWithoutManagedGatewayAuth } from '../js/utils/child-env.js';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DAEMON_SCRIPT = path.join(REPO_ROOT, 'scripts', 'claude-workflow-daemon.sh');
 const DAEMON_JS = path.join(REPO_ROOT, 'js', 'cli', 'claude-workflow-daemon.js');
-const POSTINSTALL_SCRIPT = path.join(REPO_ROOT, 'scripts', 'reconcile-installed-daemon.mjs');
+const INSTALL_MAINTENANCE_SCRIPT = path.join(
+  REPO_ROOT,
+  'scripts',
+  'reconcile-installed-daemon.mjs'
+);
 
 function freePort() {
   return new Promise(function reservePort(resolve, reject) {
@@ -333,8 +337,8 @@ async function testDaemonRevisionAndHealth() {
   }
 }
 
-async function testPostinstallReconcileIgnoresNpmLifecyclePath() {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-postinstall-home-'));
+async function testInstallationMaintenanceIgnoresNpmLifecyclePath() {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-install-maintenance-home-'));
   const stateDir = path.join(home, 'state');
   await fs.mkdir(stateDir, { mode: 0o700 });
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
@@ -380,11 +384,11 @@ async function testPostinstallReconcileIgnoresNpmLifecyclePath() {
       ),
       env.PATH,
     ].join(path.delimiter);
-    const reconciled = await runProcess(process.execPath, [POSTINSTALL_SCRIPT], {
+    const reconciled = await runProcess(process.execPath, [INSTALL_MAINTENANCE_SCRIPT], {
       ...env,
       PATH: lifecyclePath,
-      npm_config_global: 'true',
-      npm_lifecycle_event: 'postinstall',
+      CLAUDE_WORKFLOW_RECONCILE_INSTALL: '1',
+      npm_lifecycle_event: 'setup:local',
     });
     assert.equal(reconciled.code, 0, reconciled.stderr || reconciled.stdout);
     assert.match(reconciled.stdout, /already running current revision/u);
@@ -716,7 +720,7 @@ await testStopRejectsUnrelatedPidWithDaemonPathArgument();
 await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();
-await testPostinstallReconcileIgnoresNpmLifecyclePath();
+await testInstallationMaintenanceIgnoresNpmLifecyclePath();
 await testSourcedManagedAuthKeepsKimiDaemonCurrent();
 await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

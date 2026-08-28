@@ -262,11 +262,11 @@ test(
 );
 
 test(
-  'install reconciliation is global-only and migrates historical hooks on upgrade',
+  'installation maintenance requires explicit opt-in and migrates historical hooks',
   { skip: process.platform === 'win32' },
   async function (t) {
     const script = path.join(ROOT, 'scripts', 'reconcile-installed-daemon.mjs');
-    const localHome = await temporaryDirectory(t, 'claude-workflow-local-postinstall-');
+    const localHome = await temporaryDirectory(t, 'claude-workflow-maintenance-disabled-');
     const localRc = path.join(localHome, '.bashrc');
     const historicalHook = await fsp.readFile(
       path.join(FIXTURES, 'current-marker.bashrc'),
@@ -277,20 +277,21 @@ test(
       encoding: 'utf8',
       env: {
         ...managerEnvironment(localHome),
-        npm_config_global: 'false',
+        npm_config_global: 'true',
+        _PACOTE_NO_PREPARE_: 'git-fixture',
       },
     });
     assert.equal(localInstall.status, 0, localInstall.stderr || localInstall.stdout);
     assert.equal(await fsp.readFile(localRc, 'utf8'), historicalHook);
 
-    const globalHome = await temporaryDirectory(t, 'claude-workflow-global-postinstall-');
+    const globalHome = await temporaryDirectory(t, 'claude-workflow-maintenance-enabled-');
     const globalRc = path.join(globalHome, '.bashrc');
     await fsp.writeFile(globalRc, historicalHook);
     const globalInstall = spawnSync(process.execPath, [script], {
       encoding: 'utf8',
       env: {
         ...managerEnvironment(globalHome),
-        npm_config_global: 'true',
+        CLAUDE_WORKFLOW_RECONCILE_INSTALL: '1',
       },
     });
     assert.equal(globalInstall.status, 0, globalInstall.stderr || globalInstall.stdout);
@@ -300,12 +301,12 @@ test(
     assert.equal(
       fs.existsSync(path.join(globalHome, '.cache', 'claude-workflow')),
       false,
-      'global postinstall must not start or claim a stopped daemon'
+      'maintenance must not start or claim a stopped daemon'
     );
 
     const alternateShellHome = await temporaryDirectory(
       t,
-      'claude-workflow-alternate-shell-postinstall-'
+      'claude-workflow-alternate-shell-maintenance-'
     );
     const alternateShellRc = path.join(alternateShellHome, '.bashrc');
     await fsp.writeFile(alternateShellRc, historicalHook);
@@ -313,7 +314,7 @@ test(
       encoding: 'utf8',
       env: {
         ...managerEnvironment(alternateShellHome, '/usr/bin/fish'),
-        npm_config_global: 'true',
+        CLAUDE_WORKFLOW_RECONCILE_INSTALL: '1',
       },
     });
     assert.equal(
@@ -326,7 +327,7 @@ test(
       /# >>> claude-workflow shell cleanup >>>/u
     );
 
-    const freshHome = await temporaryDirectory(t, 'claude-workflow-fresh-postinstall-');
+    const freshHome = await temporaryDirectory(t, 'claude-workflow-fresh-maintenance-');
     const freshEnvironment = managerEnvironment(freshHome);
     for (const name of Object.keys(freshEnvironment)) {
       if (
@@ -352,24 +353,24 @@ test(
       encoding: 'utf8',
       env: {
         ...freshEnvironment,
-        npm_config_global: 'true',
+        CLAUDE_WORKFLOW_RECONCILE_INSTALL: '1',
       },
     });
     assert.equal(freshInstall.status, 0, freshInstall.stderr || freshInstall.stdout);
     assert.equal(
       fs.existsSync(path.join(freshHome, '.bashrc')),
       false,
-      'a fresh global install must not add an unnecessary shell hook'
+      'fresh maintenance must not add an unnecessary shell hook'
     );
   }
 );
 
 test(
-  'global installation remains installable when bash is unavailable',
+  'installation maintenance remains optional when bash is unavailable',
   { skip: process.platform !== 'linux' },
   async function (t) {
     const script = path.join(ROOT, 'scripts', 'reconcile-installed-daemon.mjs');
-    const home = await temporaryDirectory(t, 'claude-workflow-no-bash-postinstall-');
+    const home = await temporaryDirectory(t, 'claude-workflow-no-bash-maintenance-');
     const emptyPath = path.join(home, 'empty-path');
     await fsp.mkdir(emptyPath);
     const result = spawnSync(process.execPath, [script], {
@@ -378,7 +379,7 @@ test(
         HOME: home,
         PATH: emptyPath,
         SHELL: '/bin/bash',
-        npm_config_global: 'true',
+        CLAUDE_WORKFLOW_RECONCILE_INSTALL: '1',
       },
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);

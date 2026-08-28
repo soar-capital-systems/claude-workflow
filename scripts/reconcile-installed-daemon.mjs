@@ -15,12 +15,9 @@ if (process.platform !== 'darwin' && process.platform !== 'linux') {
   process.exit(0);
 }
 
-const globalInstall =
-  process.env.npm_config_global === 'true' ||
-  process.env.npm_config_global === '1';
 const explicitReconcile =
   process.env.CLAUDE_WORKFLOW_RECONCILE_INSTALL === '1';
-if (!globalInstall && !explicitReconcile) {
+if (!explicitReconcile) {
   process.exit(0);
 }
 
@@ -71,7 +68,7 @@ if (isWsl(process.env)) {
       )
       .join('\n  - ');
     console.error(
-      'claude-workflow-gateway: refusing post-install state or shell mutation from Windows-mounted WSL storage.\n' +
+      'claude-workflow-gateway: refusing installation maintenance from Windows-mounted WSL storage.\n' +
         `  - ${details}\n` +
         'Install under /home/<user> with Linux-native Node.js/npm.'
     );
@@ -96,7 +93,7 @@ for (const action of ['migrate-shell-upgrade', 'reconcile']) {
   }
   if (result.error) {
     console.error(
-      `claude-workflow-gateway: post-install ${action} failed: ${result.error.message}`
+      `claude-workflow-gateway: installation maintenance ${action} failed: ${result.error.message}`
     );
     process.exit(1);
   }

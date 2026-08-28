@@ -22,7 +22,8 @@ represented safely across providers.
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20 or newer, with npm
+- Git
 - [Claude Code](https://code.claude.com/docs/en/setup) 2.1.250 or newer
 - [Codex CLI](https://developers.openai.com/codex/cli) 0.150.1 or newer
 - macOS, Linux, or WSL 2
@@ -37,10 +38,13 @@ installing under WSL.
 
 ## Getting started
 
-Install release `v0.2.1` from the canonical GitHub repository:
+Install release `v0.2.2` from the canonical GitHub repository. npm 12 blocks
+Git dependencies by default, so the command grants access only to the package
+named on the command line:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow#v0.2.1
+npm install --global --allow-git=root \
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.2
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
@@ -72,7 +76,14 @@ claude-workflow
 
 `setup` checks the platform, CLI versions, authentication, WSL paths, and
 effective routing. It makes no model request and does not modify your Claude
-settings. Run `claude-workflow doctor` later to repeat the same checks.
+settings. When Bash is available, it also removes historical shell routing and
+refreshes an owned running shared daemon after an upgrade; it never starts a
+stopped shared daemon unless you pass `--shared`. Run `claude-workflow doctor`
+later to repeat the read-only checks.
+
+To upgrade, run the same install command with the new release tag, then rerun
+`claude-workflow setup`. The package has no install-time lifecycle hooks, so npm
+does not mutate shell or daemon state from a temporary Git checkout.
 
 For a direct Codex main session, select the route before setup; Anthropic login
 is not required:
@@ -555,20 +566,30 @@ npm run test:package
 The tests cover protocol lifecycle, context discovery, cancellation, overload,
 streaming, one-call passthrough, large tool results, provider contracts,
 installed Claude clean-home flows, WSL safety, packaging, and self-contained
-global installation. Live provider calls are excluded from CI.
+GitHub-tag global installation. Live provider calls are excluded from CI.
 
 See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
 
-Reinstall this release or remove Claude Workflow with:
+Reinstall this release, then run the setup checks and upgrade maintenance:
 
 ```bash
-npm install --global github:yshaaban/claude-workflow#v0.2.1
+npm install --global --allow-git=root \
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.2
+claude-workflow setup
+```
+
+Replace `v0.2.2` with another published tag when you intentionally select a
+different release. npm registry publication is not required for GitHub
+installation.
+
+Remove Claude Workflow with:
+
+```bash
+claude-workflow-gateway stop
 npm uninstall --global @onetool/claude-workflow
 ```
 
-Replace `v0.2.1` with another published tag when you intentionally select a
-different release. npm registry publication is not required for GitHub
-installation.
+Uninstalling leaves your user configuration and existing logs in place.
 
 ## Project links
 

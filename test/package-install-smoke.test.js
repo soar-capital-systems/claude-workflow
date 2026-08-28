@@ -29,6 +29,21 @@ assert.equal(PACKAGE_NAME, '@onetool/claude-workflow');
 assert.notEqual(PACKAGE_METADATA.private, true);
 assert.equal(PACKAGE_METADATA.publishConfig?.access, 'public');
 assert.equal(PACKAGE_METADATA.publishConfig?.registry, 'https://registry.npmjs.org/');
+assert.equal(PACKAGE_METADATA.workspaces, undefined);
+for (const lifecycle of [
+  'build',
+  'install',
+  'postinstall',
+  'preinstall',
+  'prepack',
+  'prepare',
+]) {
+  assert.equal(
+    PACKAGE_METADATA.scripts?.[lifecycle],
+    undefined,
+    `${lifecycle} would make npm prepare GitHub installs in a temporary clone`
+  );
+}
 
 function isolatedWorkflowEnvironment(overrides = {}) {
   const env = { ...process.env };
@@ -68,7 +83,11 @@ try {
     '--pack-destination',
     temporaryRoot,
   ]);
-  const packMetadata = JSON.parse(packResult.stdout)[0];
+  const packOutput = JSON.parse(packResult.stdout);
+  const packMetadata = Array.isArray(packOutput)
+    ? packOutput[0]
+    : packOutput[PACKAGE_NAME] || Object.values(packOutput)[0];
+  assert.ok(packMetadata, 'npm pack did not return package metadata');
   const packedPaths = new Set(packMetadata.files.map(function filePath(file) {
     return file.path;
   }));

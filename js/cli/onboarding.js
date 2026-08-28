@@ -1268,10 +1268,11 @@ function setupUsage() {
     '  claude-workflow setup --shared',
     '',
     'Checks Node.js, Claude Code, Codex, authentication, platform paths, routing, and inherited shell routing.',
-    'Setup is read-only unless --shared is supplied.',
+    'When Bash is available, setup also removes historical shell routing and refreshes an owned running shared daemon after upgrades.',
+    'It does not start a stopped shared daemon unless --shared is supplied.',
     '',
     'Options:',
-    '  --prepare-claude  Compatibility no-op; custom models use documented per-session settings',
+    '  --prepare-claude  Compatibility no-op for Claude state; custom models use documented per-session settings',
     '  --shared  Migrate historical shell routing, then start the shared gateway',
     '  --json    Print diagnostics as JSON (cannot be combined with --shared or --prepare-claude)',
     '  --help, -h Show this help',
@@ -1288,10 +1289,10 @@ function runGatewayAction(action, options = {}) {
     encoding: 'utf8',
     timeout: 30_000,
   });
-  if (result.stdout) {
+  if (!options.quiet && result.stdout) {
     (options.stdout || process.stdout).write(result.stdout);
   }
-  if (result.stderr) {
+  if (!options.quiet && result.stderr) {
     (options.stderr || process.stderr).write(result.stderr);
   }
   if (result.status !== 0 || result.error) {
@@ -1443,9 +1444,12 @@ export function runSetupCommand(args, options = {}) {
     throw new Error('--json cannot be combined with --shared or --prepare-claude');
   }
 
+  const env = options.env || process.env;
+  const canRunUpgradeMaintenance =
+    !parsed.json && Boolean(findExecutable('bash', env));
   const report = diagnosticReport({
     ...options,
-    migrateShell: parsed.shared === true,
+    migrateShell: parsed.shared === true || canRunUpgradeMaintenance,
     prepareClaude: parsed['prepare-claude'] === true,
   });
   if (parsed.json) {
@@ -1460,7 +1464,7 @@ export function runSetupCommand(args, options = {}) {
   }
 
   if (parsed.shared) {
-    validateSharedSetup(options.env || process.env);
+    validateSharedSetup(env);
   }
 
   if (parsed['prepare-claude']) {
@@ -1475,12 +1479,25 @@ export function runSetupCommand(args, options = {}) {
     gatewayAction('migrate-shell', options);
     gatewayAction('start', {
       ...options,
-      env: environmentWithoutManagedGatewayAuth(options.env || process.env),
+      env: environmentWithoutManagedGatewayAuth(env),
     });
     writeLine(
       stdout,
       'Historical Bash/zsh routing was migrated to cleanup-only mode. Shared gateway started from a clean environment for explicit clients. Source the migrated rc or open a new shell before using plain `claude`; use `claude-workflow` for scoped routing.'
     );
+  } else if (canRunUpgradeMaintenance) {
+    const gatewayAction = options.runGatewayAction || runGatewayAction;
+    gatewayAction('migrate-shell-upgrade', { ...options, quiet: true });
+    gatewayAction('reconcile', {
+      ...options,
+      quiet: true,
+      env: environmentWithoutManagedGatewayAuth(env),
+    });
+    if (!parsed.json) {
+      writeLine(stdout);
+      writeLine(stdout, 'Ready. Run `claude-workflow` in a trusted repository.');
+      writeLine(stdout, 'Optional: use `claude-workflow config` to inspect or change defaults.');
+    }
   } else if (!parsed.json) {
     writeLine(stdout);
     writeLine(stdout, 'Ready. Run `claude-workflow` in a trusted repository.');

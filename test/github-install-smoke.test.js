@@ -179,7 +179,7 @@ try {
     HOME: home,
     USERPROFILE: home,
     CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: state,
-    CLAUDE_WORKFLOW_GITHUB_INSTALL_REVISION: 'before-install',
+    ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS: '10000',
     ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
   });
   run('bash', [daemonManager, 'start'], {
@@ -197,7 +197,7 @@ try {
     HOME: home,
     USERPROFILE: home,
     CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: state,
-    CLAUDE_WORKFLOW_GITHUB_INSTALL_REVISION: 'after-install',
+    ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS: '11000',
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1',
     npm_config_cache: cache,
@@ -287,7 +287,7 @@ try {
       cwd: temporaryRoot,
       env: {
         ...daemonEnvironment,
-        CLAUDE_WORKFLOW_GITHUB_INSTALL_REVISION: 'after-install',
+        ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS: '11000',
       },
       encoding: 'utf8',
       timeout: 30_000,

@@ -27,6 +27,7 @@ const MANAGED_ENV = [
   'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY',
   'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS',
   'ULTRATHINK_GATEWAY_CODEX_COMMAND',
+  'ULTRATHINK_GATEWAY_CODEX_CWD',
   'ULTRATHINK_GATEWAY_CODEX_CONTEXT',
   'ULTRATHINK_GATEWAY_CODEX_CONTEXT_PROFILE',
   'ULTRATHINK_GATEWAY_CODEX_CONTEXT_WINDOW',
@@ -165,6 +166,43 @@ test('capability discovery uses the installed bundled catalog without an online 
     limit: 7_777,
   });
   assert.equal(await fs.readFile(log, 'utf8'), 'debug models --bundled\n');
+});
+
+test('capability discovery and its cache honor the configured Codex cwd', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-capabilities-cwd-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstDirectory = path.join(root, 'first');
+  const secondDirectory = path.join(root, 'second');
+  await fs.mkdir(firstDirectory);
+  await fs.mkdir(secondDirectory);
+  for (const [directory, model] of [
+    [firstDirectory, 'cwd-first'],
+    [secondDirectory, 'cwd-second'],
+  ]) {
+    await makeExecutable(
+      path.join(directory, 'codex'),
+      `#!/usr/bin/env node\n` +
+        `process.stdout.write(JSON.stringify({models:[{slug:${JSON.stringify(model)},context_window:400000,max_context_window:400000,effective_context_window_percent:95,supported_reasoning_levels:[]}]}));\n`
+    );
+  }
+
+  clearCodexCapabilityCacheForTests();
+  const first = resolveCodexCapabilities({
+    command: './codex',
+    cwd: firstDirectory,
+    model: 'cwd-first',
+    env: process.env,
+  });
+  const second = resolveCodexCapabilities({
+    command: './codex',
+    cwd: secondDirectory,
+    model: 'cwd-second',
+    env: process.env,
+  });
+  assert.equal(first.source, 'codex-catalog');
+  assert.equal(second.source, 'codex-catalog');
+  assert.equal(first.model, 'cwd-first');
+  assert.equal(second.model, 'cwd-second');
 });
 
 test('catalog discovery rejects trailing stdout instead of trusting a JSON prefix', async (t) => {

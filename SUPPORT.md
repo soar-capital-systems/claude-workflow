@@ -13,7 +13,7 @@ described in [SECURITY.md](SECURITY.md), not in an issue.
 - Node.js 20 or newer.
 - Claude Code 2.1.250 or newer.
 - Codex CLI 0.150.1 or newer.
-- macOS, Linux, or WSL. Shared mode requires Bash; historical shell cleanup
+- macOS, Linux, or WSL 2. Shared mode requires Bash; historical shell cleanup
   supports Bash and zsh.
 - A Codex workspace whose live model catalog includes the configured model.
 - For the built-in Kimi 1M preset, a Kimi Code API key and an Allegretto plan or
@@ -42,8 +42,8 @@ the private Claude Code `/model` picker. Select the 1M profile with
 `ULTRATHINK_GATEWAY_KIMI_API_KEY` to the owner-only
 `~/.claude-workflow.env` file, and verify a new session with Claude Code's
 `/status` command. Kimi Code keys and Kimi Open Platform keys are not
-interchangeable. In shared mode, restart the gateway after changing the route,
-provider, endpoint, or credential.
+interchangeable. In shared mode, run `claude-workflow-gateway reconcile` or
+rerun setup after changing the route, provider, endpoint, or credential.
 
 For Qwen, select `claude-workflow config --main qwen`, add
 `ULTRATHINK_GATEWAY_QWEN_API_KEY` to the owner-only configuration, and start a

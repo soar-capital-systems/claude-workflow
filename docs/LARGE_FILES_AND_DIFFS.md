@@ -72,8 +72,9 @@ Claude Workflow applies the following rules:
    pass through the same contiguous paging check before replay.
 5. The routed agent receives guidance to inventory large diffs, index hunks,
    inspect bounded ranges, and report gaps.
-6. A shared daemon records its loaded revision and restarts when its installed
-   code or user configuration changes.
+6. A shared daemon records its loaded revision. `start` or `reconcile` replaces
+   a stale running daemon when installed code, effective user configuration, or
+   the selected Node.js or Codex executable changes.
 7. Every workflow Codex thread disables optional native execution environments
    and integrations. Codex 0.150.1 retains its built-in `functions.exec` and
    `functions.wait` code-mode control wrappers, while repository reads, writes,

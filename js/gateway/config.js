@@ -248,6 +248,9 @@ export function loadGatewayConfig() {
   );
   const genericAnthropicApiKey = firstDefinedString(credentialEnv.ANTHROPIC_API_KEY);
   const codexCommand = firstEnvString(['ULTRATHINK_GATEWAY_CODEX_COMMAND'], 'codex');
+  const codexCwd = path.resolve(
+    expandHomePath(firstEnvString(['ULTRATHINK_GATEWAY_CODEX_CWD'], process.cwd()))
+  );
   const codexModel = codexProfileValue('model', DEFAULT_CODEX_MODEL);
   const codexReasoningEffort = codexProfileValue('reasoningEffort', 'max');
   const codexContextProfile = normalizeCodexContextProfile(
@@ -264,6 +267,7 @@ export function loadGatewayConfig() {
   );
   const codexCapabilities = resolveCodexCapabilities({
     command: codexCommand,
+    cwd: codexCwd,
     model: codexModel,
     contextProfile: codexContextProfile,
     requestedContextWindow: codexRequestedContextWindow,
@@ -331,11 +335,7 @@ export function loadGatewayConfig() {
     codex: {
       enabled: envFlag('ULTRATHINK_GATEWAY_CODEX_ENABLED', true),
       command: codexCommand,
-      cwd: path.resolve(
-        expandHomePath(
-          firstEnvString(['ULTRATHINK_GATEWAY_CODEX_CWD'], process.cwd())
-        )
-      ),
+      cwd: codexCwd,
       sandbox: firstEnvString(
         ['ULTRATHINK_GATEWAY_CODEX_SANDBOX'],
         DEFAULT_CODEX_SANDBOX

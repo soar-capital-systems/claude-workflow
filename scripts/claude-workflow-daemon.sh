@@ -23,6 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 DAEMON_JS="$REPO_ROOT/js/cli/claude-workflow-daemon.js"
 MANAGED_STATE_HELPER="$REPO_ROOT/js/cli/claude-workflow-managed-state.js"
+RUNTIME_REVISION_HELPER="$REPO_ROOT/js/cli/claude-workflow-runtime-revision.js"
 normalize_directory_base() {
   local value="$1"
   while [ "$value" != "/" ] && [ "${value%/}" != "$value" ]; do
@@ -58,7 +59,6 @@ REVISION_FILE="$STATE_DIR/claude-workflow-gateway.revision"
 LOCK_FILE="$STATE_DIR/claude-workflow-gateway.start.lock"
 LOCK_DIR="$STATE_DIR/claude-workflow-gateway.start.lock.d"
 LOG_FILE="$STATE_DIR/claude-workflow-gateway.log"
-DEFAULT_TRACE_DIR="$STATE_DIR/gateway-trace"
 # Deliberately NOT ULTRATHINK_GATEWAY_PORT (the per-session launcher's knob).
 # Keep the default in sync with DEFAULT_DAEMON_PORT in claude-workflow-daemon.js.
 PORT="${ULTRATHINK_GATEWAY_DAEMON_PORT:-4318}"
@@ -212,229 +212,13 @@ validate_shared_project_env() {
   esac
 }
 
-# Hash the runtime source tree, including uncommitted edits, so a healthy
-# daemon can still be recognized as stale after a pull or local code change.
-# Node is already a hard runtime dependency and gives us one portable digest
-# implementation across macOS, Linux, and WSL.
+# Hash installed sources, effective user configuration, and the selected Node
+# and Codex executables. This detects real runtime changes without making a
+# healthy daemon depend on the observer shell's literal PATH string.
 source_revision() {
   local node_bin
   node_bin="$(find_node)" || return 1
-  "$node_bin" - "$REPO_ROOT" <<'NODE'
-const crypto = require('node:crypto');
-const fs = require('node:fs');
-const path = require('node:path');
-
-const root = path.resolve(process.argv[2]);
-const hash = crypto.createHash('sha256');
-
-function visit(relativePath) {
-  const absolutePath = path.join(root, relativePath);
-  const entries = fs.readdirSync(absolutePath, { withFileTypes: true })
-    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
-
-  for (const entry of entries) {
-    const childRelativePath = path.posix.join(relativePath, entry.name);
-    const childAbsolutePath = path.join(root, childRelativePath);
-    if (entry.isDirectory()) {
-      visit(childRelativePath);
-      continue;
-    }
-
-    hash.update(childRelativePath);
-    hash.update('\0');
-    if (entry.isSymbolicLink()) {
-      hash.update('symlink\0');
-      hash.update(fs.readlinkSync(childAbsolutePath));
-    } else if (entry.isFile()) {
-      hash.update('file\0');
-      hash.update(fs.readFileSync(childAbsolutePath));
-    } else {
-      hash.update('other\0');
-    }
-    hash.update('\0');
-  }
-}
-
-visit('js');
-visit('scripts');
-for (const relativePath of ['package.json', 'package-lock.json']) {
-  const absolutePath = path.join(root, relativePath);
-  if (!fs.existsSync(absolutePath)) {
-    continue;
-  }
-  hash.update(relativePath);
-  hash.update('\0file\0');
-  hash.update(fs.readFileSync(absolutePath));
-  hash.update('\0');
-}
-for (const configName of ['.claude-workflow.env', '.ultrathink.env']) {
-  const configPath = path.join(process.env.HOME || '', configName);
-  if (!configPath || !fs.existsSync(configPath)) {
-    continue;
-  }
-  const stats = fs.lstatSync(configPath, { bigint: true });
-  hash.update(`user-config:${configName}\0`);
-  hash.update(crypto.createHash('sha256').update(fs.readFileSync(configPath)).digest());
-  hash.update('\0');
-  hash.update(String(stats.mode));
-  hash.update('\0');
-}
-
-const revisionEnvPrefixes = ['CLAUDE_WORKFLOW_', 'ULTRATHINK_'];
-const revisionEnvNames = new Set([
-  'ANTHROPIC_API_KEY',
-  'BAILIAN_TOKEN_PLAN_API_KEY',
-  'CODEX_HOME',
-  'DASHSCOPE_API_KEY',
-  'DEEPSEEK_API_KEY',
-  'DEEPSEEK_BASE_URL',
-  'DEEPSEEK_DEFAULT_MODEL_ID',
-  'GLM_API_KEY',
-  'GLM_BASE_URL',
-  'GLM_DEFAULT_MODEL_ID',
-  'KIMI_API_KEY',
-  'OPENAI_API_KEY',
-  'PATH',
-  'QWEN_API_KEY',
-  'QWEN_BASE_URL',
-  'QWEN_MODEL',
-  'QWEN_REASONING_EFFORT',
-  'ZAI_API_KEY',
-  'ZAI_BASE_URL',
-  'ZAI_DEFAULT_MODEL_ID',
-  'ZAI_REASONING_EFFORT',
-  'ALL_PROXY',
-  'HTTPS_PROXY',
-  'HTTP_PROXY',
-  'all_proxy',
-  'https_proxy',
-  'http_proxy',
-]);
-const projectEnvOptIn = new Set(['1', 'true', 'yes', 'on']).has(
-  String(process.env.CLAUDE_WORKFLOW_LOAD_PROJECT_ENV || '').trim().toLowerCase()
-);
-if (projectEnvOptIn) {
-  const projectRoot = process.cwd();
-  const projectEnvPath = path.join(projectRoot, '.env');
-  hash.update('project-root\0');
-  hash.update(projectRoot);
-  hash.update('\0');
-  if (fs.existsSync(projectEnvPath)) {
-    const stats = fs.lstatSync(projectEnvPath, { bigint: true });
-    hash.update('project-config:.env\0');
-    hash.update(crypto.createHash('sha256').update(fs.readFileSync(projectEnvPath)).digest());
-    hash.update('\0');
-    hash.update(String(stats.mode));
-    hash.update('\0');
-  }
-}
-const noProxyEntries = [process.env.no_proxy, process.env.NO_PROXY]
-  .filter((value) => typeof value === 'string' && value.trim() !== '')
-  .join(',')
-  .split(/[,\s]+/u)
-  .map((entry) => entry.trim())
-  .filter(Boolean);
-const seenNoProxyEntries = new Set();
-const canonicalNoProxyEntries = noProxyEntries.filter((entry) => {
-  const normalized = entry.toLowerCase();
-  if (seenNoProxyEntries.has(normalized)) {
-    return false;
-  }
-  seenNoProxyEntries.add(normalized);
-  return true;
-});
-const proxyConfigured = [
-  'ALL_PROXY',
-  'HTTPS_PROXY',
-  'HTTP_PROXY',
-  'all_proxy',
-  'https_proxy',
-  'http_proxy',
-].some((name) => String(process.env[name] || '').trim() !== '');
-const gatewayHost = String(process.env.ULTRATHINK_GATEWAY_HOST || '127.0.0.1')
-  .trim()
-  .replace(/^\[/u, '')
-  .replace(/\]$/u, '')
-  .replace(/\.$/u, '')
-  .toLowerCase();
-if (proxyConfigured && gatewayHost && !seenNoProxyEntries.has(gatewayHost)) {
-  canonicalNoProxyEntries.push(gatewayHost);
-}
-const canonicalNoProxy = canonicalNoProxyEntries.join(',');
-if (canonicalNoProxy) {
-  hash.update('environment:NO_PROXY\0');
-  hash.update(crypto.createHash('sha256').update(canonicalNoProxy).digest());
-  hash.update('\0');
-}
-function ambientAnthropicApiKeyIsEffective() {
-  if (String(process.env.ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY || '').trim()) {
-    return false;
-  }
-  try {
-    const routeMap = JSON.parse(process.env.ULTRATHINK_GATEWAY_ROUTE_MAP_JSON || '{}');
-    if (
-      routeMap &&
-      typeof routeMap === 'object' &&
-      !Array.isArray(routeMap) &&
-      Object.values(routeMap).some((route) =>
-        String(route?.provider || route?.target?.provider || '').trim().toLowerCase() ===
-        'anthropic'
-      )
-    ) {
-      return true;
-    }
-  } catch {
-    // Hash conservatively; the daemon will report the malformed route map.
-    return true;
-  }
-  const passthrough = String(
-    process.env.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS ||
-      process.env.ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS ||
-      ''
-  ).trim();
-  if (passthrough) {
-    return passthrough.toLowerCase() !== 'none';
-  }
-  return String(
-    process.env.ULTRATHINK_GATEWAY_MAIN_PROVIDER ||
-      process.env.CLAUDE_WORKFLOW_MAIN_PROVIDER ||
-      'anthropic'
-  ).trim().toLowerCase() === 'anthropic';
-}
-const includeAmbientAnthropicApiKey = ambientAnthropicApiKeyIsEffective();
-for (const name of Object.keys(process.env).sort()) {
-  if (
-    !revisionEnvNames.has(name) &&
-    !revisionEnvPrefixes.some((prefix) => name.startsWith(prefix))
-  ) {
-    continue;
-  }
-  if (name === 'ULTRATHINK_GATEWAY_RUNTIME_REVISION' ||
-      name === 'ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT' ||
-      name === 'CLAUDE_WORKFLOW_RECONCILE_INSTALL') {
-    continue;
-  }
-  if (name.startsWith('CLAUDE_WORKFLOW_GATEWAY_MANAGED_') ||
-      name.startsWith('CLAUDE_WORKFLOW_GATEWAY_PREVIOUS_')) {
-    continue;
-  }
-  if (
-    name === 'ANTHROPIC_API_KEY' &&
-    (!includeAmbientAnthropicApiKey ||
-      (process.env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN &&
-        process.env.ANTHROPIC_API_KEY ===
-          process.env.CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN))
-  ) {
-    continue;
-  }
-  hash.update(`environment:${name}\0`);
-  hash.update(
-    crypto.createHash('sha256').update(String(process.env[name] || '')).digest()
-  );
-  hash.update('\0');
-}
-process.stdout.write(`${hash.digest('hex')}\n`);
-NODE
+  "$node_bin" "$RUNTIME_REVISION_HELPER" "$REPO_ROOT" "$STATE_DIR" "$PORT"
 }
 
 recorded_revision() {
@@ -522,9 +306,10 @@ const child = spawn(
     port,
   ],
   {
-  detached: true,
-  env: process.env,
-  stdio: ['ignore', logFd, logFd],
+    detached: true,
+    cwd: statePath,
+    env: process.env,
+    stdio: ['ignore', logFd, logFd],
   }
 );
 child.unref();
@@ -882,27 +667,32 @@ start_daemon_locked() {
     return 1
   fi
 
-  local trace_dir
-  if [ "${ULTRATHINK_GATEWAY_TRACE_DIR+x}" = "x" ]; then
-    trace_dir="$ULTRATHINK_GATEWAY_TRACE_DIR"
-  else
-    trace_dir="$DEFAULT_TRACE_DIR"
-  fi
-
   local runtime_started_at
   runtime_started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   local started_pid
-  started_pid="$(ULTRATHINK_GATEWAY_DAEMON_PORT="$PORT" \
-    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$STATE_DIR" \
-    CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="$ENV_FILE" \
-    ULTRATHINK_GATEWAY_CODEX_CWD="$STATE_DIR" \
-    ULTRATHINK_GATEWAY_RUNTIME_REVISION="$runtime_revision" \
-    ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT="$runtime_started_at" \
-    ULTRATHINK_GATEWAY_TRACE_DIR="$trace_dir" \
-    spawn_detached_daemon "$NODE_BIN")" || {
-      echo "claude-workflow-gateway: failed to spawn detached daemon" >&2
-      return 1
-    }
+  local spawn_status=0
+  if [ "${ULTRATHINK_GATEWAY_TRACE_DIR+x}" = "x" ]; then
+    started_pid="$(ULTRATHINK_GATEWAY_DAEMON_PORT="$PORT" \
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$STATE_DIR" \
+      CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="$ENV_FILE" \
+      ULTRATHINK_GATEWAY_CODEX_CWD="$STATE_DIR" \
+      ULTRATHINK_GATEWAY_RUNTIME_REVISION="$runtime_revision" \
+      ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT="$runtime_started_at" \
+      ULTRATHINK_GATEWAY_TRACE_DIR="$ULTRATHINK_GATEWAY_TRACE_DIR" \
+      spawn_detached_daemon "$NODE_BIN")" || spawn_status=$?
+  else
+    started_pid="$(ULTRATHINK_GATEWAY_DAEMON_PORT="$PORT" \
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR="$STATE_DIR" \
+      CLAUDE_WORKFLOW_GATEWAY_ENV_FILE="$ENV_FILE" \
+      ULTRATHINK_GATEWAY_CODEX_CWD="$STATE_DIR" \
+      ULTRATHINK_GATEWAY_RUNTIME_REVISION="$runtime_revision" \
+      ULTRATHINK_GATEWAY_RUNTIME_STARTED_AT="$runtime_started_at" \
+      spawn_detached_daemon "$NODE_BIN")" || spawn_status=$?
+  fi
+  if [ "$spawn_status" -ne 0 ] || [ -z "$started_pid" ]; then
+    echo "claude-workflow-gateway: failed to spawn detached daemon" >&2
+    return 1
+  fi
   if ! write_atomic_state_file "$PID_FILE" "$started_pid"; then
     cleanup_failed_start "$started_pid"
     echo "claude-workflow-gateway: could not record daemon pid" >&2

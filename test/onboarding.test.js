@@ -9,6 +9,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  findExecutable,
   isWindowsMountedPath,
   rewriteConfigurationText,
   runDoctorCommand,
@@ -543,6 +544,89 @@ test(
       /reconciliation failed/u
     );
     assert.deepEqual(actions, ['migrate-shell-upgrade', 'reconcile']);
+  }
+);
+
+test(
+  'shared setup rejects cwd-dependent Codex resolution without creating state',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-shared-relative-path-');
+    const home = path.join(root, 'home');
+    const caller = path.join(root, 'repo');
+    const callerBin = path.join(caller, 'relative-bin');
+    const stateDirectory = path.join(root, 'state');
+    const absoluteBin = await installFakeNativeTools(root);
+    await fsp.mkdir(home);
+    await fsp.mkdir(callerBin, { recursive: true });
+    await fsp.writeFile(
+      path.join(callerBin, 'codex'),
+      '#!/usr/bin/env bash\nexit 1\n',
+      { mode: 0o755 }
+    );
+    const env = isolatedEnvironment(home, {
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDirectory,
+      PATH: [
+        './relative-bin',
+        absoluteBin,
+        process.env.PATH || '',
+      ].join(path.delimiter),
+    });
+
+    assert.equal(
+      findExecutable('codex', env, caller),
+      path.join(callerBin, 'codex')
+    );
+    assert.throws(
+      () => validateSharedSetup(env, caller),
+      /set ULTRATHINK_GATEWAY_CODEX_COMMAND to an absolute executable path/u
+    );
+    const commands = [];
+    const actions = [];
+    assert.throws(
+      () =>
+        runSetupCommand(['--shared'], {
+          cwd: caller,
+          env,
+          stdout: { write() { return true; } },
+          run(command) {
+            commands.push(command);
+            return { status: 1, stdout: '', stderr: 'must not run' };
+          },
+          runGatewayAction(action) {
+            actions.push(action);
+          },
+        }),
+      /set ULTRATHINK_GATEWAY_CODEX_COMMAND to an absolute executable path/u
+    );
+    assert.deepEqual(commands, []);
+    assert.deepEqual(actions, []);
+    assert.equal(fs.existsSync(stateDirectory), false);
+  }
+);
+
+test(
+  'shared setup accepts harmless relative PATH entries before an absolute Codex path',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-shared-stable-path-');
+    const home = path.join(root, 'home');
+    const caller = path.join(root, 'repo');
+    const stateDirectory = path.join(root, 'state');
+    const absoluteBin = await installFakeNativeTools(root);
+    await fsp.mkdir(home);
+    await fsp.mkdir(caller);
+    const env = isolatedEnvironment(home, {
+      CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDirectory,
+      PATH: [
+        './missing-bin',
+        absoluteBin,
+        process.env.PATH || '',
+      ].join(path.delimiter),
+    });
+
+    assert.doesNotThrow(() => validateSharedSetup(env, caller));
+    assert.equal(fs.existsSync(stateDirectory), false);
   }
 );
 

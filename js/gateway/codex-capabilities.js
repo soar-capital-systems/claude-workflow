@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import process from 'node:process';
 
 import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
@@ -92,8 +93,9 @@ function parseCatalog(stdout) {
   return Array.isArray(parsed?.models) ? parsed.models : [];
 }
 
-function readCatalog(command, env, bundledOnly) {
-  const cacheKey = `${command}\u0000${env?.CODEX_HOME || ''}\u0000${bundledOnly ? 'bundled' : 'online'}`;
+function readCatalog(command, cwd, env, bundledOnly) {
+  const catalogCwd = path.resolve(String(cwd || process.cwd()));
+  const cacheKey = `${command}\u0000${catalogCwd}\u0000${env?.CODEX_HOME || ''}\u0000${bundledOnly ? 'bundled' : 'online'}`;
   if (catalogCache.has(cacheKey)) {
     return catalogCache.get(cacheKey);
   }
@@ -103,6 +105,7 @@ function readCatalog(command, env, bundledOnly) {
     args.push('--bundled');
   }
   const result = spawnSync(command, args, {
+    cwd: catalogCwd,
     encoding: 'utf8',
     // Model discovery is local metadata lookup. Never expose unrelated
     // provider or gateway credentials to the Codex subprocess.
@@ -152,15 +155,15 @@ function normalizedCatalogModel(model) {
   };
 }
 
-function modelCapabilities(command, model, env) {
+function modelCapabilities(command, cwd, model, env) {
   // The installed binary's bundled catalog is deterministic and typically
   // loads in milliseconds. Only ask Codex to refresh its online catalog when
   // the selected model is absent, which keeps normal Claude startup off the
   // network while preserving support for remotely introduced models.
-  const bundledCatalog = readCatalog(command, env, true);
+  const bundledCatalog = readCatalog(command, cwd, env, true);
   let catalogModel = bundledCatalog?.find((entry) => entry?.slug === model);
   if (!catalogModel) {
-    const onlineCatalog = readCatalog(command, env, false);
+    const onlineCatalog = readCatalog(command, cwd, env, false);
     catalogModel = onlineCatalog?.find((entry) => entry?.slug === model);
   }
   const discovered = normalizedCatalogModel(catalogModel);
@@ -198,6 +201,7 @@ export function normalizeCodexContextProfile(value, fallback = 'standard') {
 
 export function resolveCodexCapabilities({
   command = 'codex',
+  cwd = process.cwd(),
   model,
   contextProfile = 'standard',
   requestedContextWindow = 0,
@@ -206,7 +210,7 @@ export function resolveCodexCapabilities({
 } = {}) {
   const normalizedModel = String(model || '').trim();
   const profile = normalizeCodexContextProfile(contextProfile);
-  const available = modelCapabilities(command, normalizedModel, env);
+  const available = modelCapabilities(command, cwd, normalizedModel, env);
   const requested = positiveInteger(
     requestedContextWindow,
     profile === 'long' ? available.maxContextWindow : available.contextWindow

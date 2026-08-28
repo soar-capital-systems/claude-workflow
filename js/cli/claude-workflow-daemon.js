@@ -492,8 +492,14 @@ export function writeWorkflowEnvironmentFile(
   }
 }
 
-function writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId) {
-  const { environmentFile: target, kind } = managedStateConfiguration();
+function writeEnvFile(
+  config,
+  gatewayBaseUrl,
+  subagentModelId,
+  mainModelId,
+  managedState = managedStateConfiguration()
+) {
+  const { environmentFile: target, kind } = managedState;
   const clientEnv = buildWorkflowClientEnv(
     config,
     gatewayBaseUrl,
@@ -506,6 +512,13 @@ function writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId) {
 }
 
 async function main() {
+  const managedState = managedStateConfiguration();
+  if (!Object.hasOwn(process.env, 'ULTRATHINK_GATEWAY_TRACE_DIR')) {
+    process.env.ULTRATHINK_GATEWAY_TRACE_DIR = path.join(
+      managedState.stateDirectory,
+      'gateway-trace'
+    );
+  }
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildWorkflowGatewayConfig({
       port: daemonPort(),
@@ -545,7 +558,13 @@ async function main() {
     }
 
     try {
-      const target = writeEnvFile(config, gatewayBaseUrl, subagentModelId, mainModelId);
+      const target = writeEnvFile(
+        config,
+        gatewayBaseUrl,
+        subagentModelId,
+        mainModelId,
+        managedState
+      );
       log(`env exports written to ${target}`);
     } catch (error) {
       // The env file is the daemon's contract with shell sessions; serving

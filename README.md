@@ -38,13 +38,13 @@ installing under WSL.
 
 ## Getting started
 
-Install release `v0.2.2` from the canonical GitHub repository. npm 12 blocks
+Install release `v0.2.3` from the canonical GitHub repository. npm 12 blocks
 Git dependencies by default, so the command grants access only to the package
 named on the command line:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.2
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.3
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
@@ -441,15 +441,28 @@ primitive for an explicit client that needs a stable gateway URL:
 ```bash
 claude-workflow setup --shared
 claude-workflow-gateway status
+claude-workflow-gateway reconcile
 claude-workflow-gateway log 100
 claude-workflow-gateway restart
 claude-workflow-gateway stop
 ```
 
 The daemon binds to `127.0.0.1:4318` by default. Its state, generated
-environment, logs, and traces are owner-only. Restart it after changing a
-provider, credential, endpoint, or model. Plain `claude` sessions are never
-silently routed through it.
+environment, logs, and traces are owner-only. Codex model-catalog probes and
+app-server processes run from that managed state directory. `setup --shared`
+verifies that the caller and state directory resolve the same Codex executable;
+if a cwd-relative `PATH` entry makes them differ, set
+`ULTRATHINK_GATEWAY_CODEX_COMMAND` to an absolute executable path.
+
+The manager derives the runtime revision from installed sources, effective user
+configuration, and the selected Node.js and Codex executables. An unused
+`PATH` entry or a comment-only configuration edit does not make the daemon
+stale; selecting a different executable or effective setting does. After
+changing a provider, credential, endpoint, model, or executable, run
+`claude-workflow-gateway reconcile` or rerun setup. Reconciliation replaces a
+stale running daemon but leaves a stopped daemon stopped.
+
+Plain `claude` sessions are never silently routed through the shared gateway.
 
 The explicit-client contract is the owner-only generated file at
 `${XDG_STATE_HOME:-$HOME/.cache}/claude-workflow/claude-workflow-gateway.env`.
@@ -508,10 +521,11 @@ Linux path handling, Unicode paths, and spaces in installation paths.
 - Third-party and dedicated gateway credentials are removed from Claude,
   Codex, and native preflight child environments. Anthropic passthrough uses
   Claude's own Anthropic credential.
-- Shared-daemon Codex threads use only Claude-provided dynamic tools and cannot
-  inherit optional native integrations or the daemon's working directory. The
-  app-server's built-in code-mode control wrappers remain present as described
-  above.
+- Shared-daemon Codex threads receive no native repository workspace or optional
+  integrations. The app-server and its threads use the managed state directory
+  as a deterministic working directory; repository work goes through Claude
+  Code's dynamic tools. The app-server's built-in code-mode control wrappers
+  remain present as described above.
 
 See [SECURITY.md](SECURITY.md) for reporting and the full security model.
 
@@ -539,8 +553,8 @@ claude-workflow config
   Workflow uses `codex app-server`, so that TUI prompt is not rendered. There
   is no supported client setting that bypasses the provider-side review delay.
 - **Claude shows an old model or context:** close the session, run
-  `claude-workflow config`, and start a new one. Restart the shared daemon if you
-  use shared mode.
+  `claude-workflow config`, and start a new one. Run
+  `claude-workflow-gateway reconcile` if you use shared mode.
 - **Codex setup fails:** update to Codex CLI 0.150.1 or newer, run `codex login`,
   then rerun `claude-workflow setup`.
 - **A large review is incomplete:** follow the bounded coverage process in
@@ -570,15 +584,17 @@ GitHub-tag global installation. Live provider calls are excluded from CI.
 
 See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
 
+## Upgrade and uninstall
+
 Reinstall this release, then run the setup checks and upgrade maintenance:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.2
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.3
 claude-workflow setup
 ```
 
-Replace `v0.2.2` with another published tag when you intentionally select a
+Replace `v0.2.3` with another published tag when you intentionally select a
 different release. npm registry publication is not required for GitHub
 installation.
 

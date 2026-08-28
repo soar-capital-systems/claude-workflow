@@ -76,8 +76,6 @@ const MAIN_PRESETS = Object.freeze({
 });
 const SHELL_ROUTING_ENV_NAMES = Object.freeze([
   ...CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
 ]);
 const CODEX_LOGIN_FAILURE_PATTERN =
   /not\s+logged\s+in|logged\s+out|not\s+authenticated|not\s+signed\s+in/iu;
@@ -158,28 +156,43 @@ function commandFailure(result) {
   return `exited with status ${result?.status ?? 'unknown'}`;
 }
 
-export function findExecutable(commandName, env = process.env) {
+export function findExecutable(
+  commandName,
+  env = process.env,
+  cwd = process.cwd()
+) {
   if (typeof commandName !== 'string' || commandName.trim() === '') {
     return '';
   }
 
-  if (path.isAbsolute(commandName) || commandName.includes(path.sep)) {
+  const normalizedCommand = commandName.trim();
+  const baseDirectory = path.resolve(cwd);
+  if (path.isAbsolute(normalizedCommand) || normalizedCommand.includes(path.sep)) {
+    const candidate = path.isAbsolute(normalizedCommand)
+      ? normalizedCommand
+      : path.resolve(baseDirectory, normalizedCommand);
     try {
-      fs.accessSync(commandName, fs.constants.X_OK);
-      return path.resolve(commandName);
+      const stats = fs.statSync(candidate);
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return stats.isFile() ? path.resolve(candidate) : '';
     } catch {
       return '';
     }
   }
 
-  for (const directory of String(env.PATH || '').split(path.delimiter)) {
-    if (!directory) {
-      continue;
-    }
-    const candidate = path.join(directory, commandName);
+  const searchPath =
+    env.PATH === undefined ? '/usr/bin:/bin' : String(env.PATH);
+  for (const directory of searchPath.split(path.delimiter)) {
+    const searchDirectory = directory
+      ? path.resolve(baseDirectory, directory)
+      : baseDirectory;
+    const candidate = path.join(searchDirectory, normalizedCommand);
     try {
+      const stats = fs.statSync(candidate);
       fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
+      if (stats.isFile()) {
+        return candidate;
+      }
     } catch {
       continue;
     }
@@ -244,8 +257,8 @@ export function checkWorkflowPlatform(
     ['Working directory dependencies', path.join(cwd, 'node_modules')],
     ['Node.js', process.execPath],
     ['Claude Workflow', GATEWAY_MANAGER],
-    ['Claude Code', findExecutable('claude', env)],
-    ['Codex', findExecutable(codexCommand, env)],
+    ['Claude Code', findExecutable('claude', env, cwd)],
+    ['Codex', findExecutable(codexCommand, env, cwd)],
     ['Home directory', env.HOME || env.USERPROFILE || os.homedir()],
     [
       'Gateway state',
@@ -1133,6 +1146,7 @@ export function runConfigCommand(args, options = {}) {
       const proposedEffort = String(parsed.effort || current.agents.effort).toLowerCase();
       const proposedCapabilities = resolveCodexCapabilities({
         command: gatewayConfig.codex.command,
+        cwd: gatewayConfig.codex.cwd,
         model: proposedAgentModel,
         contextProfile: gatewayConfig.codex.contextProfile,
         requestedContextWindow: gatewayConfig.codex.requestedContextWindow,
@@ -1352,8 +1366,8 @@ function resolveThroughExistingAncestor(value, visited = new Set()) {
   return candidate;
 }
 
-export function validateSharedSetup(env = process.env) {
-  if (!findExecutable('bash', env)) {
+export function validateSharedSetup(env = process.env, cwd = process.cwd()) {
+  if (!findExecutable('bash', env, cwd)) {
     throw new Error('shared setup requires bash on PATH');
   }
   fs.accessSync(GATEWAY_MANAGER, fs.constants.R_OK);
@@ -1397,6 +1411,30 @@ export function validateSharedSetup(env = process.env) {
   ) {
     throw new Error(
       `CLAUDE_WORKFLOW_GATEWAY_ENV_FILE must be exactly ${expectedEnvironmentFile} inside the normalized shared gateway state directory`
+    );
+  }
+
+  const configuredCodexCommand = String(
+    env.ULTRATHINK_GATEWAY_CODEX_COMMAND || ''
+  ).trim();
+  const codexCommand = configuredCodexCommand || 'codex';
+  const callerCodex = findExecutable(codexCommand, env, cwd);
+  const sharedCodex = findExecutable(codexCommand, env, sharedStateDirectory);
+  let sameCodexExecutable = false;
+  if (callerCodex && sharedCodex) {
+    try {
+      sameCodexExecutable =
+        fs.realpathSync(callerCodex) === fs.realpathSync(sharedCodex);
+    } catch {
+      sameCodexExecutable = false;
+    }
+  }
+  if (!sameCodexExecutable) {
+    throw new Error(
+      'shared setup must resolve the same Codex executable from the current ' +
+        'working directory and the managed state directory; set ' +
+        'ULTRATHINK_GATEWAY_CODEX_COMMAND to an absolute executable path or ' +
+        'remove cwd-relative PATH entries'
     );
   }
   const traceDirectory = String(env.ULTRATHINK_GATEWAY_TRACE_DIR || '').trim();
@@ -1445,6 +1483,9 @@ export function runSetupCommand(args, options = {}) {
   }
 
   const env = options.env || process.env;
+  if (parsed.shared) {
+    validateSharedSetup(env, options.cwd || process.cwd());
+  }
   const canRunUpgradeMaintenance =
     !parsed.json && Boolean(findExecutable('bash', env));
   const report = diagnosticReport({
@@ -1461,10 +1502,6 @@ export function runSetupCommand(args, options = {}) {
   }
   if (!report.ok) {
     throw new Error('setup checks failed; resolve the errors above and run setup again');
-  }
-
-  if (parsed.shared) {
-    validateSharedSetup(env);
   }
 
   if (parsed['prepare-claude']) {

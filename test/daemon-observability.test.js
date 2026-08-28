@@ -8,11 +8,20 @@ import { fileURLToPath } from 'node:url';
 
 import { claimManagedState } from '../js/cli/claude-workflow-managed-state.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
-import { environmentWithoutManagedGatewayAuth } from '../js/utils/child-env.js';
+import {
+  environmentWithoutGatewayAndAnthropicCredentials,
+  environmentWithoutManagedGatewayAuth,
+} from '../js/utils/child-env.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DAEMON_SCRIPT = path.join(REPO_ROOT, 'scripts', 'claude-workflow-daemon.sh');
 const DAEMON_JS = path.join(REPO_ROOT, 'js', 'cli', 'claude-workflow-daemon.js');
+const RUNTIME_REVISION_HELPER = path.join(
+  REPO_ROOT,
+  'js',
+  'cli',
+  'claude-workflow-runtime-revision.js'
+);
 const INSTALL_MAINTENANCE_SCRIPT = path.join(
   REPO_ROOT,
   'scripts',
@@ -408,6 +417,278 @@ async function testInstallationMaintenanceIgnoresNpmLifecyclePath() {
   }
 }
 
+async function testEquivalentShellsUseOneSemanticRuntimeRevision() {
+  if (process.platform === 'win32') {
+    return;
+  }
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-revision-home-'));
+  const stateDir = path.join(home, 'state');
+  const baselineBin = path.join(home, 'baseline-bin');
+  const irrelevantBin = path.join(home, 'irrelevant-bin');
+  const replacementBin = path.join(home, 'replacement-bin');
+  const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
+  const revisionFile = path.join(stateDir, 'claude-workflow-gateway.revision');
+  const configFile = path.join(home, '.claude-workflow.env');
+  const codexCwdLog = path.join(home, 'codex-cwd.log');
+  const port = await freePort();
+  await fs.mkdir(baselineBin, { recursive: true, mode: 0o700 });
+  await fs.mkdir(irrelevantBin, { recursive: true, mode: 0o700 });
+  await fs.mkdir(replacementBin, { recursive: true, mode: 0o700 });
+  await fs.writeFile(
+    path.join(baselineBin, 'configured-codex'),
+    `#!/usr/bin/env node\n` +
+      `require('node:fs').writeFileSync(${JSON.stringify(codexCwdLog)}, process.cwd());\n` +
+      `process.exit(1);\n`,
+    { mode: 0o755 }
+  );
+  await fs.writeFile(
+    path.join(irrelevantBin, 'kimi'),
+    '#!/bin/sh\nexit 1\n',
+    { mode: 0o755 }
+  );
+  await fs.writeFile(
+    path.join(replacementBin, 'configured-codex'),
+    '#!/bin/sh\nexit 2\n',
+    { mode: 0o755 }
+  );
+  const config = [
+    'ULTRATHINK_GATEWAY_CODEX_COMMAND=configured-codex',
+    'ULTRATHINK_GATEWAY_MAIN_PROVIDER=codex',
+    'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=none',
+    'ULTRATHINK_GATEWAY_TRACE_DIR=off',
+    '',
+  ].join('\n');
+  await fs.writeFile(configFile, config, { mode: 0o600 });
+
+  const scrubbedEnvironment = environmentWithoutGatewayAndAnthropicCredentials(process.env);
+  for (const name of Object.keys(scrubbedEnvironment)) {
+    if (name.startsWith('CLAUDE_WORKFLOW_') || name.startsWith('ULTRATHINK_')) {
+      delete scrubbedEnvironment[name];
+    }
+  }
+  const baselinePath = [baselineBin, scrubbedEnvironment.PATH || '']
+    .filter(Boolean)
+    .join(path.delimiter);
+  const setupEnvironment = {
+    ...scrubbedEnvironment,
+    HOME: home,
+    PATH: baselinePath,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'none',
+    ULTRATHINK_GATEWAY_CODEX_COMMAND: 'configured-codex',
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
+    ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
+    ULTRATHINK_GATEWAY_TRACE_DIR: 'off',
+  };
+  const directEnvironment = {
+    ...scrubbedEnvironment,
+    HOME: home,
+    PATH: baselinePath,
+    CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: stateDir,
+    ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
+  };
+
+  try {
+    const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], directEnvironment);
+    assert.equal(started.code, 0, await daemonFailureOutput(started, stateDir));
+    const originalPid = await readPid(pidFile);
+    const originalRevision = (await fs.readFile(revisionFile, 'utf8')).trim();
+    const originalHealth = await readHealth(port);
+    assert.equal(originalHealth.trace_enabled, false);
+    assert.equal(
+      await fs.realpath((await fs.readFile(codexCwdLog, 'utf8')).trim()),
+      await fs.realpath(stateDir)
+    );
+
+    const setupStatus = await runProcess('bash', [DAEMON_SCRIPT, 'status'], setupEnvironment);
+    assert.equal(setupStatus.code, 0, setupStatus.stderr || setupStatus.stdout);
+    assert.match(setupStatus.stdout, /healthy and current/u);
+    assert.equal(await readPid(pidFile), originalPid);
+
+    await fs.writeFile(configFile, `# Equivalent effective configuration.\n${config}`, {
+      mode: 0o600,
+    });
+    const commentOnlyStatus = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'status'],
+      directEnvironment
+    );
+    assert.equal(
+      commentOnlyStatus.code,
+      0,
+      commentOnlyStatus.stderr || commentOnlyStatus.stdout
+    );
+    assert.match(commentOnlyStatus.stdout, /healthy and current/u);
+
+    const irrelevantPathEnvironment = {
+      ...directEnvironment,
+      PATH: [irrelevantBin, baselinePath].join(path.delimiter),
+    };
+    const irrelevantStatus = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'status'],
+      irrelevantPathEnvironment
+    );
+    assert.equal(
+      irrelevantStatus.code,
+      0,
+      irrelevantStatus.stderr || irrelevantStatus.stdout
+    );
+    assert.match(irrelevantStatus.stdout, /healthy and current/u);
+    const irrelevantReconcile = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'reconcile'],
+      irrelevantPathEnvironment
+    );
+    assert.equal(
+      irrelevantReconcile.code,
+      0,
+      irrelevantReconcile.stderr || irrelevantReconcile.stdout
+    );
+    assert.match(irrelevantReconcile.stdout, /already running current revision/u);
+    assert.equal(await readPid(pidFile), originalPid);
+    assert.equal((await fs.readFile(revisionFile, 'utf8')).trim(), originalRevision);
+    assert.equal((await readHealth(port)).runtime_started_at, originalHealth.runtime_started_at);
+
+    const unrelatedEnvironment = {
+      ...irrelevantPathEnvironment,
+      CLAUDE_WORKFLOW_DEBUG: '1',
+      ULTRATHINK_MAX_FILE_BYTES: '123',
+    };
+    const unrelatedStatus = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'status'],
+      unrelatedEnvironment
+    );
+    assert.equal(unrelatedStatus.code, 0, unrelatedStatus.stderr || unrelatedStatus.stdout);
+    assert.match(unrelatedStatus.stdout, /healthy and current/u);
+    const unrelatedReconcile = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'reconcile'],
+      unrelatedEnvironment
+    );
+    assert.equal(
+      unrelatedReconcile.code,
+      0,
+      unrelatedReconcile.stderr || unrelatedReconcile.stdout
+    );
+    assert.equal(await readPid(pidFile), originalPid);
+    assert.equal((await fs.readFile(revisionFile, 'utf8')).trim(), originalRevision);
+
+    const replacementPathEnvironment = {
+      ...directEnvironment,
+      PATH: [replacementBin, baselinePath].join(path.delimiter),
+    };
+    const staleStatus = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'status'],
+      replacementPathEnvironment
+    );
+    assert.equal(staleStatus.code, 1);
+    assert.match(staleStatus.stdout, /healthy but stale/u);
+    const replaced = await runProcess(
+      'bash',
+      [DAEMON_SCRIPT, 'reconcile'],
+      replacementPathEnvironment
+    );
+    assert.equal(replaced.code, 0, await daemonFailureOutput(replaced, stateDir));
+    assert.match(replaced.stdout, /healthy daemon is stale; restarting/u);
+    const replacementPid = await readPid(pidFile);
+    assert.notEqual(replacementPid, originalPid);
+    assert.notEqual((await fs.readFile(revisionFile, 'utf8')).trim(), originalRevision);
+    await waitForCondition(
+      () => !processExists(originalPid),
+      `superseded daemon process ${originalPid} to exit`
+    );
+  } finally {
+    try {
+      await stopDaemon(directEnvironment, pidFile);
+    } catch {
+      // Best-effort cleanup for failed assertions.
+    }
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
+
+async function testExecutableAliasSelectionChangesRuntimeRevision() {
+  if (process.platform === 'win32') {
+    return;
+  }
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-alias-revision-'));
+  const bin = path.join(home, 'bin');
+  const stateDir = path.join(home, 'state');
+  await fs.mkdir(bin, { recursive: true, mode: 0o700 });
+  const target = path.join(bin, 'codex-target');
+  await fs.writeFile(target, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  await fs.symlink(target, path.join(bin, 'codex-first'));
+  await fs.symlink(target, path.join(bin, 'codex-second'));
+  const scrubbedEnvironment = environmentWithoutGatewayAndAnthropicCredentials(process.env);
+  for (const name of Object.keys(scrubbedEnvironment)) {
+    if (name.startsWith('CLAUDE_WORKFLOW_') || name.startsWith('ULTRATHINK_')) {
+      delete scrubbedEnvironment[name];
+    }
+  }
+  const baseEnvironment = {
+    ...scrubbedEnvironment,
+    HOME: home,
+    PATH: [bin, scrubbedEnvironment.PATH || ''].filter(Boolean).join(path.delimiter),
+  };
+
+  try {
+    const first = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      { ...baseEnvironment, ULTRATHINK_GATEWAY_CODEX_COMMAND: 'codex-first' }
+    );
+    const second = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      { ...baseEnvironment, ULTRATHINK_GATEWAY_CODEX_COMMAND: 'codex-second' }
+    );
+    assert.equal(first.code, 0, first.stderr || first.stdout);
+    assert.equal(second.code, 0, second.stderr || second.stdout);
+    assert.match(first.stdout.trim(), /^[a-f0-9]{64}$/u);
+    assert.match(second.stdout.trim(), /^[a-f0-9]{64}$/u);
+    assert.notEqual(first.stdout, second.stdout);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
+
+async function testDefaultCodexHomeChangesRuntimeRevision() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-home-revision-'));
+  const firstHome = path.join(root, 'first-home');
+  const secondHome = path.join(root, 'second-home');
+  const stateDir = path.join(root, 'state');
+  await fs.mkdir(firstHome);
+  await fs.mkdir(secondHome);
+  const scrubbedEnvironment = environmentWithoutGatewayAndAnthropicCredentials(process.env);
+  for (const name of Object.keys(scrubbedEnvironment)) {
+    if (name.startsWith('CLAUDE_WORKFLOW_') || name.startsWith('ULTRATHINK_')) {
+      delete scrubbedEnvironment[name];
+    }
+  }
+  delete scrubbedEnvironment.CODEX_HOME;
+
+  try {
+    const first = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      { ...scrubbedEnvironment, HOME: firstHome }
+    );
+    const second = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      { ...scrubbedEnvironment, HOME: secondHome }
+    );
+    assert.equal(first.code, 0, first.stderr || first.stdout);
+    assert.equal(second.code, 0, second.stderr || second.stdout);
+    assert.notEqual(first.stdout, second.stdout);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-kimi-auth-'));
   const pidFile = path.join(stateDir, 'claude-workflow-gateway.pid');
@@ -721,6 +1002,9 @@ await testForeignHealthCannotClaimDaemonOwnership();
 await testManagedPortChangeReplacesRecordedDaemon();
 await testDaemonRevisionAndHealth();
 await testInstallationMaintenanceIgnoresNpmLifecyclePath();
+await testEquivalentShellsUseOneSemanticRuntimeRevision();
+await testExecutableAliasSelectionChangesRuntimeRevision();
+await testDefaultCodexHomeChangesRuntimeRevision();
 await testSourcedManagedAuthKeepsKimiDaemonCurrent();
 await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

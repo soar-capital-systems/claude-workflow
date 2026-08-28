@@ -1330,6 +1330,7 @@ function codexCapabilitiesForRoute(config, route = null) {
 
   return resolveCodexCapabilities({
     command: config?.codex?.command || 'codex',
+    cwd: config?.codex?.cwd || process.cwd(),
     model,
     contextProfile: config?.codex?.contextProfile || 'standard',
     requestedContextWindow: config?.codex?.requestedContextWindow || 0,

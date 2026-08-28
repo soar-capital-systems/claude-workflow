@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.3 - 2026-08-28
+
+### Changed
+
+- Shared gateways use their managed state directory as the process working
+  directory. Codex model-catalog discovery and app-server launches therefore
+  resolve relative commands from the same location.
+
+### Fixed
+
+- Shared-daemon revision checks load user configuration with the gateway's
+  precedence rules and fingerprint the selected Node.js and Codex executables
+  and effective Codex home instead of the literal `PATH`. `setup --shared`,
+  `status`, and `reconcile` agree across equivalent shell environments. Unused
+  `PATH` entries and comment-only configuration edits do not mark a healthy
+  daemon stale, while selecting a different executable still does.
+- Shared setup rejects cwd-relative resolution when the caller and managed
+  state directory would select different Codex binaries. An absolute
+  `ULTRATHINK_GATEWAY_CODEX_COMMAND` provides a stable override.
+
 ## 0.2.2 - 2026-08-28
 
 ### Changed

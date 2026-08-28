@@ -98,6 +98,7 @@ try {
     'SUPPORT.md',
     'docs/LARGE_FILES_AND_DIFFS.md',
     'js/cli/claude-workflow-managed-state.js',
+    'js/cli/claude-workflow-runtime-revision.js',
     'js/gateway/codex-capabilities.js',
     'js/gateway/provider-profiles.js',
     'scripts/claude-workflow-daemon.sh',

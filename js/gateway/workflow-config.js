@@ -291,6 +291,7 @@ function assertTruthfulCustomModelId(
 function codexCapabilitiesForRoute(config, route) {
   return resolveCodexCapabilities({
     command: config.codex.command,
+    cwd: config.codex.cwd,
     model: routeUpstreamModel(route, config.codex.model),
     contextProfile: config.codex.contextProfile,
     requestedContextWindow: config.codex.requestedContextWindow,
@@ -473,6 +474,7 @@ export function buildWorkflowGatewayConfig({
       ? baseConfig.codex.capabilities
       : resolveCodexCapabilities({
           command: baseConfig.codex.command,
+          cwd: baseConfig.codex.cwd,
           model: baseConfig.codex.model,
           contextProfile: codexContextProfile,
           requestedContextWindow: baseConfig.codex.requestedContextWindow,
@@ -880,6 +882,7 @@ function routeContextContract(config, route) {
           ? config.codex.capabilities
           : resolveCodexCapabilities({
               command: config.codex.command,
+              cwd: config.codex.cwd,
               model,
               contextProfile: config.codex.contextProfile,
               requestedContextWindow: config.codex.requestedContextWindow,

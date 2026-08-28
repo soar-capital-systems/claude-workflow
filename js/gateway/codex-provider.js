@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
+import { resolveCodexCapabilities } from './codex-capabilities.js';
 import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
@@ -10,16 +11,68 @@ const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_PENDING_TOOL_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
 const DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES = 64_000;
-const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
-// Keep the cold-start default conservative. Once app-server reports the
-// selected model's real context window, the session budget adapts to it.
+const DEFAULT_CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 10_000;
+const CODEX_TOOL_OUTPUT_HISTORY_MULTIPLIER = 1.2;
+const CODEX_TOOL_OUTPUT_BYTES_PER_TOKEN = 4;
+const CODEX_READ_INLINE_BUDGET_FRACTION = 0.75;
 const DEFAULT_INPUT_MAX_TOKENS = 192_000;
-// Fraction of the reported context window usable as input budget; the rest
-// is headroom for the model's reasoning and output.
-const CODEX_WINDOW_INPUT_FRACTION = 0.8;
 const DEFAULT_MAX_SESSIONS = 16;
 const MAX_PENDING_INBOUND_EVENTS = 1_024;
 const SUPPORTS_PROCESS_GROUP_SIGNALS = process.platform !== 'win32';
+const CODEX_APP_SERVER_OVERLOADED_RPC_CODE = -32001;
+const JSON_RPC_METHOD_NOT_FOUND = -32601;
+const CODEX_DYNAMIC_TOOL_CALL_METHOD = 'item/tool/call';
+const CODEX_INTERRUPT_TIMEOUT_MS = 2_000;
+const CODEX_OVERLOAD_RETRY_DELAYS_MS = Object.freeze([75, 150, 300, 600]);
+const CODEX_REPORTED_WINDOW_OUTPUT_RESERVE_TOKENS = 64_000;
+const CODEX_DYNAMIC_TOOLS_ONLY_DISABLED_FEATURES = Object.freeze([
+  'shell_tool',
+  'view_image',
+  'unified_exec',
+  'hooks',
+  'exec_permission_approvals',
+  'request_permissions_tool',
+  'web_search_request',
+  'web_search_cached',
+  'standalone_web_search',
+  'memories',
+  'external_agent_memory_import',
+  'chronicle',
+  'multi_agent',
+  'multi_agent_v2',
+  'apps',
+  'enable_mcp_apps',
+  'tool_suggest',
+  'recommended_plugins',
+  'plugins',
+  'browser_use',
+  'browser_use_full_cdp_access',
+  'browser_use_external',
+  'computer_use',
+  'remote_plugin',
+  'plugin_sharing',
+  'image_generation',
+  'skill_mcp_dependency_install',
+  'skill_search',
+  'default_mode_request_user_input',
+  'terminal_visualization_instructions',
+  'guardian_approval',
+  'guardian_reuse_parent_compaction',
+  'guardian_enhanced_node_repl_transcripts',
+  'guardian_node_repl_transcript_images',
+  'guardianv2',
+  'guardian_ext',
+  'goals',
+  'token_budget',
+  'rollout_budget',
+  // 0.150.1 reads sleep from current_time_reminder below; newer app-server
+  // builds also expose an independent sleep_tool feature. Keep both off.
+  'sleep_tool',
+  'tool_call_mcp_elicitation',
+  'auth_elicitation',
+  'personality',
+  'artifact',
+]);
 const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
 const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';
 const NON_RESERVING_SELECTION_REASONS = new Set([
@@ -27,13 +80,6 @@ const NON_RESERVING_SELECTION_REASONS = new Set([
   'boundary_replay',
   'routing_reservation_replay',
 ]);
-// Selection reasons under which a between-turns session may be recycled for
-// context pressure; replay-style selections must keep their session intact.
-const RECYCLE_ELIGIBLE_SELECTION_REASONS = new Set(['canonical']);
-const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
-  /remote app server .*transport failed/iu,
-  /WebSocket protocol error: Connection reset without closing handshake/iu,
-];
 const CODEX_REASONING_EFFORTS = new Set([
   'minimal',
   'low',
@@ -44,15 +90,7 @@ const CODEX_REASONING_EFFORTS = new Set([
   'ultra',
 ]);
 const CODEX_VERBOSITIES = new Set(['low', 'medium', 'high']);
-const MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION = Object.freeze([0, 144, 1]);
-// Recycle a live Codex session before its real context (as reported by the
-// app-server) can overflow the gateway's effective input budget. Long tool
-// loops accumulate history turn by turn, so per-payload budgets alone cannot
-// bound the sum. Bootstrap replays are capped strictly below this threshold
-// (see bootstrapInputMaxTokens) so a freshly recycled session can never
-// immediately re-trigger recycling.
-const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
-const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
+const MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION = Object.freeze([0, 150, 1]);
 const CODEX_CONTEXT_DROP_RESET_FRACTION = 0.8;
 // Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
 // Undershooting chars-per-token overflows the upstream window (fatal);
@@ -75,8 +113,8 @@ const READ_OFFSET_SCHEMA_DESCRIPTION =
   'Optional 1-based source line at which to start reading. It matches the source line numbers shown by Read. For continuation, use the exact next offset reported by Read or the line after the last contiguous source line actually shown; never advance across omitted output.';
 const READ_LIMIT_SCHEMA_DESCRIPTION =
   'Optional maximum number of source lines to read. For large or dense files, begin with a small explicit range. If even a tiny range is too large because lines are very long, use targeted Grep or Bash byte/character/JSON queries instead.';
-const READ_OUTPUT_OMISSION_MARKER =
-  '\n\n[...Read output omitted to fit Codex context budget...]\n\n';
+const CLAUDE_READ_PARTIAL_NOTICE_PREFIX = '[Truncated: PARTIAL view — ';
+const CODEX_READ_PAGE_METADATA_HEADER = '[Codex Read page metadata]';
 const READ_OFFSET_GUIDANCE_LINES = [
   READ_GUIDANCE_HEADER,
   '- offset is the 1-based source line to start at and matches the line numbers displayed by Read.',
@@ -134,8 +172,83 @@ function assertDynamicToolsOnlyCodexCompatibility(config, initializeResult) {
   throw new GatewayError(
     502,
     'api_error',
-    `shared gateway requires Codex CLI 0.144.1 or newer for dynamic-tools-only threads (detected ${detected}); update Codex and restart claude-workflow-gateway`
+    `shared gateway requires Codex CLI 0.150.1 or newer for isolated dynamic-tool threads (detected ${detected}); update Codex and restart claude-workflow-gateway`
   );
+}
+
+function codexErrorInfoType(codexErrorInfo) {
+  if (typeof codexErrorInfo === 'string') {
+    return codexErrorInfo;
+  }
+  if (!codexErrorInfo || typeof codexErrorInfo !== 'object') {
+    return null;
+  }
+  return Object.keys(codexErrorInfo)[0] || null;
+}
+
+function attachCodexErrorMetadata(error, metadata = {}) {
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value !== undefined) {
+      error[key] = value;
+    }
+  }
+  return error;
+}
+
+function copyCodexErrorMetadata(target, source) {
+  if (!source) {
+    return target;
+  }
+  for (const key of [
+    'code',
+    'data',
+    'codexRpcCode',
+    'codexRpcData',
+    'codexErrorInfo',
+    'codexErrorType',
+    'codexAdditionalDetails',
+    'retryable',
+  ]) {
+    if (Object.hasOwn(source, key)) {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+function codexRpcGatewayError(rpcError) {
+  const rpcCode = rpcError?.code ?? null;
+  const overloaded = rpcCode === CODEX_APP_SERVER_OVERLOADED_RPC_CODE;
+  const error = new GatewayError(
+    overloaded ? 503 : 502,
+    overloaded ? 'overloaded_error' : 'api_error',
+    rpcError?.message || 'Codex app-server request failed'
+  );
+  return attachCodexErrorMetadata(error, {
+    code: rpcCode,
+    data: Object.hasOwn(rpcError || {}, 'data') ? rpcError.data : undefined,
+    codexRpcCode: rpcCode,
+    codexRpcData: Object.hasOwn(rpcError || {}, 'data') ? rpcError.data : undefined,
+    retryable: overloaded,
+  });
+}
+
+function codexTurnGatewayError(turnError, fallbackMessage) {
+  const codexErrorInfo = turnError?.codexErrorInfo ?? turnError?.codex_error_info ?? null;
+  const codexErrorType = codexErrorInfoType(codexErrorInfo);
+  const overloaded = codexErrorType === 'serverOverloaded';
+  const error = new GatewayError(
+    overloaded ? 503 : 502,
+    overloaded ? 'overloaded_error' : 'api_error',
+    turnError?.message || fallbackMessage || 'Codex turn failed'
+  );
+  return attachCodexErrorMetadata(error, {
+    codexErrorInfo,
+    codexErrorType,
+    codexAdditionalDetails:
+      turnError?.additionalDetails ?? turnError?.additional_details ?? undefined,
+    retryable: overloaded,
+  });
 }
 
 function signalChildProcessTree(child, signal) {
@@ -194,6 +307,30 @@ function numberOrDefault(value, defaultValue) {
   return Number.isFinite(numericValue) ? numericValue : defaultValue;
 }
 
+function waitForMilliseconds(milliseconds) {
+  return new Promise(function wait(resolve) {
+    setTimeout(resolve, Math.max(0, milliseconds));
+  });
+}
+
+function withTimeout(promise, milliseconds, fallbackValue) {
+  return new Promise(function waitWithTimeout(resolve, reject) {
+    const timer = setTimeout(function timedOut() {
+      resolve(fallbackValue);
+    }, Math.max(0, milliseconds));
+    Promise.resolve(promise).then(
+      function completed(value) {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      function failed(error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 function joinTextParts(parts) {
   if (parts.length === 0) {
     return '';
@@ -241,13 +378,12 @@ function renderSystemPrompt(requestBody) {
     parts.push(renderTextBlocks(requestBody.system, 'system'));
   }
 
-  for (const message of requestBody.messages || []) {
-    if (message?.role !== 'system') {
-      continue;
-    }
-    parts.push(renderTextBlocks(message.content, 'system'));
-  }
-
+  // Anthropic's durable developer/system instructions live in the top-level
+  // `system` field. Claude Code also interleaves non-API `role: "system"`
+  // messages inside transcript history for transient tool metadata and
+  // reminders (including Read PARTIAL notices). Promoting those messages to
+  // thread/start.developerInstructions would both persist ephemeral metadata
+  // and change the Codex session key whenever Claude adds a reminder.
   return parts.filter(Boolean).join('\n\n');
 }
 
@@ -389,6 +525,7 @@ export function buildCodexDynamicToolRegistry(tools) {
     byInternalName.set(internalName, record);
 
     return {
+      type: 'function',
       name: internalName,
       description,
       inputSchema,
@@ -554,7 +691,17 @@ function addPositiveUsageField(usage, key, value) {
 
 function normalizeUsageBreakdown(source) {
   const inputTokens = usageField(source, 'inputTokens', 'input_tokens');
-  const cachedInputTokens = usageField(source, 'cachedInputTokens', 'cached_input_tokens');
+  // Codex reports cache reads and writes as disjoint subsets of inputTokens.
+  // Anthropic reports those subsets separately from input_tokens, so clamp a
+  // malformed provider breakdown before subtracting both subsets.
+  const cachedInputTokens = Math.min(
+    inputTokens,
+    usageField(source, 'cachedInputTokens', 'cached_input_tokens')
+  );
+  const cacheWriteInputTokens = Math.min(
+    Math.max(0, inputTokens - cachedInputTokens),
+    usageField(source, 'cacheWriteInputTokens', 'cache_write_input_tokens')
+  );
   const outputTokens = usageField(source, 'outputTokens', 'output_tokens');
   const reasoningOutputTokens = usageField(
     source,
@@ -563,11 +710,13 @@ function normalizeUsageBreakdown(source) {
   );
   const totalTokens = usageField(source, 'totalTokens', 'total_tokens');
   const normalized = {
-    input_tokens: Math.max(0, inputTokens - cachedInputTokens),
-    output_tokens: outputTokens + reasoningOutputTokens,
+    input_tokens: Math.max(0, inputTokens - cachedInputTokens - cacheWriteInputTokens),
+    // Codex/Responses output_tokens already includes reasoning tokens.
+    output_tokens: outputTokens,
   };
 
   addPositiveUsageField(normalized, 'cache_read_input_tokens', cachedInputTokens);
+  addPositiveUsageField(normalized, 'cache_write_input_tokens', cacheWriteInputTokens);
   addPositiveUsageField(normalized, 'reasoning_output_tokens', reasoningOutputTokens);
   addPositiveUsageField(normalized, 'total_tokens', totalTokens);
 
@@ -602,8 +751,8 @@ function contextTokensFromUsage(usage) {
   }
 
   // Prefer the app-server's own total for the turn; fall back to summing the
-  // components (input + cached input is the full context the model was fed,
-  // output approximates the thread context after the turn).
+  // components (ordinary + cache-read + cache-write input is the full prompt;
+  // output already includes reasoning and approximates context after the turn).
   const total = usageNumber(usage, 'total_tokens');
   if (total > 0) {
     return total;
@@ -612,31 +761,9 @@ function contextTokensFromUsage(usage) {
   return (
     usageNumber(usage, 'input_tokens') +
     usageNumber(usage, 'cache_read_input_tokens') +
+    usageNumber(usage, 'cache_write_input_tokens') +
     usageNumber(usage, 'output_tokens')
   );
-}
-
-function estimateIncomingRequestTokens(requestBody) {
-  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
-  const latest = messages.at(-1);
-  if (!latest) {
-    return 0;
-  }
-
-  try {
-    return estimateTokensFromJson(latest.content ?? '');
-  } catch {
-    return 0;
-  }
-}
-
-function codexRecycleContextLimit(config, contextWindow) {
-  const base = effectiveCodexInputMaxTokens(config, contextWindow);
-  if (!Number.isFinite(base)) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  return Math.floor(base * CODEX_SESSION_RECYCLE_FRACTION);
 }
 
 function usageDelta(current, baseline) {
@@ -661,6 +788,13 @@ function usageDelta(current, baseline) {
       usageNumber(baseline, 'cache_read_input_tokens')
   );
   addPositiveUsageField(delta, 'cache_read_input_tokens', cacheReadInputTokens);
+
+  const cacheWriteInputTokens = Math.max(
+    0,
+    usageNumber(current, 'cache_write_input_tokens') -
+      usageNumber(baseline, 'cache_write_input_tokens')
+  );
+  addPositiveUsageField(delta, 'cache_write_input_tokens', cacheWriteInputTokens);
 
   const reasoningOutputTokens = Math.max(
     0,
@@ -690,6 +824,11 @@ function addUsage(left, right) {
     usageNumber(left, 'cache_read_input_tokens') +
     usageNumber(right, 'cache_read_input_tokens');
   addPositiveUsageField(total, 'cache_read_input_tokens', cacheReadInputTokens);
+
+  const cacheWriteInputTokens =
+    usageNumber(left, 'cache_write_input_tokens') +
+    usageNumber(right, 'cache_write_input_tokens');
+  addPositiveUsageField(total, 'cache_write_input_tokens', cacheWriteInputTokens);
 
   const reasoningOutputTokens =
     usageNumber(left, 'reasoning_output_tokens') +
@@ -758,6 +897,31 @@ function codexToolResultWindowMaxBytes(config) {
   }
 
   return Math.max(1, Math.trunc(maxBytes));
+}
+
+function codexToolOutputTokenLimit(config, route = null) {
+  const configured = numberOrDefault(config?.codex?.toolOutputTokenLimit, 0);
+  if (configured > 0) {
+    return Math.max(1, Math.trunc(configured));
+  }
+
+  const policy = codexCapabilitiesForRoute(config, route)?.toolOutputTruncationPolicy;
+  if (policy?.mode === 'tokens' && Number(policy.limit) > 0) {
+    return Math.max(1, Math.trunc(policy.limit));
+  }
+
+  // Codex's unknown-model fallback is byte-based. Supplying the supported
+  // thread override makes the app-server policy deterministic for dynamic
+  // tool results and gives the gateway one unit in which to budget Read pages.
+  return DEFAULT_CODEX_TOOL_OUTPUT_TOKEN_LIMIT;
+}
+
+function codexReadInlineMaxBytes(config, route = null) {
+  const tokenLimit = codexToolOutputTokenLimit(config, route);
+  const nativeHistoryBytes =
+    CODEX_TOOL_OUTPUT_BYTES_PER_TOKEN *
+    Math.ceil(CODEX_TOOL_OUTPUT_HISTORY_MULTIPLIER * tokenLimit);
+  return Math.max(1, Math.floor(nativeHistoryBytes * CODEX_READ_INLINE_BUDGET_FRACTION));
 }
 
 function byteLength(text) {
@@ -905,50 +1069,227 @@ function lineAlignedSuffixByByteBudget(text, maxBytes) {
   return suffix.slice(newlineIndex + 1);
 }
 
-function limitCodexReadToolResultText(text, maxBytes) {
-  const value = String(text || '');
-  const originalBytes = Buffer.byteLength(value, 'utf8');
-  const originalTokenCount = approxCodexOutputTokenCount(value);
-  const totalLines = countOutputLines(value);
-
-  if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
-    return {
-      text: value,
-      truncated: false,
-      originalBytes,
-      originalTokenCount,
-      totalLines,
-      readToolResult: true,
-    };
+function readRequestInfo(pendingToolCall) {
+  const args = isPlainObject(pendingToolCall?.arguments) ? pendingToolCall.arguments : {};
+  const filePath = readFilePathFromArgs(args);
+  if (typeof filePath !== 'string' || filePath === '') {
+    return { valid: false, reason: 'the Read request has no stable file path' };
   }
 
-  const warning =
-    `Warning: truncated Read output (original token count: ${originalTokenCount})\n` +
-    `Total output lines: ${totalLines}\n` +
-    'The middle is an unseen gap. Do not advance a continuation cursor past it or claim complete coverage; reread smaller explicit 1-based source ranges.\n\n';
-  const budget = Math.max(0, Math.trunc(maxBytes));
-  const warningText = utf8PrefixByByteBudget(warning, budget);
-  const warningBytes = byteLength(warningText);
-  const body = warningBytes < budget
-    ? truncateMiddleByByteBudget(value, budget - warningBytes, {
-        marker: READ_OUTPUT_OMISSION_MARKER,
-        lineAligned: true,
-      }).text
-    : '';
+  const hasOffset = Object.hasOwn(args, 'offset') && args.offset !== null;
+  const hasLimit = Object.hasOwn(args, 'limit') && args.limit !== null;
+  const offset = hasOffset ? Number(args.offset) : 1;
+  const limit = hasLimit ? Number(args.limit) : null;
+  if (!Number.isSafeInteger(offset) || offset < 1) {
+    return { valid: false, reason: 'the Read request has an invalid 1-based offset' };
+  }
+  if (hasLimit && (!Number.isSafeInteger(limit) || limit < 1)) {
+    return { valid: false, reason: 'the Read request has an invalid line limit' };
+  }
 
   return {
-    text: `${warningText}${body}`,
+    valid: true,
+    filePath,
+    offset,
+    limit,
+    wholeFile: !hasOffset && !hasLimit,
+  };
+}
+
+function parseContiguousNumberedReadLines(text, expectedStart) {
+  const normalized = String(text || '').replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
+  const lines = normalized.split('\n');
+  if (lines.at(-1) === '') {
+    lines.pop();
+  }
+  if (lines.length === 0) {
+    return { valid: false, reason: 'the Read result contains no numbered source lines' };
+  }
+
+  const records = [];
+  let expected = expectedStart;
+  for (const line of lines) {
+    const match = line.match(/^(\d+)(?:\t|:)(.*)$/u);
+    const number = match ? Number(match[1]) : 0;
+    if (!match || !Number.isSafeInteger(number) || number !== expected) {
+      return {
+        valid: false,
+        reason:
+          `the Read result is not a contiguous numbered page at source line ${String(expected)}`,
+      };
+    }
+    records.push({ number, text: line });
+    expected += 1;
+  }
+
+  return { valid: true, records };
+}
+
+function renderCodexReadPageMetadata(metadata) {
+  const serialized = JSON.stringify(metadata);
+  const instruction = metadata.source_complete
+    ? 'The numbered source lines above are the complete file.'
+    : `Only the contiguous numbered range above is covered. Continue Read at offset=${String(
+        metadata.next_offset
+      )} with limit no greater than ${String(
+        metadata.next_limit
+      )}; no later source line is represented here.`;
+  return `${CODEX_READ_PAGE_METADATA_HEADER}\n${serialized}\n${instruction}`;
+}
+
+function unpageableReadResult(text, maxBytes, reason, options = {}) {
+  const value = String(text || '');
+  const originalBytes = byteLength(value);
+  const originalTokenCount = approxCodexOutputTokenCount(value);
+  const totalLines = countOutputLines(value);
+  const detail = String(reason || 'the result could not be verified as numbered source lines');
+  const diagnostic =
+    '[Codex Read result is not safe to page]\n' +
+    `No source-line coverage or completeness claim is made because ${detail}.\n` +
+    'Retry Read with a smaller explicit 1-based offset and limit. If one source line is still too large, use a targeted Grep query or Bash byte/character slice instead.';
+  const budget = Number.isFinite(maxBytes)
+    ? Math.max(0, Math.trunc(maxBytes))
+    : byteLength(diagnostic);
+
+  return {
+    text: utf8PrefixByByteBudget(diagnostic, budget),
     truncated: true,
     originalBytes,
     originalTokenCount,
     totalLines,
     readToolResult: true,
+    readCoverageVerified: false,
+    readNoticeStatus: options.readNoticeStatus || 'none',
+  };
+}
+
+function limitCodexReadToolResultText(text, maxBytes, options = {}) {
+  const value = String(text || '');
+  const originalBytes = Buffer.byteLength(value, 'utf8');
+  const originalTokenCount = approxCodexOutputTokenCount(value);
+  const totalLines = countOutputLines(value);
+  const budget = Number.isFinite(maxBytes)
+    ? Math.max(0, Math.trunc(maxBytes))
+    : Number.POSITIVE_INFINITY;
+
+  if (options.isError === true) {
+    const limited = truncateMiddleByByteBudget(value, budget);
+    return {
+      ...limited,
+      readToolResult: true,
+      readCoverageVerified: false,
+      readNoticeStatus: options.readNoticeStatus || 'none',
+    };
+  }
+
+  if (options.readNoticeStatus === 'invalid') {
+    return unpageableReadResult(
+      value,
+      budget,
+      options.readNoticeError || 'the adjacent Claude Read truncation notice failed validation',
+      options
+    );
+  }
+
+  if (options.readPartialNotice?.kind === 'characters') {
+    const characterDetail = value.length === options.readPartialNotice.shownCharacters
+      ? 'Claude reported a long-line character excerpt that cannot establish complete source lines'
+      : 'the Claude long-line notice does not match the returned character excerpt';
+    return unpageableReadResult(
+      value,
+      budget,
+      characterDetail,
+      options
+    );
+  }
+
+  const request = readRequestInfo(options.pendingToolCall);
+  if (!request.valid) {
+    return unpageableReadResult(value, budget, request.reason, options);
+  }
+
+  const parsed = parseContiguousNumberedReadLines(value, request.offset);
+  if (!parsed.valid) {
+    return unpageableReadResult(value, budget, parsed.reason, options);
+  }
+
+  const notice = options.readPartialNotice;
+  const firstRecord = parsed.records[0];
+  const lastRecord = parsed.records.at(-1);
+  if (
+    notice?.kind === 'lines' &&
+    (notice.start !== firstRecord.number || notice.end !== lastRecord.number)
+  ) {
+    return unpageableReadResult(
+      value,
+      budget,
+      'the validated Claude partial-view range does not match the returned numbered lines',
+      { ...options, readNoticeStatus: 'invalid' }
+    );
+  }
+
+  const returnedCount = parsed.records.length;
+  // Absence of a PARTIAL banner is not durable evidence of EOF: a future
+  // Claude version could change or omit that companion system message. An
+  // explicit line limit returning fewer records is the fail-closed EOF signal
+  // available in the current textual contract.
+  const explicitLimitReachedEof =
+    notice?.kind !== 'lines' && request.limit !== null && returnedCount < request.limit;
+  const sourceTotalLines = notice?.kind === 'lines'
+    ? notice.total
+    : explicitLimitReachedEof
+      ? lastRecord.number
+      : null;
+  const rawSourceComplete = explicitLimitReachedEof;
+  let selected = null;
+  let body = '';
+  for (let index = 0; index < parsed.records.length; index += 1) {
+    body = body ? `${body}\n${parsed.records[index].text}` : parsed.records[index].text;
+    const coveredEnd = parsed.records[index].number;
+    const sourceComplete = rawSourceComplete && index === parsed.records.length - 1;
+    const metadata = {
+      path: request.filePath,
+      covered_start: firstRecord.number,
+      covered_end: coveredEnd,
+      source_total_lines: sourceTotalLines,
+      next_offset: sourceComplete ? null : coveredEnd + 1,
+      next_limit: sourceComplete ? null : index + 1,
+      contiguous: true,
+      source_complete: sourceComplete,
+    };
+    const footer = renderCodexReadPageMetadata(metadata);
+    const output = `${body}\n\n${footer}`;
+    if (Number.isFinite(budget) && byteLength(output) > budget) {
+      break;
+    }
+    selected = { output, metadata, count: index + 1 };
+  }
+
+  if (!selected) {
+    return unpageableReadResult(
+      value,
+      budget,
+      'the first complete numbered source line and its paging metadata exceed the safe inline budget',
+      options
+    );
+  }
+
+  return {
+    text: selected.output,
+    truncated: selected.count < parsed.records.length,
+    originalBytes,
+    originalTokenCount,
+    totalLines,
+    readToolResult: true,
+    readCoverageVerified: true,
+    readNoticeStatus: options.readNoticeStatus || 'none',
+    readPageMetadata: selected.metadata,
   };
 }
 
 function limitCodexToolResultText(text, maxBytes, options = {}) {
   if (isReadToolName(options.toolName)) {
-    return limitCodexReadToolResultText(text, maxBytes);
+    return limitCodexReadToolResultText(text, maxBytes, options);
   }
 
   const value = String(text || '');
@@ -977,17 +1318,100 @@ function limitCodexToolResultText(text, maxBytes, options = {}) {
   };
 }
 
-function codexThreadConfigOverrides(config, route = null) {
-  const overrides = {};
+function codexCapabilitiesForRoute(config, route = null) {
+  const model = String(route?.upstreamModel || config?.codex?.model || '').trim();
+  const configured = config?.codex?.capabilities;
+  if (!configured) {
+    return null;
+  }
+  if (configured?.model === model) {
+    return configured;
+  }
+
+  return resolveCodexCapabilities({
+    command: config?.codex?.command || 'codex',
+    model,
+    contextProfile: config?.codex?.contextProfile || 'standard',
+    requestedContextWindow: config?.codex?.requestedContextWindow || 0,
+    reasoningEffort: route?.reasoningEffort || config?.codex?.reasoningEffort || '',
+  });
+}
+
+function codexDynamicToolsOnlyConfigOverrides(discoveredConfig = null) {
+  const overrides = {
+    web_search: 'disabled',
+    include_permissions_instructions: false,
+    include_apps_instructions: false,
+    include_collaboration_mode_instructions: false,
+    include_environment_context: false,
+    'agents.enabled': false,
+    'tools.experimental_request_user_input.enabled': false,
+    'tools.update_plan.enabled': false,
+    'skills.include_instructions': false,
+    'skills.bundled.enabled': false,
+    'orchestrator.skills.enabled': false,
+    'orchestrator.mcp.enabled': false,
+    'memories.use_memories': false,
+    'memories.dedicated_tools': false,
+    // GPT-5.6 model metadata selects code-mode-only independently of feature
+    // flags. Keep Claude-provided functions top-level instead of nesting them
+    // behind Codex's exec wrapper. Codex still advertises exec/wait itself;
+    // app-server 0.150.1 has no supported thread override that removes them.
+    'features.code_mode': {
+      enabled: false,
+      direct_only_tool_namespaces: ['functions'],
+    },
+    'features.current_time_reminder': {
+      enabled: false,
+      sleep_tool: false,
+    },
+  };
+
+  for (const feature of CODEX_DYNAMIC_TOOLS_ONLY_DISABLED_FEATURES) {
+    overrides[`features.${feature}`] = false;
+  }
+
+  const mcpServers = {};
+  const plugins = {};
+  for (const layer of discoveredConfig?.layers || []) {
+    for (const name of Object.keys(layer?.config?.mcp_servers || {})) {
+      mcpServers[name] = { enabled: false };
+    }
+    for (const name of Object.keys(layer?.config?.plugins || {})) {
+      plugins[name] = { enabled: false };
+    }
+  }
+  if (Object.keys(mcpServers).length > 0) {
+    overrides.mcp_servers = mcpServers;
+  }
+  if (Object.keys(plugins).length > 0) {
+    overrides.plugins = plugins;
+  }
+
+  return overrides;
+}
+
+function codexThreadConfigOverrides(config, route = null, isolationOverrides = null) {
+  const overrides = isolationOverrides ? { ...isolationOverrides } : {};
+  const capabilities = codexCapabilitiesForRoute(config, route);
+  const toolOutputTokenLimit = codexToolOutputTokenLimit(config, route);
   const autoCompactTokenLimit = numberOrDefault(config?.codex?.autoCompactTokenLimit, 0);
-  const autoCompactTokenLimitScope =
-    config?.codex?.autoCompactTokenLimitScope || DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE;
+  const autoCompactTokenLimitScope = config?.codex?.autoCompactTokenLimitScope;
+
+  if (Number(capabilities?.resolvedRawContextTokens) > 0) {
+    overrides.model_context_window = Math.trunc(capabilities.resolvedRawContextTokens);
+  }
+
+  overrides.tool_output_token_limit = toolOutputTokenLimit;
 
   if (autoCompactTokenLimit > 0) {
     overrides.model_auto_compact_token_limit = Math.trunc(autoCompactTokenLimit);
-  }
-  if (typeof autoCompactTokenLimitScope === 'string' && autoCompactTokenLimitScope.trim() !== '') {
-    overrides.model_auto_compact_token_limit_scope = autoCompactTokenLimitScope.trim();
+    if (
+      typeof autoCompactTokenLimitScope === 'string' &&
+      autoCompactTokenLimitScope.trim() !== ''
+    ) {
+      overrides.model_auto_compact_token_limit_scope = autoCompactTokenLimitScope.trim();
+    }
   }
 
   const verbosity = String(route?.verbosity || '').trim().toLowerCase();
@@ -1005,23 +1429,32 @@ function codexThreadConfigOverrides(config, route = null) {
   return overrides;
 }
 
-function codexInputMaxTokens(config) {
-  const maxTokens = numberOrDefault(config?.codex?.inputMaxTokens, DEFAULT_INPUT_MAX_TOKENS);
-  if (maxTokens <= 0) {
-    return Number.POSITIVE_INFINITY;
+function codexInputMaxTokens(config, route = null) {
+  const explicitlyConfigured = numberOrDefault(config?.codex?.inputMaxTokens, 0);
+  if (explicitlyConfigured > 0) {
+    return Math.max(1, Math.trunc(explicitlyConfigured));
   }
 
-  return Math.max(1, Math.trunc(maxTokens));
+  const capabilityBudget = Number(codexCapabilitiesForRoute(config, route)?.inputBudgetTokens || 0);
+  return capabilityBudget > 0
+    ? Math.max(1, Math.trunc(capabilityBudget))
+    : DEFAULT_INPUT_MAX_TOKENS;
 }
 
-function effectiveCodexInputMaxTokens(config, contextWindow) {
-  const configured = codexInputMaxTokens(config);
+function effectiveCodexInputMaxTokens(config, route, contextWindow) {
+  const configured = codexInputMaxTokens(config, route);
   const window = Number(contextWindow || 0);
   if (window <= 0) {
     return configured;
   }
 
-  const fromWindow = Math.max(1, Math.floor(window * CODEX_WINDOW_INPUT_FRACTION));
+  // App-server reports the already-effective (headroom-adjusted) window.
+  // Reserve output space without applying a second arbitrary percentage.
+  const outputReserve = Math.min(
+    CODEX_REPORTED_WINDOW_OUTPUT_RESERVE_TOKENS,
+    Math.floor(window / 4)
+  );
+  const fromWindow = Math.max(1, Math.floor(window - outputReserve));
   return Math.min(configured, fromWindow);
 }
 
@@ -1165,25 +1598,6 @@ function renderToolResultContent(content) {
   return joinTextParts(parts);
 }
 
-function looksLikeReadOffsetResult(output) {
-  const lower = output.toLowerCase();
-  return (
-    (lower.includes('offset') &&
-      (lower.includes('file has') ||
-        lower.includes('out of range') ||
-        (lower.includes('line') && lower.includes('requested')))) ||
-    lower.includes('exceeds maximum allowed tokens') ||
-    lower.includes('exceeds maximum allowed size') ||
-    lower.includes('partial view') ||
-    lower.includes('[truncated:')
-  );
-}
-
-function looksLikeReadOffsetWarning(output) {
-  const lower = output.toLowerCase();
-  return lower.includes('warning') || lower.includes('system-reminder');
-}
-
 function shouldAppendReadOffsetGuidance(output, pendingToolCall, isError) {
   if (!isReadToolName(pendingToolCall?.tool)) {
     return false;
@@ -1193,7 +1607,10 @@ function shouldAppendReadOffsetGuidance(output, pendingToolCall, isError) {
     return false;
   }
 
-  return isError || (looksLikeReadOffsetResult(output) && looksLikeReadOffsetWarning(output));
+  // Successful numbered payloads must remain parseable. Source text can
+  // itself contain words such as "warning" and "offset", so content
+  // heuristics must never append gateway prose to a successful Read result.
+  return isError;
 }
 
 function appendReadToolResultFeedback(text, pendingToolCall, isError) {
@@ -1221,7 +1638,7 @@ function appendReadToolResultFeedback(text, pendingToolCall, isError) {
   };
 }
 
-function renderTranscriptBlock(block) {
+function renderTranscriptBlock(block, options = {}) {
   if (block?.type === 'text') {
     return block.text || '';
   }
@@ -1231,19 +1648,71 @@ function renderTranscriptBlock(block) {
   }
 
   if (block?.type === 'tool_result') {
-    return `[tool_result ${block.tool_use_id || ''}${block.is_error ? ' error' : ''}]\n${renderToolResultContent(block.content)}`;
+    let text = renderToolResultContent(block.content);
+    const replayToolCall = options.toolCallsById?.get(block.tool_use_id);
+    if (isReadToolName(replayToolCall?.tool)) {
+      const rawToolResult = {
+        text,
+        isError: block.is_error === true,
+        messageIndex: options.messageIndex,
+      };
+      const readNotice = adjacentClaudeReadPartialNotice(
+        options.requestBody,
+        options.messageIndex,
+        replayToolCall
+      );
+      const prepared = prepareCodexToolResultPayload(
+        {
+          ...rawToolResult,
+          readNoticeStatus: readNotice.status,
+          readPartialNotice: readNotice.notice,
+          readNoticeError: readNotice.error,
+        },
+        replayToolCall,
+        options.readInlineMaxBytes
+      );
+      text = prepared.limitedToolResult.text;
+    }
+    return `[tool_result ${block.tool_use_id || ''}${block.is_error ? ' error' : ''}]\n${text}`;
   }
 
   return '';
 }
 
-function renderMessageTranscript(message) {
+function recordTranscriptToolCalls(message, toolCallsById) {
+  if (message?.role !== 'assistant') {
+    return;
+  }
+  for (const block of normalizeContentBlocks(message.content, 'assistant content')) {
+    if (block?.type !== 'tool_use' || typeof block.id !== 'string' || block.id === '') {
+      continue;
+    }
+    toolCallsById.set(block.id, {
+      callId: block.id,
+      tool: block.name,
+      arguments: isPlainObject(block.input) ? block.input : {},
+    });
+  }
+}
+
+function transcriptToolCalls(requestBody, endMessageIndex = Number.POSITIVE_INFINITY) {
+  const toolCallsById = new Map();
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  for (let index = 0; index < messages.length && index <= endMessageIndex; index += 1) {
+    recordTranscriptToolCalls(messages[index], toolCallsById);
+  }
+  return toolCallsById;
+}
+
+function renderMessageTranscript(message, options = {}) {
   if (message?.role === 'system') {
     return '';
   }
 
   const content = normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`)
-    .map(renderTranscriptBlock)
+    .map(function renderBlock(block) {
+      return renderTranscriptBlock(block, options);
+    })
     .filter(Boolean)
     .join('\n\n');
   if (!content) {
@@ -1268,7 +1737,9 @@ function canonicalContinuityMessage(message) {
   return [
     message?.role || 'unknown',
     normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`).map(
-      renderTranscriptBlock
+      function renderContinuityBlock(block) {
+        return renderTranscriptBlock(block);
+      }
     ),
   ];
 }
@@ -1324,7 +1795,11 @@ function matchesContinuityAnchor(requestBody, anchor) {
   );
 }
 
-function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+function renderLatestUserTranscriptInput(
+  requestBody,
+  maxTokens = Number.POSITIVE_INFINITY,
+  renderOptions = {}
+) {
   const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -1333,7 +1808,13 @@ function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIV
       continue;
     }
 
-    const rendered = renderMessageTranscript(message);
+    const rendered = renderMessageTranscript(message, {
+      ...renderOptions,
+      requestBody,
+      messageIndex: index,
+      toolCallsById:
+        renderOptions.toolCallsById || transcriptToolCalls(requestBody, index),
+    });
     if (rendered) {
       return limitTextByTokenBudget(rendered, maxTokens);
     }
@@ -1344,13 +1825,22 @@ function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIV
   return limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
 }
 
-function renderedTranscriptMessages(requestBody) {
+function renderedTranscriptMessages(requestBody, renderOptions = {}) {
   const renderedMessages = [];
   const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  const toolCallsById = renderOptions.toolCallsById || new Map();
 
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
-    const rendered = renderMessageTranscript(message);
+    if (!renderOptions.toolCallsById) {
+      recordTranscriptToolCalls(message, toolCallsById);
+    }
+    const rendered = renderMessageTranscript(message, {
+      ...renderOptions,
+      requestBody,
+      messageIndex: index,
+      toolCallsById,
+    });
     if (!rendered) {
       continue;
     }
@@ -1416,8 +1906,12 @@ function summarizeLatestTurnInput(
   });
 }
 
-function renderTranscriptInputWithSummary(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
-  const renderedItems = renderedTranscriptMessages(requestBody);
+function renderTranscriptInputWithSummary(
+  requestBody,
+  maxTokens = Number.POSITIVE_INFINITY,
+  renderOptions = {}
+) {
+  const renderedItems = renderedTranscriptMessages(requestBody, renderOptions);
   const renderedMessages = renderedItems.map(function renderedText(item) {
     return item.text;
   });
@@ -1474,7 +1968,7 @@ function renderTranscriptInputWithSummary(requestBody, maxTokens = Number.POSITI
     };
   }
 
-  const text = renderLatestUserTranscriptInput(requestBody, maxTokens);
+  const text = renderLatestUserTranscriptInput(requestBody, maxTokens, renderOptions);
   return {
     text,
     summary: summarizeLatestTurnInput(
@@ -1518,12 +2012,19 @@ function fitTranscriptInputToBudget(selectedMessages, omittedCount, maxTokens) {
   return `${prefix}${latestMessage.slice(-(maxChars - prefix.length))}`;
 }
 
-function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
-  return renderTranscriptInputWithSummary(requestBody, maxTokens).text;
+function renderTranscriptInput(
+  requestBody,
+  maxTokens = Number.POSITIVE_INFINITY,
+  renderOptions = {}
+) {
+  return renderTranscriptInputWithSummary(requestBody, maxTokens, renderOptions).text;
 }
 
 function isCodexContextWindowError(error) {
-  return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
+  return (
+    error?.codexErrorType === 'contextWindowExceeded' ||
+    CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '')
+  );
 }
 
 function isCodexAutocompactThrashText(text) {
@@ -1542,8 +2043,216 @@ function isPossibleCodexContextWindowError(error) {
   );
 }
 
+function normalizedComparableReadPath(value) {
+  let pathname = String(value || '').replace(/\\/gu, '/');
+  if (!pathname) {
+    return null;
+  }
+
+  let windowsSemantics = false;
+  const wslDrive = pathname.match(/^\/mnt\/([a-zA-Z])(?:\/(.*))?$/u);
+  if (wslDrive) {
+    pathname = `${wslDrive[1]}:/${wslDrive[2] || ''}`;
+    windowsSemantics = true;
+  } else if (/^[a-zA-Z]:\//u.test(pathname) || pathname.startsWith('//')) {
+    windowsSemantics = true;
+  }
+
+  const drive = pathname.match(/^([a-zA-Z]):\/(.*)$/u);
+  const unc = !drive && pathname.startsWith('//');
+  const absolute = Boolean(drive || unc || pathname.startsWith('/'));
+  const prefix = drive ? `${drive[1]}:/` : unc ? '//' : pathname.startsWith('/') ? '/' : '';
+  const remainder = drive ? drive[2] : pathname.slice(prefix.length);
+  const segments = [];
+  for (const segment of remainder.split('/')) {
+    if (!segment || segment === '.') {
+      continue;
+    }
+    if (segment === '..') {
+      if (segments.length > 0 && segments.at(-1) !== '..') {
+        segments.pop();
+        continue;
+      }
+      if (absolute) {
+        return null;
+      }
+    }
+    segments.push(segment);
+  }
+
+  let normalized = `${prefix}${segments.join('/')}`;
+  if (!normalized && !prefix) {
+    return null;
+  }
+  if (normalized.length > prefix.length && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  if (windowsSemantics) {
+    normalized = normalized.toLowerCase();
+  }
+  return { value: normalized, windowsSemantics };
+}
+
+function equivalentReadPaths(left, right) {
+  if (left === right) {
+    return true;
+  }
+  const normalizedLeft = normalizedComparableReadPath(left);
+  const normalizedRight = normalizedComparableReadPath(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  if (normalizedLeft.windowsSemantics !== normalizedRight.windowsSemantics) {
+    return false;
+  }
+  return normalizedLeft.value === normalizedRight.value;
+}
+
+function safePositiveInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function parseClaudeReadPartialNotice(line) {
+  const lineMatch = line.match(
+    /^\[Truncated: PARTIAL view — (.+): showing lines (\d+)-(\d+) of (\d+) total \((\d+) tokens, cap (\d+)\)\. Call Read with offset=(\d+) limit=(\d+) for the next page, or Grep to find a specific section\. Do NOT answer from this page alone if the answer may be further in the file\.\]$/u
+  );
+  if (lineMatch) {
+    const [start, end, total, tokenCount, tokenCap, nextOffset, nextLimit] = lineMatch
+      .slice(2)
+      .map(safePositiveInteger);
+    if ([start, end, total, tokenCount, tokenCap, nextOffset, nextLimit].includes(null)) {
+      return null;
+    }
+    return {
+      kind: 'lines',
+      path: lineMatch[1],
+      start,
+      end,
+      total,
+      tokenCount,
+      tokenCap,
+      nextOffset,
+      nextLimit,
+    };
+  }
+
+  const characterMatch = line.match(
+    /^\[Truncated: PARTIAL view — (.+): showing the first (\d+) of (\d+) characters \((\d+) tokens, cap (\d+)\); this file has very long lines and cannot be paginated by line\. Use Grep to find a specific section, or Read with offset\/limit to page through it\. Do NOT answer from this excerpt alone if the answer may be elsewhere in the file\.\]$/u
+  );
+  if (!characterMatch) {
+    return null;
+  }
+  const [shownCharacters, totalCharacters, tokenCount, tokenCap] = characterMatch
+    .slice(2)
+    .map(safePositiveInteger);
+  if ([shownCharacters, totalCharacters, tokenCount, tokenCap].includes(null)) {
+    return null;
+  }
+  return {
+    kind: 'characters',
+    path: characterMatch[1],
+    shownCharacters,
+    totalCharacters,
+    tokenCount,
+    tokenCap,
+  };
+}
+
+function validateClaudeReadPartialNotice(notice, pendingToolCall) {
+  const request = readRequestInfo(pendingToolCall);
+  if (!request.valid) {
+    return request.reason;
+  }
+  if (!equivalentReadPaths(notice.path, request.filePath)) {
+    return 'the adjacent Claude Read truncation notice names a different path';
+  }
+  if (notice.tokenCount <= notice.tokenCap) {
+    return 'the adjacent Claude Read truncation notice has an inconsistent token cap';
+  }
+
+  if (notice.kind === 'characters') {
+    if (!request.wholeFile || notice.shownCharacters >= notice.totalCharacters) {
+      return 'the adjacent Claude long-line notice has an inconsistent character range';
+    }
+    return null;
+  }
+
+  const coveredCount = notice.end - notice.start + 1;
+  if (
+    notice.start !== request.offset ||
+    notice.end < notice.start ||
+    notice.end >= notice.total ||
+    notice.nextOffset !== notice.end + 1 ||
+    notice.nextLimit !== coveredCount ||
+    (request.limit !== null && coveredCount > request.limit)
+  ) {
+    return 'the adjacent Claude Read truncation notice has an inconsistent line range or continuation offset';
+  }
+  return null;
+}
+
+function adjacentClaudeReadPartialNotice(requestBody, messageIndex, pendingToolCall) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  const message = messages[messageIndex + 1];
+  if (message?.role !== 'system') {
+    return { status: 'none', notice: null, error: null };
+  }
+
+  const content = typeof message.content === 'string'
+    ? [{ type: 'text', text: message.content }]
+    : Array.isArray(message.content)
+      ? message.content
+      : [];
+  const candidates = [];
+  for (const block of content) {
+    if (block?.type !== 'text') {
+      continue;
+    }
+    for (const line of String(block.text || '').split(/\r?\n/u)) {
+      if (line.startsWith(CLAUDE_READ_PARTIAL_NOTICE_PREFIX)) {
+        candidates.push(line);
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return { status: 'none', notice: null, error: null };
+  }
+  if (candidates.length !== 1) {
+    return {
+      status: 'invalid',
+      notice: null,
+      error: 'the immediately adjacent system message contains multiple Claude Read partial-view notices',
+    };
+  }
+
+  const notice = parseClaudeReadPartialNotice(candidates[0]);
+  if (!notice) {
+    return {
+      status: 'invalid',
+      notice: null,
+      error: 'the immediately adjacent Claude Read partial-view notice does not match the 2.1.250 contract',
+    };
+  }
+  const validationError = validateClaudeReadPartialNotice(notice, pendingToolCall);
+  if (validationError) {
+    return { status: 'invalid', notice: null, error: validationError };
+  }
+  return { status: 'validated', notice, error: null };
+}
+
 function toolResultPayloadFromRequest(requestBody, callId) {
-  for (const block of latestUserContentBlocks(requestBody, 'tool_result message')) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  let messageIndex = messages.length - 1;
+  while (messageIndex >= 0 && messages[messageIndex]?.role === 'system') {
+    messageIndex -= 1;
+  }
+  const message = messages[messageIndex];
+  if (message?.role !== 'user') {
+    return null;
+  }
+
+  for (const block of normalizeContentBlocks(message.content, 'tool_result message')) {
     if (block?.type !== 'tool_result') {
       continue;
     }
@@ -1555,6 +2264,7 @@ function toolResultPayloadFromRequest(requestBody, callId) {
     return {
       text: renderToolResultContent(block.content),
       isError: block.is_error === true,
+      messageIndex,
     };
   }
 
@@ -1564,13 +2274,51 @@ function toolResultPayloadFromRequest(requestBody, callId) {
 function extractToolResultPayload(requestBody, pendingToolCall) {
   const payload = toolResultPayloadFromRequest(requestBody, pendingToolCall.callId);
   if (payload) {
-    return payload;
+    if (!isReadToolName(pendingToolCall.tool)) {
+      return payload;
+    }
+    const readNotice = adjacentClaudeReadPartialNotice(
+      requestBody,
+      payload.messageIndex,
+      pendingToolCall
+    );
+    return {
+      ...payload,
+      readNoticeStatus: readNotice.status,
+      readPartialNotice: readNotice.notice,
+      readNoticeError: readNotice.error,
+    };
   }
 
   throw new GatewayError(
     400,
     'invalid_request_error',
     `missing tool_result for pending tool call ${pendingToolCall.callId}`
+  );
+}
+
+function prepareCodexToolResultPayload(rawToolResult, pendingToolCall, maxBytes) {
+  const readFeedback = appendReadToolResultFeedback(
+    rawToolResult.text,
+    pendingToolCall,
+    rawToolResult.isError
+  );
+  const limitedToolResult = limitCodexToolResultText(readFeedback.text, maxBytes, {
+    toolName: pendingToolCall?.tool,
+    pendingToolCall,
+    isError: rawToolResult.isError,
+    readNoticeStatus: rawToolResult.readNoticeStatus,
+    readPartialNotice: rawToolResult.readPartialNotice,
+    readNoticeError: rawToolResult.readNoticeError,
+  });
+  return { rawToolResult, readFeedback, limitedToolResult };
+}
+
+export function prepareCodexToolResult(requestBody, pendingToolCall, maxBytes) {
+  return prepareCodexToolResultPayload(
+    extractToolResultPayload(requestBody, pendingToolCall),
+    pendingToolCall,
+    maxBytes
   );
 }
 
@@ -1727,6 +2475,7 @@ class CodexAppServerConnection extends EventEmitter {
     this.pendingInboundEvents = [];
     this.drainingInboundMessages = false;
     this.initialized = false;
+    this.dynamicToolsOnlyConfigOverrides = null;
     this.closed = false;
     this.closing = false;
     this.rpcTimeoutMs = Math.max(
@@ -1765,15 +2514,23 @@ class CodexAppServerConnection extends EventEmitter {
       },
       capabilities: {
         experimentalApi: true,
+        requestAttestation: false,
       },
     });
 
     this.send({
       method: 'initialized',
-      params: {},
     });
     this.initialized = true;
     assertDynamicToolsOnlyCodexCompatibility(this.config, initializeResult);
+    if (this.config?.codex?.dynamicToolsOnly === true) {
+      const discoveredConfig = await this.rawRequest('config/read', {
+        cwd: this.config.codex.cwd,
+        includeLayers: true,
+      });
+      this.dynamicToolsOnlyConfigOverrides =
+        codexDynamicToolsOnlyConfigOverrides(discoveredConfig);
+    }
     return initializeResult;
   }
 
@@ -1837,11 +2594,6 @@ class CodexAppServerConnection extends EventEmitter {
       return;
     }
     this.emit('stderr', text);
-    if (CODEX_APP_SERVER_FATAL_STDERR_PATTERNS.some((pattern) => pattern.test(text))) {
-      this.handleExit(
-        new GatewayError(502, 'api_error', `Codex app-server transport failed: ${text}`)
-      );
-    }
   }
 
   handleStdinError(error) {
@@ -1905,19 +2657,22 @@ class CodexAppServerConnection extends EventEmitter {
     }
 
     if (message.id !== undefined && message.error !== undefined) {
-      this.rejectPendingRequest(
-        message.id,
-        new GatewayError(
-          502,
-          'api_error',
-          message.error.message || 'Codex app-server request failed'
-        )
-      );
+      this.rejectPendingRequest(message.id, codexRpcGatewayError(message.error));
       return;
     }
 
     if (message.method && message.id !== undefined) {
-      this.dispatchInboundEvent('server-request', message);
+      if (message.method === CODEX_DYNAMIC_TOOL_CALL_METHOD) {
+        this.dispatchInboundEvent('server-request', message);
+      } else {
+        this.send({
+          id: message.id,
+          error: {
+            code: JSON_RPC_METHOD_NOT_FOUND,
+            message: `Method not found: ${message.method}`,
+          },
+        });
+      }
       return;
     }
 
@@ -1980,7 +2735,24 @@ class CodexAppServerConnection extends EventEmitter {
 
   async request(method, params) {
     await this.readyPromise;
-    return this.rawRequest(method, params);
+    let lastError = null;
+    for (let attempt = 0; attempt <= CODEX_OVERLOAD_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        return await this.rawRequest(method, params);
+      } catch (error) {
+        lastError = error;
+        if (
+          error?.codexRpcCode !== CODEX_APP_SERVER_OVERLOADED_RPC_CODE ||
+          attempt >= CODEX_OVERLOAD_RETRY_DELAYS_MS.length
+        ) {
+          throw error;
+        }
+        const baseDelay = CODEX_OVERLOAD_RETRY_DELAYS_MS[attempt];
+        const jitter = crypto.randomInt(0, Math.max(1, Math.floor(baseDelay / 4)));
+        await waitForMilliseconds(baseDelay + jitter);
+      }
+    }
+    throw lastError;
   }
 
   rawRequest(method, params) {
@@ -2142,6 +2914,7 @@ class CodexGatewaySession {
     this.threadSource = codexThreadSourceForRequest(req);
     this.ephemeralThread = this.threadSource === 'subagent';
     this.threadId = null;
+    this.actualModel = this.route.upstreamModel;
     this.pendingToolCall = null;
     this.activeBoundary = null;
     this.interBoundaryListeners = null;
@@ -2262,25 +3035,20 @@ class CodexGatewaySession {
       return own;
     }
 
-    const shared = Number(this.contextWindows?.get(this.route.upstreamModel) || 0);
+    const shared = Number(this.contextWindows?.get(this.actualModel) || 0);
     return shared > 0 ? shared : 0;
   }
 
   inputMaxTokens() {
-    return effectiveCodexInputMaxTokens(this.config, this.knownModelContextWindow());
+    return effectiveCodexInputMaxTokens(
+      this.config,
+      this.route,
+      this.knownModelContextWindow()
+    );
   }
 
   bootstrapInputMaxTokens() {
-    const budget = this.inputMaxTokens();
-    const recycleLimit = codexRecycleContextLimit(this.config, this.knownModelContextWindow());
-    if (!Number.isFinite(recycleLimit)) {
-      return budget;
-    }
-
-    // Keep bootstrap transcript replays strictly below the recycle threshold
-    // so a freshly recycled session cannot land above it and thrash into
-    // recycling again on its next turn.
-    return Math.min(budget, Math.max(1, Math.floor(recycleLimit * CODEX_BOOTSTRAP_RECYCLE_HEADROOM)));
+    return this.inputMaxTokens();
   }
 
   resetToolResultWindow(reason, tracer = null) {
@@ -2297,11 +3065,17 @@ class CodexGatewaySession {
 
   applyTokenUsage(tokenUsagePayload, usageBaseline, turnId, tracer = null) {
     const tokenUsage = normalizeCodexTokenUsage(tokenUsagePayload);
-    const usage = tokenUsage.last || usageDelta(tokenUsage.total, usageBaseline);
+    // `total` is cumulative for the app-server thread; subtract the boundary
+    // baseline to capture every upstream response in this Claude turn. `last`
+    // is only the final Responses API completion and can undercount turns that
+    // compact, retry internally, or invoke built-in control work.
+    const usage = tokenUsage.total
+      ? usageDelta(tokenUsage.total, usageBaseline)
+      : tokenUsage.last || emptyUsage();
     this.latestTotalUsage = tokenUsage.total || addUsage(usageBaseline, usage);
     if (tokenUsage.model_context_window) {
       this.modelContextWindow = tokenUsage.model_context_window;
-      this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
+      this.contextWindows?.set(this.actualModel, tokenUsage.model_context_window);
     }
 
     // Prefer the per-turn snapshot (tracks shrinkage after app-server
@@ -2374,6 +3148,19 @@ class CodexGatewaySession {
     return usage;
   }
 
+  rejectUnhandledServerRequest(message) {
+    if (message?.id === undefined) {
+      return;
+    }
+    this.connection.send({
+      id: message.id,
+      error: {
+        code: JSON_RPC_METHOD_NOT_FOUND,
+        message: `Method not found: ${message.method || 'unknown'}`,
+      },
+    });
+  }
+
   rejectParallelToolCall(message, turnId, tracer = null) {
     if (
       !this.pendingToolCall ||
@@ -2431,7 +3218,9 @@ class CodexGatewaySession {
       this.applyTokenUsage(message.params.tokenUsage, usageBaseline, turnId, tracer);
     };
     const serverRequest = (message) => {
-      this.rejectParallelToolCall(message, turnId, tracer);
+      if (!this.rejectParallelToolCall(message, turnId, tracer)) {
+        this.rejectUnhandledServerRequest(message);
+      }
     };
     const error = () => {
       this.stopInterBoundaryCapture();
@@ -2446,6 +3235,15 @@ class CodexGatewaySession {
     return this.bootstrapMode || 'transcript';
   }
 
+  transcriptRenderOptions() {
+    return {
+      readInlineMaxBytes: Math.min(
+        codexToolResultMaxBytes(this.config),
+        codexReadInlineMaxBytes(this.config, this.route)
+      ),
+    };
+  }
+
   isTranscriptContinuous(requestBody) {
     return matchesContinuityAnchor(requestBody, this.transcriptAnchor);
   }
@@ -2457,16 +3255,17 @@ class CodexGatewaySession {
   prepareInitialTurnInput(requestBody) {
     const maxTokens = this.bootstrapInputMaxTokens();
     const mode = this.initialInputMode();
+    const renderOptions = this.transcriptRenderOptions();
     if (mode === 'latest') {
-      const text = renderLatestUserTranscriptInput(requestBody, maxTokens);
-      const renderedMessages = renderedTranscriptMessages(requestBody);
+      const text = renderLatestUserTranscriptInput(requestBody, maxTokens, renderOptions);
+      const renderedMessages = renderedTranscriptMessages(requestBody, renderOptions);
       return {
         text,
         summary: summarizeLatestTurnInput(requestBody, text, maxTokens, renderedMessages),
       };
     }
 
-    return renderTranscriptInputWithSummary(requestBody, maxTokens);
+    return renderTranscriptInputWithSummary(requestBody, maxTokens, renderOptions);
   }
 
   prepareTurnInput(requestBody, threadExists) {
@@ -2476,7 +3275,10 @@ class CodexGatewaySession {
 
     const maxTokens = this.inputMaxTokens();
     const text = limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
-    const renderedMessages = renderedTranscriptMessages(requestBody);
+    const renderedMessages = renderedTranscriptMessages(
+      requestBody,
+      this.transcriptRenderOptions()
+    );
     return {
       text,
       summary: summarizeLatestTurnInput(requestBody, text, maxTokens, renderedMessages),
@@ -2522,7 +3324,12 @@ class CodexGatewaySession {
       return;
     }
 
-    const threadConfig = codexThreadConfigOverrides(this.config, this.route);
+    await this.connection.readyPromise;
+    const threadConfig = codexThreadConfigOverrides(
+      this.config,
+      this.route,
+      this.connection.dynamicToolsOnlyConfigOverrides
+    );
     const threadStartParams = {
       model: this.route.upstreamModel,
       cwd: this.config.codex.cwd,
@@ -2530,49 +3337,28 @@ class CodexGatewaySession {
       sandbox: this.route.sandbox,
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
-      // Raw response events expose exact per-response usage. Codex emits the
-      // completion before it drains dynamic-tool futures, so the subsequent
-      // item/tool/call itself is the usable Claude boundary.
-      experimentalRawEvents: true,
       serviceName: 'claude_workflow_gateway',
       threadSource: this.threadSource,
       ...(Object.keys(threadConfig).length > 0 ? { config: threadConfig } : {}),
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
-      ...(this.config.codex.dynamicToolsOnly === true ? { environments: [] } : {}),
+      ...(this.config.codex.dynamicToolsOnly === true
+        ? { environments: [], selectedCapabilityRoots: [] }
+        : {}),
     };
-    let result = null;
-    try {
-      result = await this.connection.request('thread/start', threadStartParams);
-    } catch (error) {
-      if (
-        !/experimentalRawEvents|experimental raw events|unknown field|invalid params/iu.test(
-          error?.message || ''
-        )
-      ) {
-        throw error;
-      }
-
-      // Older app-server builds may reject the experimental field instead of
-      // ignoring it. Retry once without the field; tool boundaries do not
-      // depend on raw events.
-      traceLog(this.tracer, 'codex.thread.raw_events_unsupported', {
-        error_message: error?.message || String(error),
-      });
-      const legacyThreadStartParams = { ...threadStartParams };
-      delete legacyThreadStartParams.experimentalRawEvents;
-      result = await this.connection.request('thread/start', legacyThreadStartParams);
-    }
+    const result = await this.connection.request('thread/start', threadStartParams);
 
     this.threadId = result.thread?.id || null;
     if (!this.threadId) {
       throw new GatewayError(502, 'api_error', 'Codex app-server did not return a thread id');
     }
+    this.actualModel = result.model || this.route.upstreamModel;
 
     traceLog(this.tracer, 'codex.thread.started', {
       thread_id: this.threadId,
       thread_source: this.threadSource,
       ephemeral_thread: this.ephemeralThread,
       dynamic_tools_only: this.config.codex.dynamicToolsOnly === true,
+      actual_model: this.actualModel,
       thread_config: threadConfig,
     });
   }
@@ -2592,7 +3378,6 @@ class CodexGatewaySession {
       model_context_window: contextWindow || null,
       input_max_tokens: this.inputMaxTokens(),
       bootstrap_input_max_tokens: this.bootstrapInputMaxTokens(),
-      recycle_context_limit: codexRecycleContextLimit(this.config, contextWindow),
       tool_result_window_bytes: this.toolResultWindowBytes,
       tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
         ? toolResultWindowMaxBytes
@@ -2622,27 +3407,23 @@ class CodexGatewaySession {
       throw new GatewayError(500, 'api_error', 'no pending Codex tool call exists');
     }
 
-    const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
-    const readFeedback = appendReadToolResultFeedback(
-      rawToolResult.text,
-      this.pendingToolCall,
-      rawToolResult.isError
-    );
     const toolResultMaxBytes = codexToolResultMaxBytes(this.config);
     const toolResultWindowMaxBytes = codexToolResultWindowMaxBytes(this.config);
+    const readInlineMaxBytes = isReadToolName(this.pendingToolCall.tool)
+      ? codexReadInlineMaxBytes(this.config, this.route)
+      : Number.POSITIVE_INFINITY;
     const toolResultWindowRemainingBytes = Number.isFinite(toolResultWindowMaxBytes)
       ? Math.max(0, toolResultWindowMaxBytes - this.toolResultWindowBytes)
       : Number.POSITIVE_INFINITY;
     const effectiveToolResultMaxBytes = Math.min(
       toolResultMaxBytes,
-      toolResultWindowRemainingBytes
+      toolResultWindowRemainingBytes,
+      readInlineMaxBytes
     );
-    const limitedToolResult = limitCodexToolResultText(
-      readFeedback.text,
-      effectiveToolResultMaxBytes,
-      {
-        toolName: this.pendingToolCall.tool,
-      }
+    const { rawToolResult, readFeedback, limitedToolResult } = prepareCodexToolResult(
+      requestBody,
+      this.pendingToolCall,
+      effectiveToolResultMaxBytes
     );
     // Current Codex applies its model's token-aware function-output policy
     // when it records dynamic-tool results. Do not pre-truncate the response
@@ -2666,6 +3447,7 @@ class CodexGatewaySession {
       tool_result_truncated: limitedToolResult.truncated,
       tool_result_input_budget_truncated: false,
       tool_result_max_bytes: Number.isFinite(toolResultMaxBytes) ? toolResultMaxBytes : null,
+      read_inline_max_bytes: Number.isFinite(readInlineMaxBytes) ? readInlineMaxBytes : null,
       tool_result_window_bytes: this.toolResultWindowBytes,
       tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
         ? toolResultWindowMaxBytes
@@ -2677,6 +3459,9 @@ class CodexGatewaySession {
         ? effectiveToolResultMaxBytes
         : null,
       read_tool_result: limitedToolResult.readToolResult === true,
+      read_coverage_verified: limitedToolResult.readCoverageVerified === true,
+      read_notice_status: limitedToolResult.readNoticeStatus || 'none',
+      read_page_metadata: limitedToolResult.readPageMetadata || null,
       read_result_feedback: readFeedback.feedback,
       read_sanitization: readSanitizationTrace(this.pendingToolCall.readSanitization),
       is_error: toolResult.isError,
@@ -2799,6 +3584,7 @@ class CodexGatewaySession {
 
     const cleanup = () => {
       clearImmediate(toolUseSettleHandle);
+      clearImmediate(agentTextFlushHandle);
       this.connection.off('notification', onNotification);
       this.connection.off('server-request', onServerRequest);
       this.connection.off('error', onError);
@@ -2806,12 +3592,18 @@ class CodexGatewaySession {
 
     const agentMessages = new Map();
     const agentMessageOrder = [];
-    let agentTextEmitted = false;
+    let streamedAgentMessageId = null;
+    let streamedAgentText = '';
     let rawUsageObserved = false;
     let toolUseSettleHandle = null;
+    let agentTextFlushHandle = null;
 
     const normalizeAgentMessagePhase = (phase) => {
       return phase === undefined || phase === null ? null : String(phase);
+    };
+
+    const normalizeAgentMessageDelivery = (delivery) => {
+      return delivery === undefined || delivery === null ? null : String(delivery);
     };
 
     const agentMessageRecord = (itemId) => {
@@ -2821,6 +3613,7 @@ class CodexGatewaySession {
         record = {
           id,
           phase: null,
+          delivery: null,
           text: '',
         };
         agentMessages.set(id, record);
@@ -2830,13 +3623,31 @@ class CodexGatewaySession {
     };
 
     const selectedAgentMessage = () => {
+      if (streamedAgentMessageId !== null) {
+        const streamedRecord = agentMessages.get(streamedAgentMessageId);
+        if (
+          streamedRecord &&
+          streamedRecord.delivery !== 'async' &&
+          (streamedRecord.phase === 'final_answer' || streamedRecord.phase === null)
+        ) {
+          return streamedRecord;
+        }
+        return null;
+      }
+
       for (let index = agentMessageOrder.length - 1; index >= 0; index -= 1) {
-        if (agentMessageOrder[index].phase === 'final_answer') {
+        if (
+          agentMessageOrder[index].delivery !== 'async' &&
+          agentMessageOrder[index].phase === 'final_answer'
+        ) {
           return agentMessageOrder[index];
         }
       }
       for (let index = agentMessageOrder.length - 1; index >= 0; index -= 1) {
-        if (agentMessageOrder[index].phase === null) {
+        if (
+          agentMessageOrder[index].delivery !== 'async' &&
+          agentMessageOrder[index].phase === null
+        ) {
           return agentMessageOrder[index];
         }
       }
@@ -2848,14 +3659,53 @@ class CodexGatewaySession {
       return boundary.text;
     };
 
-    const emitSelectedAgentText = (text) => {
-      if (!text || agentTextEmitted) {
+    const emitSelectedAgentTextSuffix = () => {
+      const selected = selectedAgentMessage();
+      if (!selected || !selected.text) {
         return;
       }
-      agentTextEmitted = true;
+
+      if (streamedAgentMessageId === null) {
+        streamedAgentMessageId = selected.id;
+      }
+      if (selected.id !== streamedAgentMessageId) {
+        return;
+      }
+
+      const text = String(selected.text);
+      if (!text.startsWith(streamedAgentText)) {
+        traceLog(tracer, 'codex.agent_message.stream_diverged', {
+          turn_id: turnId,
+          item_id: selected.id,
+          emitted_chars: streamedAgentText.length,
+          completed_chars: text.length,
+        });
+        return;
+      }
+
+      const suffix = text.slice(streamedAgentText.length);
+      if (!suffix) {
+        return;
+      }
+      streamedAgentText = text;
+      boundary.text = text;
       boundary.emit({
         type: 'text_delta',
-        text,
+        text: suffix,
+      });
+    };
+
+    const scheduleSelectedAgentTextSuffix = () => {
+      if (agentTextFlushHandle !== null) {
+        return;
+      }
+      // Coalesce notifications already buffered in the same stdout turn. This
+      // preserves phase selection when a superseding final item is delivered
+      // in the same app-server batch while still streaming live deltas on the
+      // next event-loop turn.
+      agentTextFlushHandle = setImmediate(() => {
+        agentTextFlushHandle = null;
+        emitSelectedAgentTextSuffix();
       });
     };
 
@@ -2889,7 +3739,7 @@ class CodexGatewaySession {
       }
 
       cleanup();
-      emitSelectedAgentText(outcome.text);
+      emitSelectedAgentTextSuffix();
       if (outcome.type === 'tool_use') {
         this.captureInterBoundaryEvents(turnId, boundary.usageBaseline, tracer);
       }
@@ -2919,6 +3769,60 @@ class CodexGatewaySession {
 
     const onNotification = (message) => {
       if (
+        message.method === 'model/rerouted' &&
+        message.params?.threadId === this.threadId &&
+        message.params?.turnId === turnId
+      ) {
+        const previousModel = this.actualModel;
+        const nextModel = String(message.params?.toModel || '').trim();
+        if (nextModel) {
+          this.actualModel = nextModel;
+          this.modelContextWindow = Number(this.contextWindows?.get(nextModel) || 0);
+        }
+        traceLog(tracer, 'codex.model.rerouted', {
+          turn_id: turnId,
+          from_model: message.params?.fromModel || previousModel,
+          to_model: nextModel || previousModel,
+          reason: message.params?.reason || null,
+        });
+        return;
+      }
+
+      if (message.method === 'error' && message.params?.turnId === turnId) {
+        const willRetry = message.params?.willRetry === true;
+        const turnError = codexTurnGatewayError(
+          message.params?.error,
+          'Codex app-server reported a turn error'
+        );
+        traceLog(tracer, 'codex.turn.error', {
+          turn_id: turnId,
+          will_retry: willRetry,
+          codex_error_type: turnError.codexErrorType || null,
+          error_message: turnError.message,
+        });
+        if (!willRetry) {
+          failBoundary(turnError);
+        }
+        return;
+      }
+
+      if (
+        (message.method === 'item/started' || message.method === 'item/completed') &&
+        message.params?.turnId === turnId &&
+        message.params?.item?.type === 'contextCompaction'
+      ) {
+        const completed = message.method === 'item/completed';
+        if (completed) {
+          this.resetToolResultWindow('context_compaction', tracer);
+        }
+        traceLog(tracer, `codex.context_compaction.${completed ? 'completed' : 'started'}`, {
+          turn_id: turnId,
+          item_id: message.params?.item?.id || null,
+        });
+        return;
+      }
+
+      if (
         message.method === 'item/started' &&
         message.params?.turnId === turnId &&
         message.params?.item?.type === 'agentMessage'
@@ -2928,10 +3832,14 @@ class CodexGatewaySession {
         if (Object.hasOwn(item, 'phase')) {
           record.phase = normalizeAgentMessagePhase(item.phase);
         }
+        if (Object.hasOwn(item, 'delivery')) {
+          record.delivery = normalizeAgentMessageDelivery(item.delivery);
+        }
         if (typeof item.text === 'string' && item.text !== '') {
           record.text = item.text;
         }
         refreshSelectedAgentText();
+        scheduleSelectedAgentTextSuffix();
         return;
       }
 
@@ -2941,6 +3849,7 @@ class CodexGatewaySession {
         if (text) {
           record.text += text;
           refreshSelectedAgentText();
+          scheduleSelectedAgentTextSuffix();
         }
         return;
       }
@@ -2955,10 +3864,14 @@ class CodexGatewaySession {
         if (Object.hasOwn(item, 'phase')) {
           record.phase = normalizeAgentMessagePhase(item.phase);
         }
+        if (Object.hasOwn(item, 'delivery')) {
+          record.delivery = normalizeAgentMessageDelivery(item.delivery);
+        }
         if (typeof item.text === 'string') {
           record.text = item.text;
         }
         refreshSelectedAgentText();
+        scheduleSelectedAgentTextSuffix();
         return;
       }
 
@@ -3012,10 +3925,9 @@ class CodexGatewaySession {
       const turn = message.params.turn;
       if (turn.status !== 'completed') {
         failBoundary(
-          new GatewayError(
-            502,
-            'api_error',
-            turn.error?.message || `Codex turn ended with status ${String(turn.status)}`
+          codexTurnGatewayError(
+            turn.error,
+            `Codex turn ended with status ${String(turn.status)}`
           )
         );
         return;
@@ -3029,6 +3941,7 @@ class CodexGatewaySession {
 
     const onServerRequest = (message) => {
       if (message.method !== 'item/tool/call' || message.params?.turnId !== turnId) {
+        this.rejectUnhandledServerRequest(message);
         return;
       }
 
@@ -3155,6 +4068,74 @@ class CodexGatewaySession {
     } finally {
       removeListener();
     }
+  }
+
+  async interrupt(reason = null) {
+    const boundary = this.activeBoundary;
+    if (!boundary || boundary.finished) {
+      return true;
+    }
+    if (!this.threadId || !boundary.turnId) {
+      return false;
+    }
+
+    const interrupted = await withTimeout(
+      this.connection
+        .request('turn/interrupt', {
+          threadId: this.threadId,
+          turnId: boundary.turnId,
+        })
+        .then(
+          function interruptAccepted() {
+            return true;
+          },
+          function interruptFailed() {
+            return false;
+          }
+        ),
+      CODEX_INTERRUPT_TIMEOUT_MS,
+      false
+    );
+    if (!interrupted) {
+      return false;
+    }
+
+    const boundarySettled = await withTimeout(
+      boundary.done.then(
+        function boundaryCompleted() {
+          return true;
+        },
+        function boundaryFailed() {
+          return true;
+        }
+      ),
+      CODEX_INTERRUPT_TIMEOUT_MS,
+      false
+    );
+    if (!boundarySettled || !boundary.finished) {
+      return false;
+    }
+
+    // Claude may discard a partially streamed turn after cancellation while
+    // Codex retains it in thread history. Keep the warm app-server process,
+    // but start the next request on a fresh Codex thread bootstrapped from
+    // Claude's authoritative transcript.
+    this.stopInterBoundaryCapture();
+    this.threadId = null;
+    this.actualModel = this.route.upstreamModel;
+    this.modelContextWindow = 0;
+    this.pendingToolCall = null;
+    this.activeBoundary = null;
+    this.transcriptAnchor = null;
+    this.bootstrapMode = 'transcript';
+    this.toolResultWindowBytes = 0;
+    this.latestTotalUsage = emptyUsage();
+    this.latestContextTokens = 0;
+    traceLog(this.tracer, 'codex.turn.interrupted', {
+      reason: reason?.message || 'gateway request aborted',
+      process_reused: true,
+    });
+    return true;
   }
 
   async close(reason = null) {
@@ -3361,6 +4342,7 @@ export class CodexSessionManager {
     if (
       session &&
       selection.selectionReason === 'canonical' &&
+      session.threadId &&
       session.isTranscriptContinuous?.(requestBody) === false
     ) {
       const divergedSession = session;
@@ -3382,32 +4364,6 @@ export class CodexSessionManager {
       session = null;
       // The current Claude request is authoritative after a rewind, branch, or
       // compaction. Seed a clean Codex thread from its bounded transcript.
-      options = { ...options, bootstrapMode: 'transcript' };
-    }
-
-    const pressure = session
-      ? this.contextPressureDecision(session, selection.selectionReason, requestBody)
-      : null;
-    if (pressure) {
-      traceLog(requestTracer || this.tracer, 'codex.session.recycled', {
-        session_key: selection.sessionKey,
-        selection_reason: selection.selectionReason,
-        context_tokens: pressure.contextTokens,
-        incoming_tokens: pressure.incomingTokens,
-        projected_live_tokens: pressure.projectedLiveTokens,
-        projected_tokens: pressure.projectedTokens,
-        recycle_limit: pressure.limit,
-        model_context_window: session.knownModelContextWindow?.() || null,
-        read_context: readRequestDiagnostics(requestBody, session.pendingToolCall),
-      });
-      this.sessions.delete(selection.sessionKey);
-      void this.trackSessionClosure(
-        session.close(new Error('recycled before Codex context window overflow'))
-      ).catch(function ignoreRecycledSessionCloseFailure() {});
-      session = null;
-      // The replacement must replay the bounded transcript even under a fork
-      // session key, whose default bootstrap mode ('latest') would silently
-      // drop all prior context.
       options = { ...options, bootstrapMode: 'transcript' };
     }
 
@@ -3558,10 +4514,13 @@ export class CodexSessionManager {
       .filter(Boolean)
       .join(', ');
 
-    return new GatewayError(
-      400,
-      'invalid_request_error',
-      `Codex context window exceeded${details ? ` (${details})` : ''}: ${error?.message || String(error)}`
+    return copyCodexErrorMetadata(
+      new GatewayError(
+        400,
+        'invalid_request_error',
+        `Codex context window exceeded${details ? ` (${details})` : ''}: ${error?.message || String(error)}`
+      ),
+      error
     );
   }
 
@@ -3590,50 +4549,6 @@ export class CodexSessionManager {
         ),
       });
     }
-  }
-
-  recycleContextTokenLimit(session) {
-    return codexRecycleContextLimit(this.config, session?.knownModelContextWindow?.() || 0);
-  }
-
-  contextPressureDecision(session, selectionReason, requestBody = null) {
-    // Only recycle when the session is between turns: a fresh replacement is
-    // bootstrapped from the bounded transcript replay, the same path used
-    // when an idle-expired session receives a follow-up tool result.
-    if (!RECYCLE_ELIGIBLE_SELECTION_REASONS.has(selectionReason)) {
-      return null;
-    }
-
-    if (session.routingReservation) {
-      return null;
-    }
-
-    if (session.activeBoundary && !session.activeBoundary.finished) {
-      return null;
-    }
-
-    const contextTokens = Number(session.latestContextTokens || 0);
-
-    // Project the incoming payload on top of the live context so a single
-    // oversized tool result cannot leap past the window in one turn.
-    const limit = this.recycleContextTokenLimit(session);
-    const incomingTokens = estimateIncomingRequestTokens(requestBody);
-    const projectedLiveTokens = contextTokens > 0 ? contextTokens + incomingTokens : 0;
-    if (projectedLiveTokens <= 0) {
-      return null;
-    }
-    const projectedTokens = projectedLiveTokens;
-    if (projectedTokens < limit) {
-      return null;
-    }
-
-    return {
-      contextTokens,
-      incomingTokens,
-      projectedLiveTokens,
-      projectedTokens,
-      limit,
-    };
   }
 
   canRecoverFromContextOverflow(error, options) {
@@ -3690,7 +4605,7 @@ export class CodexSessionManager {
 
   isEvictableFailure(error) {
     if (error instanceof GatewayError) {
-      return error.status >= 499 || isCodexContextWindowError(error);
+      return error.status >= 500 || isCodexContextWindowError(error);
     }
 
     return true;
@@ -3865,12 +4780,24 @@ export class CodexSessionManager {
       function onAbort() {
         const error = abortError();
         if (abortSessionOnSignal) {
-          void manager.abortSession(session.sessionKey, error).catch(function traceAbortFailure(closeError) {
-            traceLog(manager.tracer, 'codex.session.abort_cleanup_failed', {
-              session_key: session.sessionKey,
-              error_message: closeError?.message || String(closeError),
-            });
-          });
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          Promise.resolve(manager.abortSession(session.sessionKey, error)).then(
+            function abortComplete() {
+              reject(error);
+            },
+            function abortFailed(closeError) {
+              traceLog(manager.tracer, 'codex.session.abort_cleanup_failed', {
+                session_key: session.sessionKey,
+                error_message: closeError?.message || String(closeError),
+              });
+              reject(error);
+            }
+          );
+          return;
         }
         settle(reject, error);
       }
@@ -3903,6 +4830,15 @@ export class CodexSessionManager {
   async abortSession(sessionKey, reason) {
     const session = this.sessions.get(sessionKey);
     if (!session) {
+      return;
+    }
+
+    const interrupted = await session.interrupt?.(reason);
+    if (interrupted === true) {
+      traceLog(this.tracer, 'codex.session.abort_interrupted', {
+        session_key: sessionKey,
+        process_reused: true,
+      });
       return;
     }
 

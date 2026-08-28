@@ -47,8 +47,8 @@ export function bail(msg, err) {
   process.exit(1);
 }
 
-export async function runTest(label, fn) {
-  const guard = setTimeoutGuard(label, 30000);
+export async function runTest(label, fn, timeoutMs = 30000) {
+  const guard = setTimeoutGuard(label, timeoutMs);
   console.log(`# ${label}`);
   try {
     await fn();

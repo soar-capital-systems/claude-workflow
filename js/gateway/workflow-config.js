@@ -10,9 +10,11 @@ import crypto from 'node:crypto';
 import process from 'node:process';
 
 import { envFlag, loadGatewayConfig } from './config.js';
+import { resolveCodexCapabilities } from './codex-capabilities.js';
 import {
   ROUTE_ENTRY_REASONING_KEYS,
   ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
+  configuredRouteMapEntry,
   modelIdWithoutBracketQualifiers,
   resolveModelRoute,
   routeEntryValue,
@@ -28,27 +30,47 @@ import {
 } from '../utils/child-env.js';
 
 const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
-// Workflow-profile ceiling for the Codex input budget. The codex provider also
-// caps this against the live app-server window when one is reported.
-const WORKFLOW_CODEX_INPUT_MAX_TOKENS = 180_000;
-const WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR = 7;
-const WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR = 10;
+const WORKFLOW_CODEX_CONTEXT_PROFILE = 'long';
 // Current Codex app-server releases own token-aware tool-output truncation.
 // Avoid layering the gateway's byte heuristics on top for workflow sessions;
 // operators can still opt into either gateway cap with its existing env var.
 const WORKFLOW_CODEX_TOOL_RESULT_MAX_BYTES = 0;
 const WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES = 0;
 const GLM_AUTO_COMPACT_WINDOW = '1000000';
+const CLAUDE_NATIVE_MODEL_ALIASES = new Set([
+  'best',
+  'default',
+  'fable',
+  'haiku',
+  'inherit',
+  'opus',
+  'opusplan',
+  'sonnet',
+]);
+const CLAUDE_MODEL_ALIAS_PREFIXES = Object.freeze([
+  'ANTHROPIC_DEFAULT_FABLE',
+  'ANTHROPIC_DEFAULT_HAIKU',
+  'ANTHROPIC_DEFAULT_OPUS',
+  'ANTHROPIC_DEFAULT_SONNET',
+]);
 const MANAGED_PROVIDER_CLIENT_ENV_NAMES = Object.freeze([
+  'ANTHROPIC_CUSTOM_MODEL_OPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
 ]);
-export const DEFAULT_MAIN_MODEL_ID = 'claude-opus-5[1m]';
-export const FABLE_MAIN_MODEL_ID = 'claude-fable-5[1m]';
+// Opus 5 and Fable 5 expose their 1M windows natively. Keeping the canonical
+// API IDs avoids a redundant client-only qualifier and survives model-picker
+// and resume round trips unchanged.
+export const DEFAULT_MAIN_MODEL_ID = 'claude-opus-5';
+export const FABLE_MAIN_MODEL_ID = 'claude-fable-5';
 export const DEFAULT_SUBAGENT_REASONING_EFFORT = 'max';
-export const KIMI_MAIN_MODEL_ID = 'k3[1m]';
-export const QWEN_MAIN_MODEL_ID = `${QWEN_TOKEN_PLAN_DEFAULTS.model}[1m]`;
+export const KIMI_MAIN_MODEL_ID = 'k3';
+export const QWEN_MAIN_MODEL_ID = QWEN_TOKEN_PLAN_DEFAULTS.model;
 
 export function envString(name, fallback = '') {
   const value = process.env[name];
@@ -61,21 +83,10 @@ export function envString(name, fallback = '') {
 
 function displayRoutedModel() {
   if (envString('CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL')) {
-    return envFlag('CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL', true);
+    return envFlag('CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL', false);
   }
 
-  return envFlag('ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL', true);
-}
-
-function workflowAutoCompactTokenLimit(inputMaxTokens) {
-  const tokens = Number(inputMaxTokens);
-  if (!Number.isFinite(tokens) || tokens <= 0) {
-    return 0;
-  }
-
-  const scaledTokens =
-    (tokens * WORKFLOW_CODEX_AUTO_COMPACT_NUMERATOR) / WORKFLOW_CODEX_AUTO_COMPACT_DENOMINATOR;
-  return Math.max(1, Math.floor(scaledTokens));
+  return envFlag('ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL', false);
 }
 
 function defaultAnthropicPassthroughPattern(mainModelId) {
@@ -91,16 +102,14 @@ function routeModelAliases(modelId) {
   return dedupeStrings([normalized, strippedBracketQualifiers]);
 }
 
-function routeModelPatterns(modelId) {
+function routeModelFamilyFallbackPattern(modelId) {
   const aliases = routeModelAliases(modelId);
   const family = aliases[aliases.length - 1];
   // Dated variants of a Claude main model (e.g. claude-opus-5-20260724)
-  // follow the main route through the family wildcard.
-  if (family.startsWith('claude-')) {
-    return dedupeStrings([...aliases, `${family}*`]);
-  }
-
-  return aliases;
+  // follow the main route through a fallback family wildcard. User route-map
+  // wildcards are inserted before this fallback and therefore retain their
+  // documented precedence.
+  return family.startsWith('claude-') ? `${family}*` : '';
 }
 
 function dedupeStrings(values) {
@@ -216,7 +225,14 @@ function mainRouteDisplayName(provider) {
   }
 }
 
-function routedModelId(provider, upstreamModel, reasoningEffort, requestedModel) {
+function routedModelId(provider, upstreamModel, requestedModel) {
+  if (provider === 'anthropic') {
+    return (
+      modelIdWithoutBracketQualifiers(upstreamModel) ||
+      modelIdWithoutBracketQualifiers(requestedModel)
+    );
+  }
+
   const durableCodexTier =
     provider === 'codex'
       ? String(upstreamModel || '').match(/^gpt-\d+(?:\.\d+)*-(sol|terra|luna)$/u)?.[1]
@@ -225,11 +241,78 @@ function routedModelId(provider, upstreamModel, reasoningEffort, requestedModel)
     return `codex-${durableCodexTier}`;
   }
 
-  const effort = reasoningEffort ? `-${modelIdPart(reasoningEffort)}` : '';
-  return [
-    `${modelIdPart(provider)}-${modelIdPart(upstreamModel)}${effort}`,
-    modelIdPart(requestedModel),
-  ].join('-via-');
+  if (provider === 'codex') {
+    const upstream = modelIdPart(upstreamModel);
+    return upstream.startsWith('codex-') ? upstream : `codex-${upstream}`;
+  }
+
+  // First-class third-party model IDs (k3, qwen3.8-max, and similar) are
+  // already truthful and native-looking. Provider and effort remain available
+  // in picker descriptions, health data, traces, and opt-in response metadata.
+  return modelIdPart(upstreamModel || `${provider}-model`);
+}
+
+function assertTruthfulCustomModelId(
+  modelId,
+  route,
+  envName = 'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID'
+) {
+  const provider = routeProvider(route, '');
+  if (provider === 'anthropic') {
+    return;
+  }
+  const normalized = String(modelId || '').trim();
+  if (
+    /^(?:anthropic|claude)(?:[^A-Za-z0-9]|$)/iu.test(normalized) ||
+    /\[[^\]]+\]/u.test(normalized) ||
+    CLAUDE_NATIVE_MODEL_ALIASES.has(normalized.toLowerCase())
+  ) {
+    throw new Error(
+      `${envName} must be a truthful custom model ID without a Claude/Anthropic ` +
+        'prefix, native Claude alias, or bracket context qualifier; use codex-terra ' +
+      'or another concise non-Anthropic ID'
+    );
+  }
+  if (provider === 'codex' && /^codex-(?:sol|terra|luna|gpt-)/u.test(normalized)) {
+    const expected = routedModelId(
+      provider,
+      routeUpstreamModel(route, ''),
+      normalized
+    );
+    if (normalized !== expected) {
+      throw new Error(
+        `${envName}=${normalized} does not describe the resolved Codex model ` +
+          `${routeUpstreamModel(route, 'unknown')}; use ${expected} or leave the alias unset`
+      );
+    }
+  }
+}
+
+function codexCapabilitiesForRoute(config, route) {
+  return resolveCodexCapabilities({
+    command: config.codex.command,
+    model: routeUpstreamModel(route, config.codex.model),
+    contextProfile: config.codex.contextProfile,
+    requestedContextWindow: config.codex.requestedContextWindow,
+    reasoningEffort: routeReasoningEffort(route, config.codex.reasoningEffort),
+  });
+}
+
+function validateEffectiveCodexRoutes(config) {
+  for (const [modelId, route] of Object.entries(config.routeMap || {})) {
+    if (routeProvider(route, '') !== 'codex') {
+      continue;
+    }
+    const capabilities = codexCapabilitiesForRoute(config, route);
+    if (capabilities.effortSupported) {
+      continue;
+    }
+    const effort = routeReasoningEffort(route, config.codex.reasoningEffort);
+    throw new Error(
+      `Codex route ${modelId} uses ${capabilities.model} with unsupported reasoning ` +
+        `effort ${effort}; choose one of ${capabilities.reasoningEfforts.join(', ')}`
+    );
+  }
 }
 
 export function routeTargetSummary(route) {
@@ -263,21 +346,48 @@ export function buildWorkflowGatewayConfig({
   defaultPort = 0,
   port = null,
   host = null,
-  dynamicToolsOnly = false,
+  dynamicToolsOnly = true,
 } = {}) {
   const baseConfig = loadGatewayConfig();
-  const mainModelId = envString('ULTRATHINK_GATEWAY_MAIN_MODEL_ID', DEFAULT_MAIN_MODEL_ID);
+  const explicitMainModelId = envString('ULTRATHINK_GATEWAY_MAIN_MODEL_ID');
+  const configuredMainModelId = explicitMainModelId || DEFAULT_MAIN_MODEL_ID;
   const mainProvider = normalizedRouteProvider(
     envString('ULTRATHINK_GATEWAY_MAIN_PROVIDER', envString('CLAUDE_WORKFLOW_MAIN_PROVIDER'))
   );
+  // Legacy Kimi/Qwen presets used Claude's [1m] qualifier. Claude hard-codes
+  // that qualifier as exactly 1,000,000 tokens and ignores the truthful
+  // custom-model window, so normalize those persisted IDs at the boundary.
+  const normalizedMainModelId =
+    mainProvider === 'kimi' || mainProvider === 'qwen' || mainProvider === 'codex'
+      ? modelIdWithoutBracketQualifiers(configuredMainModelId)
+      : configuredMainModelId;
   const mainUpstreamModel = envString(
     'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL',
-    mainRouteDefaultModel(mainProvider, mainModelId, baseConfig)
+    mainRouteDefaultModel(mainProvider, normalizedMainModelId, baseConfig)
   );
   const mainReasoningEffort = envString(
     'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT',
     mainRouteDefaultReasoningEffort(mainProvider, baseConfig)
   );
+  // `codex` was the historical direct-main preset. Resolve it to the same
+  // concise, tier-specific ID used by Claude subagents so picker metadata,
+  // context policy, and wire routing all describe one model identity.
+  const candidateMainModelId =
+    mainProvider !== 'anthropic' && !explicitMainModelId
+      ? mainProvider === 'codex'
+        ? routedModelId(
+            mainProvider,
+            mainUpstreamModel,
+            normalizedMainModelId
+          )
+        : modelIdPart(mainUpstreamModel)
+      : mainProvider === 'codex' && normalizedMainModelId === 'codex'
+      ? routedModelId(
+          mainProvider,
+          mainUpstreamModel,
+          normalizedMainModelId
+        )
+      : normalizedMainModelId;
   const rawSubagentModelId = envString(
     'ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID',
     'claude-sonnet-5'
@@ -305,16 +415,69 @@ export function buildWorkflowGatewayConfig({
     displayName: 'Codex Subagent Route',
   };
   const baseRouteMap = baseConfig.routeMap || {};
-  const subagentRoute = baseRouteMap[rawSubagentModelId] || defaultSubagentRoute;
+  const generatedDefaultMainModelId = routedModelId(
+    mainProvider,
+    mainUpstreamModel,
+    normalizedMainModelId
+  );
+  const mainModelIdIsDerived =
+    mainProvider !== 'anthropic' &&
+    candidateMainModelId === generatedDefaultMainModelId;
+  const configuredCandidateMainRouteEntry = configuredRouteMapEntry(
+    candidateMainModelId,
+    baseConfig
+  );
+  const configuredCandidateMainRoute = configuredCandidateMainRouteEntry
+    ? resolveModelRoute(candidateMainModelId, baseConfig)
+    : defaultMainRoute;
+  const mainModelId = mainModelIdIsDerived
+    ? routedModelId(
+        routeProvider(configuredCandidateMainRoute, mainProvider),
+        routeUpstreamModel(configuredCandidateMainRoute, mainUpstreamModel),
+        candidateMainModelId
+      )
+    : candidateMainModelId;
+  const finalMainRouteEntry = configuredRouteMapEntry(mainModelId, baseConfig);
+  const configuredMainRoute = finalMainRouteEntry
+    ? resolveModelRoute(mainModelId, baseConfig)
+    : configuredCandidateMainRoute;
+  if (
+    mainModelId !== candidateMainModelId &&
+    finalMainRouteEntry &&
+    routeTargetSummary(configuredMainRoute) !==
+      routeTargetSummary(configuredCandidateMainRoute)
+  ) {
+    throw new Error(
+      `${mainModelId} resolves to ${routeTargetSummary(configuredMainRoute)}, but the ` +
+        `main route that generated that truthful ID resolves to ${routeTargetSummary(
+          configuredCandidateMainRoute
+        )}; remove the conflicting route-map alias`
+    );
+  }
+  const configuredRawSubagentRoute = configuredRouteMapEntry(
+    rawSubagentModelId,
+    baseConfig
+  );
+  const subagentRoute = configuredRawSubagentRoute
+    ? resolveModelRoute(rawSubagentModelId, baseConfig)
+    : defaultSubagentRoute;
   const displayModels = displayRoutedModel();
-  const codexInputMaxTokens = envString('ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS')
-    ? baseConfig.codex.inputMaxTokens
-    : WORKFLOW_CODEX_INPUT_MAX_TOKENS;
-  const codexAutoCompactTokenLimit = envString(
-    'ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT'
-  )
-    ? baseConfig.codex.autoCompactTokenLimit
-    : workflowAutoCompactTokenLimit(codexInputMaxTokens);
+  const codexContextExplicit =
+    envString('ULTRATHINK_GATEWAY_CODEX_CONTEXT') ||
+    envString('ULTRATHINK_GATEWAY_CODEX_CONTEXT_PROFILE');
+  const codexContextProfile = codexContextExplicit
+    ? baseConfig.codex.contextProfile
+    : WORKFLOW_CODEX_CONTEXT_PROFILE;
+  const codexCapabilities =
+    codexContextProfile === baseConfig.codex.capabilities?.profile
+      ? baseConfig.codex.capabilities
+      : resolveCodexCapabilities({
+          command: baseConfig.codex.command,
+          model: baseConfig.codex.model,
+          contextProfile: codexContextProfile,
+          requestedContextWindow: baseConfig.codex.requestedContextWindow,
+          reasoningEffort: baseConfig.codex.reasoningEffort,
+        });
   const codexToolResultMaxBytes = envString(
     'ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES'
   )
@@ -325,29 +488,93 @@ export function buildWorkflowGatewayConfig({
   )
     ? baseConfig.codex.toolResultWindowMaxBytes
     : WORKFLOW_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES;
-  const subagentModelId = displayModels
-    ? envString(
-        'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID',
-        routedModelId(
-          routeProvider(subagentRoute),
-          routeUpstreamModel(subagentRoute, subagentUpstreamModel),
-          routeReasoningEffort(subagentRoute, subagentReasoningEffort),
-          rawSubagentModelId
-        )
-      )
-    : rawSubagentModelId;
+  const explicitSubagentModelId = envString('CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID');
+  const candidateSubagentModelId =
+    explicitSubagentModelId ||
+    routedModelId(
+      routeProvider(subagentRoute),
+      routeUpstreamModel(subagentRoute, subagentUpstreamModel),
+      rawSubagentModelId
+    );
+  const configuredSubagentRouteEntry = configuredRouteMapEntry(
+    candidateSubagentModelId,
+    baseConfig
+  );
+  const configuredSubagentRoute = configuredSubagentRouteEntry
+    ? resolveModelRoute(candidateSubagentModelId, baseConfig)
+    : subagentRoute;
+  // Automatic IDs describe the route Claude will actually use, after both
+  // raw-model and generated-ID route-map overrides have been resolved. An
+  // explicit CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID remains operator-owned.
+  const subagentModelId = explicitSubagentModelId
+    ? explicitSubagentModelId
+    : routedModelId(
+        routeProvider(configuredSubagentRoute),
+        routeUpstreamModel(configuredSubagentRoute, subagentUpstreamModel),
+        candidateSubagentModelId
+      );
+  const finalSubagentRouteEntry = configuredRouteMapEntry(subagentModelId, baseConfig);
+  const finalSubagentRoute = finalSubagentRouteEntry
+    ? resolveModelRoute(subagentModelId, baseConfig)
+    : configuredSubagentRoute;
+  if (
+    subagentModelId !== candidateSubagentModelId &&
+    finalSubagentRouteEntry &&
+    routeTargetSummary(finalSubagentRoute) !== routeTargetSummary(configuredSubagentRoute)
+  ) {
+    throw new Error(
+      `${subagentModelId} resolves to ${routeTargetSummary(finalSubagentRoute)}, but the ` +
+        `route that generated that truthful ID resolves to ${routeTargetSummary(
+          configuredSubagentRoute
+        )}; remove the conflicting route-map alias`
+    );
+  }
+  const sharedMainAndSubagentId = mainModelId === subagentModelId;
+  if (
+    sharedMainAndSubagentId &&
+    routeTargetSummary(configuredMainRoute) !== routeTargetSummary(finalSubagentRoute)
+  ) {
+    throw new Error(
+      `${mainModelId} cannot identify different main and subagent routes; ` +
+        'set CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID to a distinct truthful model ID'
+    );
+  }
+  const resolvedDefaultMainRoute = sharedMainAndSubagentId
+    ? {
+        ...configuredMainRoute,
+        ...finalSubagentRoute,
+        displayName: 'Codex Main and Subagent Route',
+      }
+    : configuredMainRoute;
   const mainRouteMap = Object.fromEntries(
-    routeModelPatterns(mainModelId).map(function mapMainRoute(modelId) {
-      return [modelId, defaultMainRoute];
+    routeModelAliases(mainModelId).map(function mapMainRoute(modelId) {
+      return [modelId, resolvedDefaultMainRoute];
     })
   );
+  const mainFamilyFallbackPattern = routeModelFamilyFallbackPattern(mainModelId);
+  const mainFamilyFallbackRouteMap =
+    mainFamilyFallbackPattern && !Object.hasOwn(baseRouteMap, mainFamilyFallbackPattern)
+      ? { [mainFamilyFallbackPattern]: resolvedDefaultMainRoute }
+      : {};
   const routeMap = {
-    [rawSubagentModelId]: defaultSubagentRoute,
-    [subagentModelId]: subagentRoute,
-    ...mainRouteMap,
+    [rawSubagentModelId]: subagentRoute,
+    [candidateSubagentModelId]: configuredSubagentRoute,
     ...baseRouteMap,
+    [subagentModelId]: finalSubagentRoute,
+    [candidateMainModelId]: configuredCandidateMainRoute,
+    ...mainRouteMap,
+    // Keep the generated family wildcard behind every user entry so a
+    // documented user wildcard cannot be shadowed by workflow defaults.
+    ...mainFamilyFallbackRouteMap,
   };
+  const selectedSubagentRoute = routeMap[subagentModelId] || finalSubagentRoute;
+  assertTruthfulCustomModelId(subagentModelId, selectedSubagentRoute);
   const resolvedMainProvider = routeProvider(routeMap[mainModelId], mainProvider);
+  assertTruthfulCustomModelId(
+    mainModelId,
+    routeMap[mainModelId],
+    'ULTRATHINK_GATEWAY_MAIN_MODEL_ID'
+  );
   const hasKimiRoute = Object.values(routeMap).some(function usesKimi(route) {
     return routeProvider(route, '') === 'kimi';
   });
@@ -416,37 +643,46 @@ export function buildWorkflowGatewayConfig({
     );
   }
 
-  return {
-    config: {
-      ...baseConfig,
-      sharedSecret,
-      host: host ?? envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
-      port: port ?? parseRequestedPort(defaultPort),
-      displayRoutedModel: displayModels,
-      routeMap,
-      anthropicPassthroughModels,
-      codex: {
-        ...baseConfig.codex,
-        dynamicToolsOnly: Boolean(dynamicToolsOnly),
-        idleTimeoutMs: envString('ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS')
-          ? baseConfig.codex.idleTimeoutMs
-          : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
-        inputMaxTokens: codexInputMaxTokens,
-        autoCompactTokenLimit: codexAutoCompactTokenLimit,
-        toolResultMaxBytes: codexToolResultMaxBytes,
-        toolResultWindowMaxBytes: codexToolResultWindowMaxBytes,
-      },
-      exposedModels: dedupeStrings([
-        ...routeModelAliases(mainModelId),
-        rawSubagentModelId,
-        subagentModelId,
-        ...(baseConfig.exposedModels || []),
-      ]),
+  const config = {
+    ...baseConfig,
+    sharedSecret,
+    host: host ?? envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
+    port: port ?? parseRequestedPort(defaultPort),
+    displayRoutedModel: displayModels,
+    routeMap,
+    anthropicPassthroughModels,
+    codex: {
+      ...baseConfig.codex,
+      contextProfile: codexContextProfile,
+      capabilities: codexCapabilities,
+      dynamicToolsOnly: Boolean(dynamicToolsOnly),
+      idleTimeoutMs: envString('ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS')
+        ? baseConfig.codex.idleTimeoutMs
+        : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
+      toolResultMaxBytes: codexToolResultMaxBytes,
+      toolResultWindowMaxBytes: codexToolResultWindowMaxBytes,
     },
+    exposedModels: dedupeStrings([
+      ...routeModelAliases(mainModelId),
+      rawSubagentModelId,
+      subagentModelId,
+      ...(baseConfig.exposedModels || []),
+    ]),
+  };
+  validateEffectiveCodexRoutes(config);
+  const effectiveSubagentRoute = resolveModelRoute(subagentModelId, config);
+  const subagentCapabilities =
+    routeProvider(effectiveSubagentRoute, '') === 'codex'
+      ? codexCapabilitiesForRoute(config, effectiveSubagentRoute)
+      : null;
+
+  return {
+    config,
     mainModelId,
     subagentModelId,
     rawSubagentModelId,
-    subagentRoute,
+    subagentRoute: effectiveSubagentRoute,
+    subagentCapabilities,
   };
 }
 
@@ -469,11 +705,65 @@ export function buildWorkflowClientEnv(
   }
   clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME] = null;
 
-  if (routeMapUsesProvider(config, 'glm')) {
+  const mainRoute = resolveModelRoute(mainModelId, config);
+  const subagentRoute = resolveModelRoute(subagentModelId, config);
+  const routedContextContracts = [mainRoute, subagentRoute]
+    .map((route) => routeContextContract(config, route))
+    .filter(Boolean);
+  if (routedContextContracts.length > 0) {
+    clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(
+      Math.min(...routedContextContracts.map((contract) => contract.usableContextTokens))
+    );
+    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(
+      Math.min(...routedContextContracts.map((contract) => contract.autoCompactTokens))
+    );
+  } else if (routeMapUsesProvider(config, 'glm')) {
     clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = GLM_AUTO_COMPACT_WINDOW;
   }
 
-  const mainRoute = resolveModelRoute(mainModelId, config);
+  const customModelRoute = routeProvider(mainRoute, '') === 'anthropic' ? subagentRoute : mainRoute;
+  const customModelId = routeProvider(mainRoute, '') === 'anthropic' ? subagentModelId : mainModelId;
+  if (routeProvider(customModelRoute, '') !== 'anthropic') {
+    clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION = customModelId;
+    clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = customModelName(customModelRoute);
+    clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION =
+      `${routeTargetSummary(customModelRoute)} through claude-workflow`;
+    clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES =
+      customModelSupportedCapabilities(config, customModelRoute);
+  }
+
+  const subagentProvider = routeProvider(subagentRoute, '');
+  const subagentName = customModelName(subagentRoute);
+  const subagentDescription = `${routeTargetSummary(subagentRoute)} through claude-workflow`;
+  const subagentSupportedCapabilities =
+    subagentProvider === 'anthropic'
+      ? null
+      : customModelSupportedCapabilities(config, subagentRoute);
+  for (const prefix of CLAUDE_MODEL_ALIAS_PREFIXES) {
+    const aliasModelName = `${prefix}_MODEL`;
+    const describesSubagent =
+      subagentProvider !== 'anthropic' && clientEnv[aliasModelName] === subagentModelId;
+    clientEnv[`${prefix}_MODEL_NAME`] = describesSubagent ? subagentName : null;
+    clientEnv[`${prefix}_MODEL_DESCRIPTION`] = describesSubagent
+      ? subagentDescription
+      : null;
+    clientEnv[`${prefix}_MODEL_SUPPORTED_CAPABILITIES`] = describesSubagent
+      ? subagentSupportedCapabilities
+      : null;
+  }
+
+  const clientEffort = routeReasoningEffort(
+    routeProvider(mainRoute, '') === 'codex' ? mainRoute : subagentRoute,
+    DEFAULT_SUBAGENT_REASONING_EFFORT
+  );
+  if (clientEffort) {
+    clientEnv.CLAUDE_CODE_EFFORT_LEVEL = clientEffort;
+  }
+  // Claude may fall back from a broken stream to a non-streaming retry. A tool
+  // turn is not safely replayable, so keep one intended boundary to one
+  // provider request and surface the transport failure instead.
+  clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = '1';
+
   if (mainRoute.suppressTerminalTitleRequest) {
     // Claude Code otherwise spends a second provider request generating a
     // terminal title. Direct third-party routes should make one request for a
@@ -481,17 +771,9 @@ export function buildWorkflowClientEnv(
     clientEnv[CLAUDE_TERMINAL_TITLE_ENV_NAME] = '1';
   }
   if (routeProvider(mainRoute, '') === 'kimi') {
-    const contextTokens = String(mainRoute.contextTokens || 1_048_576);
-    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;
-    clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = contextTokens;
     clientEnv.CLAUDE_CODE_EFFORT_LEVEL = routeReasoningEffort(mainRoute, 'max');
   }
   if (routeProvider(mainRoute, '') === 'qwen') {
-    const contextTokens = String(
-      mainRoute.contextTokens || QWEN_TOKEN_PLAN_DEFAULTS.contextTokens
-    );
-    clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW = contextTokens;
-    clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS = contextTokens;
     clientEnv.CLAUDE_CODE_EFFORT_LEVEL = mainRoute.claudeEffort || 'max';
   }
 
@@ -502,6 +784,127 @@ export function buildWorkflowClientEnv(
   }
 
   return clientEnv;
+}
+
+function customModelName(route) {
+  const provider = routeProvider(route, '');
+  if (provider === 'codex') {
+    const tier = String(routeUpstreamModel(route, '')).match(/-(sol|terra|luna)$/u)?.[1];
+    return tier ? `Codex ${tier[0].toUpperCase()}${tier.slice(1)}` : 'Codex';
+  }
+  return route.displayName || mainRouteDisplayName(provider);
+}
+
+function customModelSupportedCapabilities(config, route) {
+  const capabilities = ['effort'];
+  const provider = routeProvider(route, '');
+  if (provider === 'codex') {
+    const supportedEfforts = new Set(
+      codexCapabilitiesForRoute(config, route).reasoningEfforts
+    );
+    if (supportedEfforts.has('xhigh')) {
+      capabilities.push('xhigh_effort');
+    }
+    if (supportedEfforts.has('max')) {
+      capabilities.push('max_effort');
+    }
+  } else {
+    capabilities.push('xhigh_effort', 'max_effort');
+  }
+  if (
+    provider === 'kimi' ||
+    route?.preserveAssistantThinking === true ||
+    route?.preserveThinking === true
+  ) {
+    capabilities.push('thinking', 'adaptive_thinking', 'interleaved_thinking');
+  }
+  return capabilities.join(',');
+}
+
+function modelPickerLabel(modelId, route) {
+  const provider = routeProvider(route, '');
+  if (provider === 'codex') {
+    return customModelName(route);
+  }
+  if (provider === 'kimi') {
+    return 'Kimi K3';
+  }
+  if (provider === 'qwen') {
+    return 'Qwen 3.8 Max';
+  }
+  if (provider === 'anthropic') {
+    const normalized = modelIdWithoutBracketQualifiers(modelId);
+    for (const [pattern, label] of [
+      [/^claude-fable-5(?:-|$)/u, 'Fable 5'],
+      [/^claude-opus-5(?:-|$)/u, 'Opus 5'],
+      [/^claude-sonnet-5(?:-|$)/u, 'Sonnet 5'],
+    ]) {
+      if (pattern.test(normalized)) {
+        return label;
+      }
+    }
+  }
+  return route.displayName || modelId;
+}
+
+function modelPickerDescription(modelId, route) {
+  if (routeProvider(route, '') === 'anthropic') {
+    return `Anthropic ${modelIdWithoutBracketQualifiers(modelId)}`;
+  }
+  return `${routeTargetSummary(route)} through Claude Workflow`;
+}
+
+export function buildWorkflowModelPicker(config, mainModelId, subagentModelId) {
+  const options = dedupeStrings([mainModelId, subagentModelId]).map(function modelRow(
+    modelId
+  ) {
+    const route = resolveModelRoute(modelId, config);
+    return {
+      model: modelId,
+      label: modelPickerLabel(modelId, route),
+      description: modelPickerDescription(modelId, route),
+    };
+  });
+  return {
+    options,
+    replaceBuiltInOptions: true,
+  };
+}
+
+function routeContextContract(config, route) {
+  switch (routeProvider(route, '')) {
+    case 'codex': {
+      const model = routeUpstreamModel(route, config.codex.model);
+      const capabilities =
+        model === config.codex.capabilities?.model
+          ? config.codex.capabilities
+          : resolveCodexCapabilities({
+              command: config.codex.command,
+              model,
+              contextProfile: config.codex.contextProfile,
+              requestedContextWindow: config.codex.requestedContextWindow,
+              reasoningEffort: routeReasoningEffort(route, config.codex.reasoningEffort),
+            });
+      return {
+        usableContextTokens: capabilities.usableContextTokens,
+        autoCompactTokens: capabilities.autoCompactTokens,
+      };
+    }
+    case 'kimi': {
+      const tokens = Number(route.contextTokens || config.kimi?.contextTokens || 0);
+      return tokens > 0
+        ? { usableContextTokens: Math.trunc(tokens), autoCompactTokens: Math.trunc(tokens) }
+        : null;
+    }
+    case 'qwen': {
+      const tokens = Number(route.contextTokens || config.qwen?.contextTokens || 0);
+      return tokens > 0
+        ? { usableContextTokens: Math.trunc(tokens), autoCompactTokens: Math.trunc(tokens) }
+        : null;
+    }
+    default:
+      return null;
+  }
 }
 
 function routeMapUsesProvider(config, provider) {

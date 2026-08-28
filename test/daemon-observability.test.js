@@ -203,9 +203,11 @@ async function testDaemonRevisionAndHealth() {
     assert.equal(typeof firstHealth.codex_tool_result_max_bytes, 'number');
     assert.equal(typeof firstHealth.codex_tool_result_window_max_bytes, 'number');
     assert.equal(typeof firstHealth.codex_auto_compact_token_limit, 'number');
-    assert.equal(typeof firstHealth.codex_auto_compact_token_limit_scope, 'string');
+    assert.equal(firstHealth.codex_auto_compact_token_limit_scope, null);
     assert.equal(firstHealth.qwen_model, 'qwen3.8-max');
     assert.equal(firstHealth.qwen_reasoning_effort, 'xhigh');
+    assert.equal(firstHealth.qwen_total_context_tokens, 1_000_000);
+    assert.equal(firstHealth.qwen_input_ceiling_tokens, 983_616);
     assert.equal(firstHealth.qwen_context_tokens, 983_616);
     assert.equal(firstHealth.qwen_max_output_tokens, 131_072);
     assert.equal(firstHealth.qwen_key_configured, false);

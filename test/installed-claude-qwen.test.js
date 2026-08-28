@@ -12,6 +12,7 @@ import {
   QWEN_MAIN_MODEL_ID,
   buildWorkflowClientEnv,
   buildWorkflowGatewayConfig,
+  buildWorkflowModelPicker,
 } from '../js/gateway/workflow-config.js';
 import {
   buildClaudeSettingsOverrideEnvironment,
@@ -182,7 +183,7 @@ function runClaude(args, options) {
 }
 
 test(
-  'installed Claude accepts Qwen 3.8 Max 1M/xhigh and preserves a streamed tool loop',
+  'installed Claude accepts Qwen 3.8 Max with truthful context and preserves a streamed tool loop',
   { skip: !CLAUDE_AVAILABLE },
   async function (t) {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-clean-qwen-'));
@@ -254,13 +255,34 @@ test(
       no_proxy: '127.0.0.1',
     });
     assert.equal(env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
-    assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '983616');
-    assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '983616');
+    assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+    assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
     assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+    assert.equal(env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
+    assert.equal(env.ANTHROPIC_CUSTOM_MODEL_OPTION, QWEN_MAIN_MODEL_ID);
+    assert.equal(env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Qwen 3.8 Max Main Route');
+    assert.equal(
+      env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+      'qwen:qwen3.8-max/xhigh through claude-workflow'
+    );
+    assert.equal(
+      env.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+      'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
+    );
     assert.equal(Object.values(env).includes(QWEN_API_KEY), false);
-    prepareClaudeThirdPartyModelSupport(env);
+    const prepared = prepareClaudeThirdPartyModelSupport(env);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(prepared.settingsChanged, false);
+    assert.equal(prepared.backupPath, null);
+    await assert.rejects(fsp.access(prepared.path));
     const settingsOverride = createPrivateClaudeSettingsOverride(
-      buildClaudeSettingsOverrideEnvironment(env, managedClientEnv)
+      buildClaudeSettingsOverrideEnvironment(env, managedClientEnv),
+      buildWorkflowModelPicker(
+        workflow.config,
+        workflow.mainModelId,
+        workflow.subagentModelId
+      )
     );
     t.after(() => settingsOverride.cleanup());
 

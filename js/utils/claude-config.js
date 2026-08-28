@@ -9,27 +9,38 @@ import {
   GATEWAY_ONLY_CREDENTIAL_ENV_NAMES,
 } from './child-env.js';
 
-const BACKUP_SUFFIX = '.claude-workflow.bak';
-
 export const CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES = Object.freeze([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_BETAS',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_DISABLE_1M_CONTEXT',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
+  'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
   'CLAUDE_CODE_DISABLE_THINKING',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
@@ -168,7 +179,57 @@ function writePrivateAtomic(target, content, expectedStats = undefined) {
   }
 }
 
-export function createPrivateClaudeSettingsOverride(settingsEnv) {
+function validatedModelPicker(modelPicker) {
+  if (modelPicker === null || modelPicker === undefined) {
+    return null;
+  }
+  if (!modelPicker || typeof modelPicker !== 'object' || Array.isArray(modelPicker)) {
+    throw new Error('Claude settings modelPicker must be an object');
+  }
+  if (
+    !Array.isArray(modelPicker.options) ||
+    modelPicker.options.length === 0 ||
+    modelPicker.options.length > 32
+  ) {
+    throw new Error('Claude settings modelPicker options must contain 1 to 32 rows');
+  }
+  if (
+    modelPicker.replaceBuiltInOptions !== undefined &&
+    typeof modelPicker.replaceBuiltInOptions !== 'boolean'
+  ) {
+    throw new Error('Claude settings modelPicker replaceBuiltInOptions must be a boolean');
+  }
+
+  const options = modelPicker.options.map(function validateModelPickerRow(row, index) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error(`Claude settings modelPicker row ${index + 1} must be an object`);
+    }
+    const model = typeof row.model === 'string' ? row.model.trim() : '';
+    if (!model) {
+      throw new Error(`Claude settings modelPicker row ${index + 1} requires a model`);
+    }
+    const result = { model };
+    for (const field of ['label', 'description']) {
+      if (row[field] === undefined) {
+        continue;
+      }
+      if (typeof row[field] !== 'string' || row[field].trim() === '') {
+        throw new Error(
+          `Claude settings modelPicker row ${index + 1} ${field} must be a non-empty string`
+        );
+      }
+      result[field] = row[field].trim();
+    }
+    return result;
+  });
+
+  return {
+    options,
+    replaceBuiltInOptions: modelPicker.replaceBuiltInOptions === true,
+  };
+}
+
+export function createPrivateClaudeSettingsOverride(settingsEnv, modelPicker = null) {
   if (!settingsEnv || typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) {
     throw new Error('Claude settings override env must be an object');
   }
@@ -177,6 +238,7 @@ export function createPrivateClaudeSettingsOverride(settingsEnv) {
       throw new Error(`Claude settings override ${name} must be a string`);
     }
   }
+  const validatedPicker = validatedModelPicker(modelPicker);
 
   const temporaryRoot = os.tmpdir();
   if (!path.isAbsolute(temporaryRoot)) {
@@ -202,7 +264,11 @@ export function createPrivateClaudeSettingsOverride(settingsEnv) {
     }
 
     const target = path.join(directory, 'settings.json');
-    writePrivateAtomic(target, `${JSON.stringify({ env: settingsEnv }, null, 2)}\n`, null);
+    const settings = {
+      env: settingsEnv,
+      ...(validatedPicker ? { modelPicker: validatedPicker } : {}),
+    };
+    writePrivateAtomic(target, `${JSON.stringify(settings, null, 2)}\n`, null);
     return {
       path: target,
       cleanup() {
@@ -252,90 +318,16 @@ export function claudeUserSettingsPath(env = process.env) {
     : path.join(claudeHomeDirectory(env), '.claude', 'settings.json');
 }
 
-function parseJsonObject(source, target, label) {
-  let value;
-  try {
-    value = JSON.parse(source.content);
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${target}: ${error.message}`);
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label} must contain a JSON object: ${target}`);
-  }
-  return value;
-}
-
-function hardenExistingFile(target, stats) {
-  if (!stats || ownerOnlyModeIsEnforced(stats)) {
-    return false;
-  }
-  fs.chmodSync(target, 0o600);
-  const hardenedStats = fs.lstatSync(target);
-  assertSafeRegularFile(target, hardenedStats);
-  if (!ownerOnlyModeIsEnforced(hardenedStats)) {
-    throw new Error(
-      `Claude state storage does not enforce owner-only permissions: ${target}. ` +
-        'On WSL, use the Linux filesystem or enable DrvFS metadata.'
-    );
-  }
-  return true;
-}
-
-export function inspectClaudeThirdPartyModelSupport(env = process.env) {
-  const target = claudeUserStatePath(env);
-  const source = optionalFile(target);
-  let stateEnabled = false;
-  if (source.stats) {
-    const value = parseJsonObject(source, target, 'Claude state file');
-    stateEnabled =
-      value.hasCompletedOnboarding === true && value.penguinModeOrgEnabled === true;
-  }
-
-  return {
-    // The launcher supplies a private, higher-precedence --settings file for
-    // every session. Persistent user/project settings are irrelevant to this
-    // readiness check and may be malformed or symlinked without blocking it.
-    enabled: stateEnabled,
-    exists: Boolean(source.stats),
-    path: target,
-    settingsPath: claudeUserSettingsPath(env),
-    stateEnabled,
-  };
-}
-
 export function prepareClaudeThirdPartyModelSupport(env = process.env) {
   const target = claudeUserStatePath(env);
-  const source = optionalFile(target);
-  let value = {};
-  if (source.stats) {
-    value = parseJsonObject(source, target, 'Claude state file');
-  }
-
-  const stateChanged =
-    value.hasCompletedOnboarding !== true || value.penguinModeOrgEnabled !== true;
-  let backupPath = null;
-  if (stateChanged && source.stats) {
-    backupPath = `${target}${BACKUP_SUFFIX}`;
-    writePrivateAtomic(backupPath, source.content);
-  }
-  if (stateChanged) {
-    const next = {
-      ...value,
-      penguinModeOrgEnabled: true,
-      hasCompletedOnboarding: true,
-    };
-    writePrivateAtomic(target, `${JSON.stringify(next, null, 2)}\n`, source.stats);
-  } else {
-    hardenExistingFile(target, source.stats);
-  }
 
   return {
-    backupPath,
-    changed: stateChanged,
+    backupPath: null,
+    changed: false,
     path: target,
     settingsBackupPath: null,
     settingsChanged: false,
     settingsPath: claudeUserSettingsPath(env),
-    stateChanged,
+    stateChanged: false,
   };
 }

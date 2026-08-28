@@ -79,6 +79,7 @@ try {
     'SUPPORT.md',
     'docs/LARGE_FILES_AND_DIFFS.md',
     'js/cli/claude-workflow-managed-state.js',
+    'js/gateway/codex-capabilities.js',
     'js/gateway/provider-profiles.js',
     'scripts/claude-workflow-daemon.sh',
     'scripts/reconcile-installed-daemon.mjs',
@@ -199,7 +200,7 @@ try {
   const qwenConfigPath = path.join(qwenHome, '.claude-workflow.env');
   const qwenConfig = await fs.readFile(qwenConfigPath, 'utf8');
   assert.match(qwenConfig, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=qwen/u);
-  assert.match(qwenConfig, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max\[1m\]/u);
+  assert.match(qwenConfig, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max/u);
   assert.doesNotMatch(qwenConfig, /API_KEY=/u);
   if (process.platform !== 'win32') {
     assert.equal((await fs.stat(qwenConfigPath)).mode & 0o777, 0o600);
@@ -210,12 +211,12 @@ try {
     await fs.mkdir(fakeBin);
     await fs.writeFile(
       path.join(fakeBin, 'claude'),
-      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "2.1.206 (Claude Code)"; elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then echo \'{"loggedIn":true}\'; else exit 2; fi\n',
+      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "2.1.250 (Claude Code)"; elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then echo \'{"loggedIn":true}\'; else exit 2; fi\n',
       { mode: 0o755 }
     );
     await fs.writeFile(
       path.join(fakeBin, 'codex'),
-      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "codex-cli 0.144.1"; elif [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in using ChatGPT"; else exit 2; fi\n',
+      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "codex-cli 0.150.1"; elif [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in using ChatGPT"; else exit 2; fi\n',
       { mode: 0o755 }
     );
     const setupResult = run(workflowBin, ['setup'], {

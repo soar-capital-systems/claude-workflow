@@ -2,6 +2,9 @@ export const QWEN_TOKEN_PLAN_DEFAULTS = Object.freeze({
   baseUrl: 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
   model: 'qwen3.8-max',
   reasoningEffort: 'xhigh',
+  totalContextTokens: 1_000_000,
+  // Alibaba's documented thinking-mode input ceiling. Keep this separate from
+  // the total window because output and chain-of-thought consume the balance.
   contextTokens: 983_616,
   maxOutputTokens: 131_072,
 });
@@ -131,23 +134,43 @@ function isLoopbackHostname(hostname) {
   );
 }
 
+function endpointTransportConfigurationIssue(baseUrl) {
+  let endpoint;
+  try {
+    endpoint = new URL(baseUrl);
+  } catch {
+    return { endpoint: null, issue: 'invalid_url' };
+  }
+  if (endpoint.protocol !== 'https:' && endpoint.protocol !== 'http:') {
+    return { endpoint, issue: 'unsupported_protocol' };
+  }
+  if (endpoint.protocol === 'http:' && !isLoopbackHostname(endpoint.hostname)) {
+    return { endpoint, issue: 'insecure_url' };
+  }
+  return { endpoint, issue: '' };
+}
+
+export function kimiProfileConfigurationIssue(profile) {
+  if (!profile?.apiKey) {
+    return 'missing_key';
+  }
+  return endpointTransportConfigurationIssue(profile.baseUrl).issue;
+}
+
+export function kimiProfileIsUsable(profile) {
+  return kimiProfileConfigurationIssue(profile) === '';
+}
+
 export function qwenProfileConfigurationIssue(profile) {
   if (!profile?.apiKey) {
     return 'missing_key';
   }
 
-  let endpoint;
-  try {
-    endpoint = new URL(profile.baseUrl);
-  } catch {
-    return 'invalid_url';
+  const transport = endpointTransportConfigurationIssue(profile.baseUrl);
+  if (transport.issue) {
+    return transport.issue;
   }
-  if (endpoint.protocol !== 'https:' && endpoint.protocol !== 'http:') {
-    return 'unsupported_protocol';
-  }
-  if (endpoint.protocol === 'http:' && !isLoopbackHostname(endpoint.hostname)) {
-    return 'insecure_url';
-  }
+  const endpoint = transport.endpoint;
   if (endpoint.pathname.includes('/apps/anthropic')) {
     return 'anthropic_endpoint';
   }

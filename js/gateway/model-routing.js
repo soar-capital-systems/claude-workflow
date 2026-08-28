@@ -2,6 +2,7 @@ import {
   GATEWAY_PROVIDER_IDS,
   QWEN_TOKEN_PLAN_DEFAULTS,
   gatewayProviderProfile,
+  kimiProfileConfigurationIssue,
   qwenProfileConfigurationIssue,
   routeProviderMetadata,
 } from './provider-profiles.js';
@@ -183,7 +184,7 @@ function validateRouteMapEntry(modelId, entry) {
   return entry;
 }
 
-function routeMapEntry(modelId, config) {
+export function configuredRouteMapEntry(modelId, config) {
   const routeMap = config.routeMap || {};
   const exactEntry = routeMap[modelId];
   if (exactEntry !== undefined) {
@@ -427,6 +428,8 @@ function buildQwenRoute(modelId, config, entry = null) {
     upstreamModel,
     reasoningEffort,
     contextTokens: providerConfig.contextTokens || QWEN_TOKEN_PLAN_DEFAULTS.contextTokens,
+    totalContextTokens:
+      providerConfig.totalContextTokens || QWEN_TOKEN_PLAN_DEFAULTS.totalContextTokens,
     maxOutputTokens:
       providerConfig.maxOutputTokens || QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens,
     claudeEffort: QWEN_CLAUDE_EFFORT_MAP[reasoningEffort],
@@ -454,6 +457,31 @@ function normalizedKimiReasoningEffort(modelId, value) {
   );
 }
 
+function validateKimiEndpoint(providerConfig) {
+  const issue = kimiProfileConfigurationIssue(providerConfig);
+  if (issue === 'invalid_url') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Kimi routing requires a valid ULTRATHINK_GATEWAY_KIMI_BASE_URL'
+    );
+  }
+  if (issue === 'unsupported_protocol') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Kimi routing requires an https:// base URL; http:// is allowed only for a loopback gateway'
+    );
+  }
+  if (issue === 'insecure_url') {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'Kimi routing refuses remote http:// base URLs because they would expose the upstream credential; use https:// or a loopback HTTP gateway'
+    );
+  }
+}
+
 function buildKimiRoute(modelId, config, entry = null) {
   const providerConfig = config.kimi || {};
   if (!providerConfig.apiKey) {
@@ -463,6 +491,7 @@ function buildKimiRoute(modelId, config, entry = null) {
       'Kimi routing is configured but ULTRATHINK_GATEWAY_KIMI_API_KEY or KIMI_API_KEY is missing'
     );
   }
+  validateKimiEndpoint(providerConfig);
 
   const upstreamModel = modelIdWithoutBracketQualifiers(
     routeEntryValue(entry, ROUTE_ENTRY_UPSTREAM_MODEL_KEYS, providerConfig.model, 'k3')
@@ -597,7 +626,7 @@ export function resolveModelRoute(modelId, config) {
     );
   }
 
-  const configuredRoute = routeMapEntry(modelId, config);
+  const configuredRoute = configuredRouteMapEntry(modelId, config);
   if (configuredRoute) {
     const provider = configuredProvider(configuredRoute, modelId);
     return ROUTE_PROVIDER_BUILDERS[provider](modelId, config, configuredRoute);

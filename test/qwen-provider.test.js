@@ -22,18 +22,33 @@ const QWEN_API_KEY = 'sk-sp-test-qwen-upstream-key';
 const GATEWAY_SECRET = 'test-qwen-gateway-secret';
 const QWEN_MODEL = 'qwen3.8-max';
 const QWEN_CONTEXT_TOKENS = 983_616;
+const CLAUDE_COMMON_CONTEXT_TOKENS = 828_400;
+const CLAUDE_COMMON_AUTO_COMPACT_TOKENS = 784_800;
 const DAEMON_PATH = fileURLToPath(
   new URL('../js/cli/claude-workflow-daemon.js', import.meta.url)
 );
 const ISOLATED_ENV_NAMES = Object.freeze([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES',
   'BAILIAN_TOKEN_PLAN_API_KEY',
   'DASHSCOPE_API_KEY',
   'QWEN_API_KEY',
   'QWEN_BASE_URL',
   'QWEN_MODEL',
   'QWEN_REASONING_EFFORT',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL',
+  'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID',
+  'ULTRATHINK_GATEWAY_CODEX_COMMAND',
+  'ULTRATHINK_GATEWAY_CODEX_MODEL',
+  'ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT',
   'ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY',
   'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS',
   'ULTRATHINK_GATEWAY_MAIN_MODEL_ID',
@@ -48,6 +63,9 @@ const ISOLATED_ENV_NAMES = Object.freeze([
   'ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT',
   'ULTRATHINK_GATEWAY_ROUTE_MAP_JSON',
   'ULTRATHINK_GATEWAY_SHARED_SECRET',
+  'ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID',
+  'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT',
+  'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL',
   'CLAUDE_WORKFLOW_MAIN_PROVIDER',
 ]);
 
@@ -116,7 +134,7 @@ function jsonHeaders(extra = {}) {
   return { 'content-type': 'application/json', ...extra };
 }
 
-test('Qwen profile exposes the exact 1M/xhigh route without leaking its credential', async function () {
+test('Qwen profile exposes its exact route with the shared Codex-safe Claude context', async function () {
   await withIsolatedEnvironment(
     {
       DASHSCOPE_API_KEY: 'test-low-priority-qwen-key',
@@ -133,6 +151,7 @@ test('Qwen profile exposes the exact 1M/xhigh route without leaking its credenti
         model: QWEN_MODEL,
         reasoningEffort: 'xhigh',
         contextTokens: QWEN_CONTEXT_TOKENS,
+        totalContextTokens: 1_000_000,
         maxOutputTokens: 131_072,
       });
 
@@ -144,6 +163,7 @@ test('Qwen profile exposes the exact 1M/xhigh route without leaking its credenti
       assert.equal(route.upstreamModel, QWEN_MODEL);
       assert.equal(route.reasoningEffort, 'xhigh');
       assert.equal(route.contextTokens, QWEN_CONTEXT_TOKENS);
+      assert.equal(route.totalContextTokens, 1_000_000);
       assert.equal(route.maxOutputTokens, 131_072);
       assert.equal(route.preserveAssistantThinking, true);
       assert.equal(route.emitReasoningContent, true);
@@ -167,10 +187,27 @@ test('Qwen profile exposes the exact 1M/xhigh route without leaking its credenti
         workflow.mainModelId
       );
       assert.equal(clientEnv.ANTHROPIC_MODEL, QWEN_MAIN_MODEL_ID);
-      assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '983616');
-      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '983616');
+      assert.equal(
+        clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+        String(CLAUDE_COMMON_AUTO_COMPACT_TOKENS)
+      );
+      assert.equal(
+        clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+        String(CLAUDE_COMMON_CONTEXT_TOKENS)
+      );
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
       assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, QWEN_MAIN_MODEL_ID);
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Qwen 3.8 Max Main Route');
+      assert.equal(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+        'qwen:qwen3.8-max/xhigh through claude-workflow'
+      );
+      assert.equal(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+        'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
+      );
       assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
       assert.equal(Object.values(clientEnv).includes(QWEN_API_KEY), false);
 
@@ -186,12 +223,40 @@ test('Qwen profile exposes the exact 1M/xhigh route without leaking its credenti
   );
 });
 
+test('Qwen paired with literal-1M Codex agents keeps proactive input headroom', async function () {
+  await withIsolatedEnvironment(
+    {
+      ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+      ULTRATHINK_GATEWAY_CODEX_MODEL: 'gpt-5.4',
+      ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT: 'xhigh',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: QWEN_MAIN_MODEL_ID,
+      ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'qwen',
+      ULTRATHINK_GATEWAY_QWEN_API_KEY: QWEN_API_KEY,
+      ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT: 'xhigh',
+      ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.4',
+    },
+    async function verifyQwenHeadroom() {
+      const workflow = buildWorkflowGatewayConfig();
+      const clientEnv = buildWorkflowClientEnv(
+        workflow.config,
+        'http://127.0.0.1:4318',
+        workflow.subagentModelId,
+        workflow.mainModelId
+      );
+      assert.equal(workflow.subagentModelId, 'codex-gpt-5.4');
+      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '950000');
+      assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '900000');
+      assert.equal(QWEN_CONTEXT_TOKENS - 900_000, 83_616);
+    }
+  );
+});
+
 test('Qwen effort aliases normalize to Alibaba-supported levels and invalid values fail locally', async function () {
   await withIsolatedEnvironment(
     {
       ULTRATHINK_GATEWAY_QWEN_API_KEY: QWEN_API_KEY,
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-        qwenHigh: { provider: 'QWEN', model: `${QWEN_MODEL}[1m]`, reasoningEffort: 'max' },
+        qwenHigh: { provider: 'QWEN', model: QWEN_MODEL, reasoningEffort: 'max' },
         qwenMedium: { provider: 'qwen', model: QWEN_MODEL, reasoning_effort: 'medium' },
         qwenBad: { provider: 'qwen', model: QWEN_MODEL, reasoningEffort: 'extreme' },
       }),
@@ -466,6 +531,13 @@ test('Qwen OpenAI transport preserves max thinking, reasoning blocks, tools, and
           models.data.some((model) => model.id === QWEN_MAIN_MODEL_ID),
           true
         );
+
+        const healthResponse = await fetch(`${gatewayUrl}/healthz`);
+        assert.equal(healthResponse.status, 200);
+        const health = await healthResponse.json();
+        assert.equal(health.qwen_total_context_tokens, 1_000_000);
+        assert.equal(health.qwen_input_ceiling_tokens, QWEN_CONTEXT_TOKENS);
+        assert.equal(health.qwen_context_tokens, QWEN_CONTEXT_TOKENS);
 
         const jsonResponse = await fetch(`${gatewayUrl}/v1/messages`, {
           method: 'POST',

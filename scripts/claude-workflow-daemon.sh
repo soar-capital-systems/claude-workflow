@@ -670,8 +670,11 @@ NODE
       case "$recorded_port" in
         ''|*[!0-9]*) return 1 ;;
       esac
-      health_matches_runtime "$pid" "" "http://127.0.0.1:$recorded_port/healthz"
-      return
+      # The exact daemon path and managed state binding establish ownership.
+      # Health is a separate readiness condition: folding it into pid_running
+      # made a transient startup health miss look like a dead process and left
+      # the detached child orphaned because cleanup repeated the same miss.
+      return 0
       ;;
   esac
   if printf '%s\n' "$command_line" | grep -Fq -- "$DAEMON_JS"; then

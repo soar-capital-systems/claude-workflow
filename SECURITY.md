@@ -26,8 +26,13 @@ published gateway env files, or complete private prompts/transcripts.
   owner-only `~/.claude-workflow.env` file. Do not export them from a shell
   startup file or store them in a repository `.env`, command-line argument,
   issue, trace, or diagnostic attachment. Kimi requests use the gateway-side
-  key rather than Claude Code's inbound credential. Qwen Token Plan keys must
-  match their plan endpoint, and custom remote Qwen endpoints must use HTTPS.
+  key rather than Claude Code's inbound credential. Kimi and Qwen custom remote
+  endpoints must use HTTPS; plain HTTP is allowed only on loopback. Qwen Token
+  Plan keys must match their plan endpoint.
+  All outbound upstream requests reject HTTP redirects so credentials are not
+  forwarded to a redirect target. The built-in Qwen Token Plan route also
+  ignores a generic `DASHSCOPE_API_KEY` unless an explicit matching Qwen base
+  URL is configured.
   Dedicated gateway keys are removed from child processes; Kimi, Qwen, and
   unrelated Anthropic credentials are also removed from Codex probes and
   app-server processes.
@@ -36,21 +41,31 @@ published gateway env files, or complete private prompts/transcripts.
   It contains only local gateway credentials, never upstream provider keys,
   and is removed on normal exit, SIGINT, and SIGTERM. Claude organization
   policy has higher precedence and is not bypassed.
-- `setup --prepare-claude` is the only setup action that changes Claude Code's
-  `.claude.json`. It preserves existing fields, refuses symlinks and foreign
-  ownership, writes with owner-only permissions, and creates a private backup
-  before changing an existing file.
-- Shared-daemon Codex threads disable native execution environments and use
-  Claude-provided dynamic tools. Per-launch sessions retain the caller cwd.
+- Claude Workflow does not modify `.claude.json`, user settings, or project
+  settings. Plain `setup` is read-only, and `setup --prepare-claude` remains a
+  compatibility no-op. `setup --shared` manages private daemon state and
+  removes historical shell routing; it does not enable third-party models by
+  changing Claude state.
+- Every workflow Codex route, including per-session, shared, direct-main, and
+  delegated-agent routes, starts without Codex-native execution environments
+  or capability roots. Native agents, memories, MCP servers, plugins, skills,
+  web, planning, permission, request-input, and clock/sleep tools are disabled.
+  Repository operations use the dynamic tools supplied by Claude Code. Codex
+  app-server 0.150.1 still advertises its code-mode `functions.exec` and
+  `functions.wait` wrappers; the app-server has no supported thread override
+  that removes them. This isolation does not turn permission bypass into a
+  sandbox.
 - Workflow entrypoints ignore project `.env` by default. Only a parent process
   can opt a trusted project into per-session loading. Shared mode rejects that
   opt-in because its daemon is global rather than repository-scoped.
 - User configuration, state, env exports, logs, and traces are private. User
   configuration must be a current-user-owned, non-symlink regular file with no
-  group or other access. Symlinks and broadly
-  accessible custom state/trace locations are rejected.
+  group or other access. Symlinks and broadly accessible custom state or trace
+  locations are rejected. Blank compatibility aliases written to
+  `~/.claude-workflow.env` deliberately shadow stale values in the legacy
+  `~/.ultrathink.env` fallback.
 - Unauthenticated non-loopback health responses omit paths, PIDs, revisions,
   and budgets.
 
-Only the current default branch receives security fixes during the initial
-public release period.
+Security fixes are provided for the latest release on the default branch.
+Older releases are not supported.

@@ -11,30 +11,48 @@ Several independent limits apply to one review:
 
 - Claude Code can reject an oversized Read result before the gateway receives
   it. Line count, token count, and a dense single line can each trigger this.
-- The gateway accepts JSON request bodies up to 20 MiB. This is separate from
+- The gateway accepts JSON request bodies up to 32 MiB. This is separate from
   provider context limits and can bind first for unusually large tool results.
-- Codex and the gateway may shorten tool output before it enters model history.
+- Generic Codex tool output may be shortened before it enters model history.
   An omission marker identifies an unseen gap; it is not a continuation cursor.
+- For a matching Claude `Read` result, the gateway validates Claude 2.1.250's
+  immediately adjacent partial-view notice and forwards only a contiguous
+  numbered prefix no larger than 36,000 UTF-8 bytes. It adds machine-readable
+  coverage metadata with the exact next 1-based offset. A malformed or
+  mismatched notice produces no coverage claim.
+- The Codex CLI 0.150.1 bundled catalog declares a 10,000-token function-output policy.
+  A single 12,000-line result can therefore be shortened independently of the
+  overall context window.
 - A context window counts the complete conversation, including system
   instructions, tool schemas, prior turns, tool results, reasoning, and output
   headroom. The source or diff gets only part of that budget.
+- Codex CLI 0.150.1's bundled 5.6 models advertise a 272,000-token standard window and an
+  872,000-token maximum through the installed app-server catalog. Codex reserves
+  part of that window, leaving 258,400 usable tokens in `standard` mode or
+  828,400 in `long` mode. Claude Workflow uses `long` by default and passes the
+  exact catalog values to both Codex and Claude Code; it does not claim a literal
+  1,000,000-token Codex window.
 - Kimi K3 supports up to 1,048,576 context tokens on Allegretto and higher
   plans. Kimi Code separately rejects total message content above 2,097,152
   bytes, so the byte limit can bind first. See Kimi's
   [model reference](https://www.kimi.com/code/docs/en/kimi-code/models.html) and
   [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
-- Qwen 3.8 Max exposes a 983,616-token client context and a 131,072-token
-  answer cap. Its `xhigh` setting can use up to 262,144 thinking tokens, so a
-  large review still needs room for reasoning, tools, and the final report.
+- Qwen 3.8 Max has a 1,000,000-token total context window, a safe
+  983,616-token thinking-mode input ceiling, and a 131,072-token answer cap.
+  With the default Terra agents, Claude Code exposes the smaller shared
+  custom-model maximum of 828,400 tokens. Qwen's `xhigh` setting can use up to
+  262,144 thinking tokens, so a large review still needs room for reasoning,
+  tools, and the final report.
 
 Kimi Code does not document an Anthropic-compatible token-count endpoint. For
 Kimi routes, the gateway answers Claude Code's count request locally with a
-conservative UTF-8 byte estimate. This is a compaction signal, not an exact
-provider token count.
+conservative ceiling of one estimated token per UTF-8 byte. This is a
+deliberately early compaction signal, not an exact provider token count.
 
-The Qwen Token Plan route uses the same conservative local counting policy;
+The Qwen Token Plan route uses the same conservative local byte ceiling;
 Alibaba does not expose a compatible count endpoint for this workflow. The
-estimate makes no provider call and must not be treated as a billing count.
+count makes no provider call and must not be treated as a tokenizer or billing
+count.
 
 ## Gateway guarantees
 
@@ -44,18 +62,27 @@ Claude Workflow applies the following rules:
    large raw result does not silently move to an unrelated thread.
 2. Omitted content is marked as an unreviewed gap. The gateway never presents a
    head-and-tail preview as full coverage.
-3. Read arguments retain Claude Code's 1-based source-line semantics. The
-   gateway does not rewrite a large offset or invent a cursor beyond omitted
-   content.
-4. The routed agent receives guidance to inventory large diffs, index hunks,
+3. Read arguments retain Claude Code's 1-based source-line semantics. A verified
+   result carries its contiguous covered range and exact next offset. The
+   gateway never advances beyond the last numbered source line it actually
+   forwarded.
+4. Claude's adjacent partial-view notice remains transient. It does not become
+   a persistent Codex developer instruction or change thread identity. If a
+   thread must be rebuilt after eviction or recovery, historical Read results
+   pass through the same contiguous paging check before replay.
+5. The routed agent receives guidance to inventory large diffs, index hunks,
    inspect bounded ranges, and report gaps.
-5. A shared daemon records its loaded revision and restarts when its installed
+6. A shared daemon records its loaded revision and restarts when its installed
    code or user configuration changes.
-6. Per-session Codex threads use the caller's repository. Shared-daemon Codex
-   threads disable native shell and patch access and use Claude-provided tools,
-   preventing the daemon's startup directory from leaking into another
-   repository.
-7. Qwen tool-result translation does not add a gateway byte cap. Contract tests
+7. Every workflow Codex thread disables optional native execution environments
+   and integrations. Codex 0.150.1 retains its built-in `functions.exec` and
+   `functions.wait` code-mode control wrappers, while repository reads, writes,
+   searches, and shell commands use Claude-provided dynamic tools. The same
+   boundary applies to per-session and shared gateways.
+8. A dense single line, malformed partial notice, path mismatch, or noncontiguous
+   numbered result fails closed and recommends a smaller Read, targeted Grep,
+   or byte/character query without claiming source coverage.
+9. Qwen tool-result translation does not add a gateway byte cap. Contract tests
    carry a 12,000-line result through the continuation unchanged, but Claude's
    own Read paging and the provider's context limits still apply.
 

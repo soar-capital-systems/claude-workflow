@@ -88,6 +88,22 @@ async function makeExecutable(filePath, content) {
   await fs.chmod(filePath, 0o755);
 }
 
+async function makeClaudeExecutable(filePath, content, version = '2.1.250') {
+  const firstNewline = content.indexOf('\n');
+  assert.notEqual(firstNewline, -1, 'fake Claude executable must start with a shebang');
+  const versionProbe = content.startsWith('#!/usr/bin/env node')
+    ? `if (process.argv[2] === '--version') { process.stdout.write(${JSON.stringify(
+        `${version} (Claude Code)\n`
+      )}); process.exit(0); }\n`
+    : `if [ "\${1:-}" = "--version" ]; then echo ${JSON.stringify(
+        `${version} (Claude Code)`
+      )}; exit 0; fi\n`;
+  await makeExecutable(
+    filePath,
+    `${content.slice(0, firstNewline + 1)}${versionProbe}${content.slice(firstNewline + 1)}`
+  );
+}
+
 async function makeCodexLoginStatusCommand(filePath, statusText = 'Logged in', exitCode = 0) {
   await makeExecutable(
     filePath,
@@ -101,7 +117,7 @@ async function makeCodexLoginStatusCommand(filePath, statusText = 'Logged in', e
 }
 
 async function makeClaudeShouldNotRunCommand(filePath) {
-  await makeExecutable(
+  await makeClaudeExecutable(
     filePath,
     '#!/bin/bash\n' +
       'echo "CLAUDE SHOULD NOT RUN" >&2\n' +
@@ -1031,7 +1047,8 @@ await runTest('gateway treats blank numeric env values as unset', async function
       const config = loadGatewayConfig();
       assert.equal(config.port, 4319);
       assert.equal(config.requestTimeoutMs, 5 * 60_000);
-      assert.equal(config.codex.inputMaxTokens, 192_000);
+      assert.equal(config.codex.inputMaxTokens, 0);
+      assert.equal(config.codex.capabilities.inputBudgetTokens > 0, true);
       assert.equal(config.codex.maxSessions, 16);
       assert.equal(config.codex.pendingToolTimeoutMs, 10 * 60_000);
       assert.equal(config.traceMaxBytes, 256);
@@ -1098,14 +1115,14 @@ await runTest('gateway strips client-only [1m] qualifiers before Anthropic passt
   ok('client-visible [1m] aliases use the plain Anthropic API model id upstream');
 });
 
-await runTest('workflow defaults never send the client-only [1m] qualifier upstream', async function testWorkflowMainAliasStripping() {
+await runTest('workflow defaults use the canonical Opus 5 model id', async function testWorkflowMainAliasStripping() {
   await withTemporaryEnv(CLEAN_WORKFLOW_ENV, async function assertWorkflowMainAlias() {
     const { config, mainModelId } = buildWorkflowGatewayConfig();
     const route = resolveModelRoute(mainModelId, config);
-    assert.equal(mainModelId, 'claude-opus-5[1m]');
+    assert.equal(mainModelId, 'claude-opus-5');
     assert.equal(route.provider, 'anthropic');
     assert.equal(route.upstreamModel, 'claude-opus-5');
-    ok('workflow example/default aliases are resolved to a valid Anthropic model id');
+    ok('workflow defaults preserve the native 1M Opus 5 API model id');
   });
 });
 
@@ -1227,7 +1244,7 @@ await runTest(
 );
 
 await runTest(
-  'gateway config defaults Codex auto-compaction to body-after-prefix scope',
+  'gateway config defaults Codex auto-compaction to total scope',
   async function testCodexAutoCompactScopeDefault() {
     await withTemporaryEnv(
       {
@@ -1235,8 +1252,8 @@ await runTest(
       },
       async function assertAutoCompactScopeDefault() {
         const config = loadGatewayConfig();
-        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
-        ok('Codex gateway threads avoid total-context autocompact thrash by default');
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'total');
+        ok('explicit Codex compaction limits use the upstream total-context contract');
       }
     );
   }
@@ -1249,9 +1266,10 @@ await runTest(
       CLEAN_WORKFLOW_ENV,
       async function assertWorkflowCodexContextDefaults() {
         const { config } = buildWorkflowGatewayConfig();
-        assert.equal(config.codex.inputMaxTokens, 180_000);
-        assert.equal(config.codex.autoCompactTokenLimit, 126_000);
-        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
+        assert.equal(config.codex.inputMaxTokens, 0);
+        assert.equal(config.codex.autoCompactTokenLimit, 0);
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'total');
+        assert.equal(config.codex.capabilities.inputBudgetTokens, 752_800);
         assert.equal(config.codex.toolResultMaxBytes, 0);
         assert.equal(config.codex.toolResultWindowMaxBytes, 0);
         ok('workflow Codex sessions use upstream token-aware tool-output truncation by default');
@@ -1280,12 +1298,22 @@ await runTest(
           workflow.mainModelId
         );
 
-        assert.equal(workflow.config.routeMap.codex.provider, 'codex');
+        assert.equal(workflow.mainModelId, 'codex-terra');
+        assert.equal(workflow.config.routeMap[workflow.mainModelId].provider, 'codex');
+        assert.equal(workflow.config.routeMap[workflow.mainModelId].verbosity, 'high');
+        assert.equal(
+          workflow.config.routeMap[workflow.mainModelId].displayName,
+          'Codex Main and Subagent Route'
+        );
         assert.equal(workflow.config.anthropicPassthroughModels.length, 0);
         assert.equal(workflow.config.sharedSecret.length > 0, true);
         assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
         assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
         assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+        assert.equal(
+          clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+          'effort,xhigh_effort,max_effort'
+        );
         ok('direct Codex main satisfies Claude client authentication without an Anthropic login');
       }
     );
@@ -1839,6 +1867,7 @@ await runTest(
     ]);
 
     assert.equal(registry.dynamicTools.length, 4);
+    assert.equal(registry.dynamicTools.every((tool) => tool.type === 'function'), true);
     assert.equal(registry.dynamicTools[0].name, 'ext_tool_001');
     assert.equal(registry.dynamicTools[1].name, 'ext_tool_002');
     assert.equal(registry.dynamicTools[2].name, 'StructuredOutput');
@@ -2886,14 +2915,20 @@ await runTest(
       assert.equal(threadStarts[0].params.threadSource, 'user');
       assert.equal(threadStarts[0].params.ephemeral, undefined);
       assert.equal(
-        threadStarts[0].params.config.model_auto_compact_token_limit_scope,
-        'body_after_prefix'
+        Object.hasOwn(
+          threadStarts[0].params.config || {},
+          'model_auto_compact_token_limit_scope'
+        ),
+        false
       );
       assert.equal(threadStarts[1].params.threadSource, 'subagent');
       assert.equal(threadStarts[1].params.ephemeral, true);
       assert.equal(
-        threadStarts[1].params.config.model_auto_compact_token_limit_scope,
-        'body_after_prefix'
+        Object.hasOwn(
+          threadStarts[1].params.config || {},
+          'model_auto_compact_token_limit_scope'
+        ),
+        false
       );
       ok('Claude workflow agent Codex threads are pathless/non-resumable app-server threads');
     } finally {
@@ -3248,7 +3283,7 @@ await runTest(
 );
 
 await runTest(
-  'Codex app-server hard-bounds large Read results without inventing a cursor',
+  'Codex correlates Claude 2.1.250 Read partial metadata and keeps a contiguous prefix',
   async function testCodexReadResultTruncation() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-truncate-'));
     const codexPath = path.join(tempDir, 'codex-read-truncate');
@@ -3276,13 +3311,14 @@ await runTest(
           '    return;\n' +
           '  }\n' +
           "  if (message.method === 'thread/start') {\n" +
+          "    record({ event: 'thread_start', params: message.params });\n" +
           "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
           '    return;\n' +
           '  }\n' +
           "  if (message.method === 'turn/start') {\n" +
           '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
           '    setTimeout(function emitToolCall() {\n' +
-          "      send({ id: 'tool_req_read_truncate', method: 'item/tool/call', params: { turnId, callId: 'call_read_truncate', tool: 'ext_tool_001', arguments: { file_path: '/tmp/big.txt' } } });\n" +
+          "      send({ id: 'tool_req_read_truncate', method: 'item/tool/call', params: { turnId, callId: 'call_read_truncate', tool: 'ext_tool_001', arguments: { file_path: '/Users/yshaaban/src/ultrathink/js/gateway/codex-provider.js' } } });\n" +
           '    }, 5);\n' +
           '    return;\n' +
           '  }\n' +
@@ -3311,7 +3347,7 @@ await runTest(
               cwd: tempDir,
               idleTimeoutMs: 0,
               inputMaxTokens: 10_000,
-              toolResultMaxBytes: 900,
+              toolResultMaxBytes: 0,
             },
           },
           { tracer }
@@ -3334,8 +3370,8 @@ await runTest(
           messages: [{ role: 'user', content: 'Read a large file.' }],
           tools,
         };
-        const rawResult = Array.from({ length: 120 }, function line(_, index) {
-          return `line-${String(index + 1).padStart(3, '0')} ${'x'.repeat(24)}`;
+        const rawResult = Array.from({ length: 2_339 }, function line(_, index) {
+          return `${String(index + 1)}\tline-${String(index + 1).padStart(4, '0')} ${'x'.repeat(24)}`;
         }).join('\n');
 
         const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
@@ -3343,7 +3379,7 @@ await runTest(
           id: 'call_read_truncate',
           name: 'Read',
           input: {
-            file_path: '/tmp/big.txt',
+            file_path: '/Users/yshaaban/src/ultrathink/js/gateway/codex-provider.js',
           },
         });
 
@@ -3374,6 +3410,16 @@ await runTest(
                   },
                 ],
               },
+              {
+                role: 'system',
+                content: [
+                  {
+                    type: 'text',
+                    text:
+                      '[Truncated: PARTIAL view — /Users/yshaaban/src/ultrathink/js/gateway/codex-provider.js: showing lines 1-2339 of 4403 total (40000 tokens, cap 25000). Call Read with offset=2340 limit=2339 for the next page, or Grep to find a specific section. Do NOT answer from this page alone if the answer may be further in the file.]\n\n<total_tokens>14999979 tokens left</total_tokens>',
+                  },
+                ],
+              },
             ],
             tools,
           },
@@ -3383,25 +3429,40 @@ await runTest(
         const continuedCall = responses.find(function findReadResponse(message) {
           return message.id === 'tool_req_read_truncate';
         });
+        const threadStart = responses.find(function findThreadStart(message) {
+          return message.event === 'thread_start';
+        });
         const continuedText = continuedCall.result.contentItems[0].text;
         const resultTrace = entries.find(function findResultTrace(entry) {
           return entry.event === 'codex.tool_result.continued';
         });
 
         assert.equal(finalOutcome.type, 'final');
-        assert.match(continuedText, /^Warning: truncated Read output/u);
-        assert.match(continuedText, /Total output lines: 120/u);
-        assert.match(continuedText, /Read output omitted to fit Codex context budget/u);
-        assert.match(continuedText, /middle is an unseen gap/u);
-        assert.match(continuedText, /Do not advance a continuation cursor/u);
-        assert.equal(continuedText.includes('line-001'), true);
-        assert.equal(continuedText.includes('line-060'), false);
-        assert.equal(continuedText.includes('line-120'), true);
-        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 900, true);
+        assert.equal(threadStart.params.config.tool_output_token_limit, 10_000);
+        assert.match(continuedText, /^1\tline-0001/u);
+        assert.match(continuedText, /\[Codex Read page metadata\]/u);
+        const metadata = JSON.parse(
+          continuedText.split('[Codex Read page metadata]\n')[1].split('\n')[0]
+        );
+        assert.equal(metadata.path, '/Users/yshaaban/src/ultrathink/js/gateway/codex-provider.js');
+        assert.equal(metadata.covered_start, 1);
+        assert.equal(metadata.covered_end < 2_339, true);
+        assert.equal(metadata.source_total_lines, 4_403);
+        assert.equal(metadata.next_offset, metadata.covered_end + 1);
+        assert.equal(metadata.next_limit, metadata.covered_end);
+        assert.equal(metadata.contiguous, true);
+        assert.equal(metadata.source_complete, false);
+        assert.equal(continuedText.includes(`${metadata.covered_end}\tline-`), true);
+        assert.equal(continuedText.includes(`${metadata.covered_end + 1}\tline-`), false);
+        assert.equal(continuedText.includes('2339\tline-2339'), false);
+        assert.equal(continuedText.includes('<total_tokens>'), false);
+        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 36_000, true);
         assert.equal(resultTrace.details.read_tool_result, true);
+        assert.equal(resultTrace.details.read_coverage_verified, true);
+        assert.equal(resultTrace.details.read_notice_status, 'validated');
         assert.equal(resultTrace.details.tool_result_truncated, true);
         assert.equal(resultTrace.details.raw_result_bytes > resultTrace.details.result_bytes, true);
-        ok('large Read results obey the byte cap and identify the omitted middle as an unseen gap');
+        ok('only validated canonical paging metadata follows the contiguous Read prefix');
       } finally {
         await manager?.close();
         if (previousPath === undefined) {
@@ -3816,14 +3877,14 @@ await runTest(
 
         assert.deepEqual(firstOutcome.usage, {
           input_tokens: 80,
-          output_tokens: 35,
+          output_tokens: 30,
           cache_read_input_tokens: 20,
           reasoning_output_tokens: 5,
           total_tokens: 115,
         });
         assert.deepEqual(secondOutcome.usage, {
           input_tokens: 30,
-          output_tokens: 17,
+          output_tokens: 15,
           cache_read_input_tokens: 30,
           reasoning_output_tokens: 2,
           total_tokens: 47,
@@ -3839,7 +3900,7 @@ await runTest(
 );
 
 await runTest(
-  'Codex app-server usage prefers last snapshot when total is also present',
+  'Codex app-server usage uses the cumulative total delta when last is also present',
   async function testCodexUsagePrefersLastSnapshot() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-last-total-'));
     const codexPath = path.join(tempDir, 'codex-usage-last-total');
@@ -3850,6 +3911,7 @@ await runTest(
         '#!/usr/bin/env node\n' +
           "const readline = require('node:readline');\n" +
           'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'let turnCount = 0;\n' +
           'const rl = readline.createInterface({ input: process.stdin });\n' +
           "rl.on('line', function onLine(line) {\n" +
           '  const message = JSON.parse(line);\n' +
@@ -3862,15 +3924,29 @@ await runTest(
           '    return;\n' +
           '  }\n' +
           "  if (message.method === 'turn/start') {\n" +
-          "    const turnId = 'turn-1';\n" +
+          '    turnCount += 1;\n' +
+          "    const turnId = `turn-${turnCount}`;\n" +
           '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
           '    setTimeout(function completeTurn() {\n' +
           "      send({ method: 'item/agentMessage/delta', params: { turnId, itemId: 'message-1', delta: 'done' } });\n" +
-          '      const tokenUsage = {\n' +
-          '        total: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1250 },\n' +
-          '        last: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9, reasoningOutputTokens: 3, totalTokens: 132 },\n' +
-          '      };\n' +
-          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          '      if (turnCount === 1) {\n' +
+          '        const tokenUsage = {\n' +
+          '          total: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 },\n' +
+          '          last: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 },\n' +
+          '        };\n' +
+          "        send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          '      } else {\n' +
+          '        const firstUpdate = {\n' +
+          '          total: { inputTokens: 1120, cachedInputTokens: 540, cacheWriteInputTokens: 20, outputTokens: 209, reasoningOutputTokens: 53, totalTokens: 1329 },\n' +
+          '          last: { inputTokens: 120, cachedInputTokens: 40, cacheWriteInputTokens: 20, outputTokens: 9, reasoningOutputTokens: 3, totalTokens: 129 },\n' +
+          '        };\n' +
+          "        send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: firstUpdate } });\n" +
+          '        const finalUpdate = {\n' +
+          '          total: { inputTokens: 1200, cachedInputTokens: 560, cacheWriteInputTokens: 30, outputTokens: 220, reasoningOutputTokens: 57, totalTokens: 1420 },\n' +
+          '          last: { inputTokens: 80, cachedInputTokens: 20, cacheWriteInputTokens: 10, outputTokens: 11, reasoningOutputTokens: 4, totalTokens: 91 },\n' +
+          '        };\n' +
+          "        send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: finalUpdate } });\n" +
+          '      }\n' +
           "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
           '    }, 5);\n' +
           '  }\n' +
@@ -3888,20 +3964,36 @@ await runTest(
       });
 
       try {
+        const baseline = await manager.processRequest(
+          claudeSessionRequest('codex-usage-last-total'),
+          codexUserRequest('Establish a cumulative usage baseline.'),
+          codexRoute()
+        );
+        assert.equal(baseline.usage.total_tokens, 1200);
+
         const outcome = await manager.processRequest(
           claudeSessionRequest('codex-usage-last-total'),
-          codexUserRequest('Mixed total and last usage turn.'),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Establish a cumulative usage baseline.' },
+              { role: 'assistant', content: 'done' },
+              { role: 'user', content: 'Mixed total and last usage turn.' },
+            ],
+            tools: [],
+          },
           codexRoute()
         );
 
         assert.deepEqual(outcome.usage, {
-          input_tokens: 80,
-          output_tokens: 12,
-          cache_read_input_tokens: 40,
-          reasoning_output_tokens: 3,
-          total_tokens: 132,
+          input_tokens: 110,
+          output_tokens: 20,
+          cache_read_input_tokens: 60,
+          cache_write_input_tokens: 30,
+          reasoning_output_tokens: 7,
+          total_tokens: 220,
         });
-        ok('Codex last usage snapshots drive per-response Anthropic usage when available');
+        ok('Codex total deltas include every upstream response in the Claude turn');
       } finally {
         await manager.close();
       }
@@ -4042,7 +4134,7 @@ await runTest('Codex app-server invalid JSON rejects startup without crashing th
   }
 });
 
-await runTest('Codex app-server control socket resets fail and evict the session immediately', async function testCodexControlSocketResetEvictsSession() {
+await runTest('Codex app-server stderr stays diagnostic until the process exits', async function testCodexControlSocketResetEvictsSession() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-control-reset-'));
   const codexPath = path.join(tempDir, 'codex-control-reset');
 
@@ -4061,6 +4153,7 @@ await runTest('Codex app-server control socket resets fail and evict the session
         '  }\n' +
         "  if (message.method === 'thread/start') {\n" +
         "    process.stderr.write('ERROR: remote app server at `unix:///tmp/app-server-control.sock` transport failed: WebSocket protocol error: Connection reset without closing handshake\\n');\n" +
+        '    setTimeout(function exitAfterDiagnostic() { process.exit(1); }, 10);\n' +
         '  }\n' +
         '});\n' +
         'setInterval(function keepAlive() {}, 1000);\n'
@@ -4086,11 +4179,11 @@ await runTest('Codex app-server control socket resets fail and evict the session
         },
         codexRoute()
       ),
-      /Connection reset without closing handshake/u
+      /exited unexpectedly/u
     );
     assert.equal(manager.sessions.size, 0);
     await manager.close();
-    ok('Codex control socket reset stderr rejects and evicts without waiting for timeout');
+    ok('diagnostic stderr does not corrupt JSON-RPC while a real process exit still evicts promptly');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -4715,7 +4808,7 @@ await runTest('Codex sessions recycle when Claude rewinds or compacts the transc
   }
 });
 
-await runTest('Codex sessions recycle before the reported context can overflow the window', async function testCodexSessionContextPressureRecycle() {
+await runTest('Codex sessions leave live context ownership to native app-server compaction', async function testCodexSessionContextPressureRecycle() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-recycle-'));
   const codexPath = path.join(tempDir, 'codex-recycle');
   const turnLogPath = path.join(tempDir, 'turn-log.json');
@@ -4774,8 +4867,8 @@ await runTest('Codex sessions recycle before the reported context can overflow t
         },
       });
 
-      // First turn reports 100 context tokens against a 100-token budget and a
-      // 120-token window, exceeding the 75% recycle threshold.
+      // First turn reports pressure near the model window. The gateway keeps
+      // the live app-server thread and lets native Codex compaction own it.
       await manager.processRequest(
         gatewayRequest(),
         {
@@ -4792,7 +4885,7 @@ await runTest('Codex sessions recycle before the reported context can overflow t
           model: CODEX_REQUEST_MODEL,
           messages: [
             { role: 'user', content: 'hi' },
-            { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+            { role: 'assistant', content: [] },
             { role: 'user', content: 'again' },
           ],
           tools: [],
@@ -4802,11 +4895,11 @@ await runTest('Codex sessions recycle before the reported context can overflow t
 
       const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
       assert.equal(turns.length, 2);
-      assert.notEqual(turns[0].pid, turns[1].pid);
+      assert.equal(turns[0].pid, turns[1].pid);
       assert.equal(turns[1].input.includes('again'), true);
-      assert.equal(turns[1].input.includes('hi'), true);
+      assert.equal(turns[1].input.includes('hi'), false);
       await manager.close();
-      ok('context-pressured Codex sessions are replaced by a fresh transcript-replay thread');
+      ok('context pressure no longer flattens and replays Claude history into a replacement process');
     } finally {
       if (previousTarget === undefined) {
         delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
@@ -4820,7 +4913,7 @@ await runTest('Codex sessions recycle before the reported context can overflow t
 });
 
 await runTest(
-  'Codex sessions recycle against configured budget when the model window is larger',
+  'Codex input budgets do not force live process recycling',
   async function testCodexSessionRecycleUsesConfiguredBudget() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-budget-recycle-'));
     const codexPath = path.join(tempDir, 'codex-budget-recycle');
@@ -4896,7 +4989,7 @@ await runTest(
             model: CODEX_REQUEST_MODEL,
             messages: [
               { role: 'user', content: 'hi' },
-              { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+              { role: 'assistant', content: [] },
               { role: 'user', content: 'again' },
             ],
             tools: [],
@@ -4906,11 +4999,11 @@ await runTest(
 
         const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
         assert.equal(turns.length, 2);
-        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[0].pid, turns[1].pid);
         assert.equal(turns[1].input.includes('again'), true);
-        assert.equal(turns[1].input.includes('hi'), true);
+        assert.equal(turns[1].input.includes('hi'), false);
         await manager.close();
-        ok('Codex session pressure honors the configured input budget before the learned window');
+        ok('configured input budgets bound payloads without replacing live Codex sessions');
       } finally {
         if (previousTarget === undefined) {
           delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
@@ -4925,16 +5018,16 @@ await runTest(
 );
 
 await runTest(
-  'Codex keeps a 12k-line matching tool_result on its pending call under stale usage',
+  'Codex keeps 12,001-line Read coverage contiguous on its pending call under stale usage',
   async function testCodexToolResultStaysOnPendingCallUnderStaleUsage() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-'));
     const codexPath = path.join(tempDir, 'codex-tool-result-replay');
     const turnLogPath = path.join(tempDir, 'turn-log.json');
     const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
     const replayMarker = 'RESULT_MARKER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
-    const largeResult = Array.from({ length: 12_000 }, function resultLine(_, index) {
+    const largeResult = Array.from({ length: 12_001 }, function resultLine(_, index) {
       const sentinel = index === 6_000 ? replayMarker : 'payload';
-      return `line-${String(index + 1).padStart(5, '0')} ${sentinel} ${'x'.repeat(32)}`;
+      return `${String(index + 1)}\tline-${String(index + 1).padStart(5, '0')} ${sentinel} ${'x'.repeat(32)}`;
     }).join('\n');
 
     try {
@@ -4977,7 +5070,7 @@ await runTest(
           '    }\n' +
           '    setTimeout(function emitUsageAndToolCall() {\n' +
           "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 1 }, modelContextWindow: 120 } } });\n" +
-          "      send({ id: 'tool_req_replay', method: 'item/tool/call', params: { turnId, callId: 'call_replay', tool: 'ext_tool_001', arguments: {} } });\n" +
+          "      send({ id: 'tool_req_replay', method: 'item/tool/call', params: { turnId, callId: 'call_replay', tool: 'ext_tool_001', arguments: { file_path: 'C:\\\\Workspace\\\\12001-lines.txt' } } });\n" +
           '    }, 5);\n' +
           '    return;\n' +
           '  }\n' +
@@ -5003,23 +5096,28 @@ await runTest(
             cwd: tempDir,
             idleTimeoutMs: 0,
             inputMaxTokens: 100,
-            toolResultMaxBytes: 10_000,
+            toolResultMaxBytes: 0,
+            toolResultWindowMaxBytes: 0,
           },
         });
 
         const tools = [
           {
-            name: 'lookup',
+            name: 'Read',
             input_schema: {
               type: 'object',
-              properties: {},
+              properties: {
+                file_path: { type: 'string' },
+                offset: { type: 'integer' },
+                limit: { type: 'integer' },
+              },
             },
           },
         ];
         const openingMessages = [
           { role: 'user', content: 'Background context. '.repeat(8) },
           { role: 'assistant', content: [{ type: 'text', text: 'Prior analysis. '.repeat(4) }] },
-          { role: 'user', content: 'Call the lookup tool and wait for the result.' },
+          { role: 'user', content: 'Read the whole 12,001-line file and account for every line.' },
         ];
         const initialRequest = {
           model: CODEX_REQUEST_MODEL,
@@ -5031,8 +5129,8 @@ await runTest(
         assert.equal(toolUse.type, 'tool_use');
         assert.deepEqual(toolUse.toolCall, {
           id: 'call_replay',
-          name: 'lookup',
-          input: {},
+          name: 'Read',
+          input: { file_path: 'C:\\Workspace\\12001-lines.txt' },
         });
 
         const finalOutcome = await manager.processRequest(
@@ -5047,8 +5145,8 @@ await runTest(
                   {
                     type: 'tool_use',
                     id: 'call_replay',
-                    name: 'lookup',
-                    input: {},
+                    name: 'Read',
+                    input: { file_path: 'C:\\Workspace\\12001-lines.txt' },
                   },
                 ],
               },
@@ -5059,6 +5157,16 @@ await runTest(
                     type: 'tool_result',
                     tool_use_id: 'call_replay',
                     content: largeResult,
+                  },
+                ],
+              },
+              {
+                role: 'system',
+                content: [
+                  {
+                    type: 'text',
+                    text:
+                      '[Truncated: PARTIAL view — /mnt/c/workspace/12001-lines.txt: showing lines 1-12001 of 20000 total (50000 tokens, cap 25000). Call Read with offset=12002 limit=12001 for the next page, or Grep to find a specific section. Do NOT answer from this page alone if the answer may be further in the file.]',
                   },
                 ],
               },
@@ -5076,13 +5184,25 @@ await runTest(
         assert.equal(finalOutcome.type, 'final');
         assert.equal(turns.length, 1);
         assert.equal(toolResponses[0].pid, turns[0].pid);
-        assert.match(continuedText, /^Warning: truncated output/u);
-        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 10_000, true);
-        assert.equal(continuedText.includes('line-00001'), true);
-        assert.equal(continuedText.includes('line-12000'), true);
+        assert.match(continuedText, /^1\tline-00001/u);
+        assert.equal(Buffer.byteLength(continuedText, 'utf8') <= 36_000, true);
+        const metadata = JSON.parse(
+          continuedText.split('[Codex Read page metadata]\n')[1].split('\n')[0]
+        );
+        assert.equal(metadata.path, 'C:\\Workspace\\12001-lines.txt');
+        assert.equal(metadata.covered_start, 1);
+        assert.equal(metadata.covered_end < 12_001, true);
+        assert.equal(metadata.source_total_lines, 20_000);
+        assert.equal(metadata.next_offset, metadata.covered_end + 1);
+        assert.equal(metadata.next_limit, metadata.covered_end);
+        assert.equal(metadata.contiguous, true);
+        assert.equal(metadata.source_complete, false);
+        assert.equal(continuedText.includes(`${metadata.covered_end}\tline-`), true);
+        assert.equal(continuedText.includes(`${metadata.covered_end + 1}\tline-`), false);
+        assert.equal(continuedText.includes('12001\tline-12001'), false);
         assert.equal(continuedText.includes(replayMarker), false);
         ok(
-          'a large raw result is hard-bounded and continued on the original pending app-server call'
+          'a large Read result exposes only a gap-free prefix and exact next offset on the live call'
         );
       } finally {
         await manager?.close();
@@ -5344,8 +5464,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
       );
 
       // A brand-new session must render its bootstrap transcript inside the
-      // learned window and below the recycle threshold:
-      // floor(floor(80 * 0.8) * 0.75 * 0.9) = 43 tokens = 129 chars.
+      // learned effective window with 25% output headroom: 60 tokens.
       await manager.processRequest(
         claudeSessionRequest('learned-window-b'),
         {
@@ -5362,7 +5481,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
 
       const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
       assert.equal(turns.length, 2);
-      assert.equal(turns[1].input.length <= 43 * 3, true);
+      assert.equal(turns[1].input.length <= 60 * 3, true);
       assert.equal(turns[1].input.includes('KEEP'), true);
       assert.equal(turns[1].input.includes('Ancient history'), false);
       await manager.close();
@@ -6698,6 +6817,7 @@ await runTest('non-loopback health checks hide diagnostics without gateway auth'
       sharedSecret: 'health-secret',
       runtimeRevision: 'private-revision',
       traceDir: '/tmp/private-example-trace',
+      anthropicPassthroughModels: [],
     })
   );
   await waitForListening(runtime.server);
@@ -7204,6 +7324,21 @@ await runTest(
 
       await makeClaudeShouldNotRunCommand(claudePath);
 
+      await makeClaudeExecutable(
+        claudePath,
+        '#!/bin/bash\n' +
+          'echo "CLAUDE SHOULD NOT RUN" >&2\n' +
+          'exit 99\n',
+        '2.1.249'
+      );
+      const outdatedClaude = await runLauncher({
+        ULTRATHINK_GATEWAY_CODEX_COMMAND: loggedInCodexPath,
+      });
+      assert.equal(outdatedClaude.code, 1);
+      assert.match(outdatedClaude.stderr, /requires Claude Code 2\.1\.250 or newer/u);
+
+      await makeClaudeShouldNotRunCommand(claudePath);
+
       const missingCodex = await runLauncher({
         ULTRATHINK_GATEWAY_CODEX_COMMAND: missingCodexPath,
       });
@@ -7239,7 +7374,7 @@ await runTest(
     const capturedEnvPath = path.join(tempDir, 'claude-env.json');
 
     try {
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +
@@ -7337,7 +7472,7 @@ await runTest(
     });
 
     try {
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "const fs = require('node:fs');\n" +
@@ -7394,7 +7529,7 @@ await runTest(
 );
 
 await runTest(
-  'claude-workflow enables routed model display metadata by default',
+  'claude-workflow preserves concise response model IDs by default',
   async function testWorkflowCliDisplayRoutedModelDefault() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-cli-display-model-'));
     const claudePath = path.join(tempDir, 'claude');
@@ -7448,7 +7583,7 @@ await runTest(
         '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n',
         { mode: 0o600 }
       );
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "const fs = require('node:fs');\n" +
@@ -7476,8 +7611,8 @@ await runTest(
       await makeCodexLoginStatusCommand(codexPath);
 
       const defaultHealth = await runWithDisplayEnv('default-health.json');
-      const optedOutHealth = await runWithDisplayEnv('opted-out-health.json', {
-        CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL: 'false',
+      const optedInHealth = await runWithDisplayEnv('opted-in-health.json', {
+        CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL: 'true',
       });
       const workflowOptOutHealth = await runWithDisplayEnv('workflow-opt-out-health.json', {
         CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL: 'false',
@@ -7509,7 +7644,7 @@ await runTest(
         ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-opus-5-20260724',
       });
       const glmMainHealth = await runWithDisplayEnv('glm-main-health.json', {
-        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'glm-5.2[1m]',
+        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'glm-5.2',
         ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'glm',
         ULTRATHINK_GATEWAY_GLM_API_KEY: 'glm-key',
         ULTRATHINK_GATEWAY_GLM_MODEL: 'glm-5.2',
@@ -7527,17 +7662,17 @@ await runTest(
         }),
       });
 
-      assert.equal(defaultHealth.health.display_routed_model, true);
+      assert.equal(defaultHealth.health.display_routed_model, false);
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
-      assert.equal(defaultHealth.autoCompactWindow, '');
-      // The launcher now defaults the main model to Opus 5 1m and keeps
+      assert.equal(defaultHealth.autoCompactWindow, '784800');
+      // The launcher defaults the main model to native-1M Opus 5 and keeps
       // the Opus 5 family on Anthropic; lower-tier Claude ids route to Codex Terra.
       assert.deepEqual(
         defaultHealth.health.anthropic_passthrough_models,
         ['claude-opus-5*']
       );
       assert.equal(
-        defaultHealth.health.exposed_models.includes('claude-opus-5[1m]'),
+        defaultHealth.health.exposed_models.includes('claude-opus-5'),
         true
       );
       assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.6-terra');
@@ -7546,11 +7681,11 @@ await runTest(
         modelDisplayName(defaultHealth, 'claude-sonnet-4-7') || '',
         /Codex gpt-5\.6-terra/u
       );
-      assert.equal(optedOutHealth.health.display_routed_model, false);
-      assert.equal(optedOutHealth.subagentModel, 'claude-sonnet-5');
+      assert.equal(optedInHealth.health.display_routed_model, true);
+      assert.equal(optedInHealth.subagentModel, 'codex-terra');
       assert.equal(workflowOptOutHealth.health.display_routed_model, false);
-      assert.equal(workflowOptOutHealth.subagentModel, 'claude-sonnet-5');
-      assert.equal(customRouteHealth.subagentModel, 'codex-gpt-custom-xhigh-via-claude-sonnet-5');
+      assert.equal(workflowOptOutHealth.subagentModel, 'codex-terra');
+      assert.equal(customRouteHealth.subagentModel, 'codex-gpt-custom');
       assert.equal(
         customRouteHealth.health.exposed_models.includes(customRouteHealth.subagentModel),
         true
@@ -7568,26 +7703,26 @@ await runTest(
       );
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
-      assert.equal(deepSeekMainHealth.autoCompactWindow, '');
+      assert.equal(deepSeekMainHealth.autoCompactWindow, '784800');
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-opus-5[1m]'),
+        undefined
+      );
+      assert.equal(
+        modelDisplayName(deepSeekMainHealth, 'deepseek-v4-pro'),
         'DeepSeek Main Route'
       );
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-opus-5'),
-        'DeepSeek Main Route'
-      );
-      assert.equal(
-        modelDisplayName(deepSeekMainHealth, 'claude-opus-5-20260724'),
-        'DeepSeek Main Route'
+        undefined
       );
       assert.equal(glmMainHealth.health.glm_model, 'glm-5.2');
       assert.equal(glmMainHealth.health.glm_reasoning_effort, 'max');
       assert.equal(glmMainHealth.health.glm_thinking, 'enabled');
-      assert.equal(glmMainHealth.autoCompactWindow, '1000000');
+      assert.equal(glmMainHealth.autoCompactWindow, '784800');
       assert.equal(
         modelDisplayName(glmMainHealth, 'glm-5.2[1m]'),
-        'GLM Main Route'
+        undefined
       );
       assert.equal(
         modelDisplayName(glmMainHealth, 'glm-5.2'),
@@ -7602,7 +7737,7 @@ await runTest(
         invalidRoute.result.stderr,
         /entry for claude-sonnet-5 must set provider/u
       );
-      ok('claude-workflow defaults routed response model display on and supports explicit opt-out');
+      ok('claude-workflow keeps concise response IDs by default and supports explicit routed metadata');
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -7624,7 +7759,7 @@ await runTest(
     try {
       await fs.mkdir(projectA, { recursive: true });
       await fs.mkdir(projectB, { recursive: true });
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +
@@ -7825,7 +7960,7 @@ await runTest(
     }
 
     try {
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +
@@ -7997,7 +8132,8 @@ await runTest(
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
-  }
+  },
+  60_000
 );
 
 await runTest(
@@ -8011,7 +8147,7 @@ await runTest(
     const settingsPathMarker = path.join(tempDir, 'claude-settings-path');
 
     try {
-      await makeExecutable(
+      await makeClaudeExecutable(
         claudePath,
         '#!/usr/bin/env node\n' +
           "import fs from 'node:fs';\n" +

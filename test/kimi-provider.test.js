@@ -23,9 +23,11 @@ import {
 
 const KIMI_API_KEY = 'test-kimi-upstream-key';
 const GATEWAY_SECRET = 'test-gateway-client-secret';
-const KIMI_MODEL_ALIAS = 'k3[1m]';
+const KIMI_MODEL_ALIAS = 'k3';
 const KIMI_UPSTREAM_MODEL = 'k3';
 const KIMI_CONTEXT_TOKENS = 1_048_576;
+const CLAUDE_COMMON_CONTEXT_TOKENS = 828_400;
+const CLAUDE_COMMON_AUTO_COMPACT_TOKENS = 784_800;
 const DAEMON_PATH = fileURLToPath(
   new URL('../js/cli/claude-workflow-daemon.js', import.meta.url)
 );
@@ -33,6 +35,10 @@ const DAEMON_PATH = fileURLToPath(
 const ISOLATED_ENV_NAMES = Object.freeze([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME',
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
@@ -40,6 +46,7 @@ const ISOLATED_ENV_NAMES = Object.freeze([
   'ANTHROPIC_MODEL',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_DISABLE_TERMINAL_TITLE',
+  'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
   'CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL',
@@ -155,7 +162,7 @@ function assertKimiRoute(route) {
   assert.equal(route.contextTokens, KIMI_CONTEXT_TOKENS);
 }
 
-test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', async function () {
+test('Kimi profile uses plain K3 with max thinking and the shared Codex-safe context', async function () {
   await withIsolatedEnvironment(
     {
       ANTHROPIC_DEFAULT_FABLE_MODEL: 'stale-fable-route',
@@ -192,8 +199,10 @@ test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', 
         },
         /Kimi routes require gateway authentication/u
       );
-      assert.equal(workflow.config.exposedModels.includes(KIMI_MODEL_ALIAS), true);
-      assert.equal(workflow.config.exposedModels.includes(KIMI_UPSTREAM_MODEL), true);
+      assert.equal(
+        workflow.config.exposedModels.filter((model) => model === KIMI_MODEL_ALIAS).length,
+        1
+      );
       assertKimiRoute(resolveModelRoute(KIMI_MODEL_ALIAS, workflow.config));
       assert.equal(
         resolveModelRoute(KIMI_UPSTREAM_MODEL, workflow.config).upstreamModel,
@@ -212,10 +221,27 @@ test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', 
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL, workflow.subagentModelId);
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, workflow.subagentModelId);
-      assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, String(KIMI_CONTEXT_TOKENS));
-      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(KIMI_CONTEXT_TOKENS));
+      assert.equal(
+        clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+        String(CLAUDE_COMMON_AUTO_COMPACT_TOKENS)
+      );
+      assert.equal(
+        clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+        String(CLAUDE_COMMON_CONTEXT_TOKENS)
+      );
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
       assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, KIMI_MODEL_ALIAS);
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Kimi K3 Main Route');
+      assert.equal(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+        'kimi:k3/max through claude-workflow'
+      );
+      assert.equal(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+        'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
+      );
       assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
       assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
       assert.equal(
@@ -229,18 +255,63 @@ test('Kimi profile, K3 route, and workflow environment use max thinking at 1M', 
       const daemonEnvironment = serializeWorkflowEnvironment(clientEnv);
       assert.equal(daemonEnvironment.includes(KIMI_API_KEY), false);
       assert.equal(daemonEnvironment.includes('KIMI_API_KEY'), false);
-      assert.match(daemonEnvironment, /export ANTHROPIC_MODEL='k3\[1m\]'/u);
+      assert.match(daemonEnvironment, /export ANTHROPIC_MODEL='k3'/u);
       assert.match(
         daemonEnvironment,
-        /export CLAUDE_CODE_AUTO_COMPACT_WINDOW='1048576'/u
+        /export CLAUDE_CODE_AUTO_COMPACT_WINDOW='784800'/u
       );
       assert.match(
         daemonEnvironment,
-        /export CLAUDE_CODE_MAX_CONTEXT_TOKENS='1048576'/u
+        /export CLAUDE_CODE_MAX_CONTEXT_TOKENS='828400'/u
       );
+      assert.match(
+        daemonEnvironment,
+        /export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK='1'/u
+      );
+      assert.match(daemonEnvironment, /export ANTHROPIC_CUSTOM_MODEL_OPTION='k3'/u);
       assert.match(daemonEnvironment, /export CLAUDE_CODE_EFFORT_LEVEL='max'/u);
     }
   );
+});
+
+test('Kimi credentials require HTTPS except on loopback development gateways', async function () {
+  const commonEnvironment = {
+    ULTRATHINK_GATEWAY_KIMI_API_KEY: KIMI_API_KEY,
+    ULTRATHINK_GATEWAY_MAIN_MODEL_ID: KIMI_MODEL_ALIAS,
+    ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'kimi',
+  };
+
+  for (const baseUrl of [
+    'https://example.com/coding/',
+    'http://localhost:8787/coding/',
+    'http://127.0.0.1:8787/coding/',
+    'http://[::1]:8787/coding/',
+  ]) {
+    await withIsolatedEnvironment(
+      { ...commonEnvironment, ULTRATHINK_GATEWAY_KIMI_BASE_URL: baseUrl },
+      async function acceptSecureOrLoopbackEndpoint() {
+        const workflow = buildWorkflowGatewayConfig();
+        assert.equal(workflow.config.kimi.baseUrl, baseUrl);
+        assert.equal(resolveModelRoute(workflow.mainModelId, workflow.config).provider, 'kimi');
+      }
+    );
+  }
+
+  for (const [baseUrl, expected] of [
+    ['not a URL', /requires a valid ULTRATHINK_GATEWAY_KIMI_BASE_URL/u],
+    ['ftp://example.com/coding/', /requires an https:\/\/ base URL/u],
+    ['http://example.com/coding/', /refuses remote http:\/\/ base URLs/u],
+  ]) {
+    await withIsolatedEnvironment(
+      { ...commonEnvironment, ULTRATHINK_GATEWAY_KIMI_BASE_URL: baseUrl },
+      async function rejectCredentialExposingEndpoint() {
+        assert.throws(() => {
+          const workflow = buildWorkflowGatewayConfig();
+          resolveModelRoute(workflow.mainModelId, workflow.config);
+        }, expected);
+      }
+    );
+  }
 });
 
 test('route switches discard only stale workflow-owned Anthropic credentials', async function () {
@@ -356,16 +427,20 @@ test('Kimi client settings follow only the resolved main route', async function 
         workflow.mainModelId
       );
       assert.equal(workflow.mainModelId.startsWith('claude-opus-5'), true);
-      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, null);
-      assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, null);
+      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
+      assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+      assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, workflow.subagentModelId);
+      assert.match(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, /^Codex /u);
       assert.equal(
         Object.hasOwn(clientEnv, 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE'),
         false
       );
       const serialized = serializeWorkflowEnvironment(clientEnv);
-      assert.match(serialized, /^unset CLAUDE_CODE_AUTO_COMPACT_WINDOW\b/mu);
-      assert.match(serialized, /^unset CLAUDE_CODE_EFFORT_LEVEL\b/mu);
-      assert.match(serialized, /^unset CLAUDE_CODE_MAX_CONTEXT_TOKENS\b/mu);
+      assert.match(serialized, /export CLAUDE_CODE_AUTO_COMPACT_WINDOW='784800'/u);
+      assert.match(serialized, /export CLAUDE_CODE_EFFORT_LEVEL='max'/u);
+      assert.match(serialized, /export CLAUDE_CODE_MAX_CONTEXT_TOKENS='828400'/u);
     }
   );
 
@@ -391,6 +466,8 @@ test('Kimi client settings follow only the resolved main route', async function 
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'high');
       assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '262144');
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '262144');
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, KIMI_UPSTREAM_MODEL);
     }
   );
 });
@@ -605,7 +682,7 @@ test('Kimi gateway preserves the Anthropic wire protocol without leaking client 
         });
         assert.equal(
           countPayload.input_tokens,
-          Math.ceil(Buffer.byteLength(serializedCountInput, 'utf8') / 2)
+          Buffer.byteLength(serializedCountInput, 'utf8')
         );
 
         const unicodeCountRequest = {
@@ -628,7 +705,7 @@ test('Kimi gateway preserves the Anthropic wire protocol without leaking client 
         });
         assert.equal(
           unicodeCountPayload.input_tokens,
-          Math.ceil(Buffer.byteLength(serializedUnicodeInput, 'utf8') / 2)
+          Buffer.byteLength(serializedUnicodeInput, 'utf8')
         );
         assert.equal(requests.length, upstreamCallsBeforeCount);
 

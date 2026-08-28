@@ -668,7 +668,12 @@ export function estimateAnthropicInputTokens(requestBody) {
     tools: requestBody.tools,
     tool_choice: requestBody.tool_choice,
   });
-  return Math.max(1, Math.ceil(serialized.length / 4));
+  // This endpoint supplies a local preflight estimate for routes whose native
+  // tokenizer is unavailable. The 2:1 UTF-8-byte heuristic intentionally
+  // favors source code but is not a formal upper bound. Actual Codex turn usage
+  // remains authoritative once app-server reports it. Providers that need an
+  // early fail-closed ceiling use the separate conservative-estimate policy.
+  return Math.max(1, Math.ceil(Buffer.byteLength(serialized, 'utf8') / 2));
 }
 
 export function formatAnthropicError(error) {

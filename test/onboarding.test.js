@@ -18,7 +18,6 @@ import {
 } from '../js/cli/onboarding.js';
 import {
   CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
-  inspectClaudeThirdPartyModelSupport,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
 
@@ -103,11 +102,11 @@ async function installFakeNativeTools(root) {
     [
       '#!/usr/bin/env bash',
       'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'claude:%s|%s|%s|%s|%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY+x}" "${QWEN_API_KEY+x}" "${BAILIAN_TOKEN_PLAN_API_KEY+x}" "${DASHSCOPE_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
-      'if [ "${1:-}" = "--version" ]; then echo "2.1.206 (Claude Code)"; exit 0; fi',
+      'if [ "${1:-}" = "--version" ]; then echo "${FAKE_CLAUDE_VERSION:-2.1.250} (Claude Code)"; exit 0; fi',
       'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ] && [ "${3:-}" = "--json" ]; then if [ "${FAKE_CLAUDE_LOGGED_OUT:-}" = "1" ]; then echo \'{"loggedIn":false}\'; exit 1; fi; echo \'{"loggedIn":true}\'; exit 0; fi',
       'if [ -n "${FAKE_CLAUDE_SETTINGS_CAPTURE_FILE:-}" ]; then _cw_args=("$@"); for ((_cw_i=0; _cw_i<${#_cw_args[@]}; _cw_i++)); do if [ "${_cw_args[$_cw_i]}" = "--settings" ]; then _cw_i=$((_cw_i + 1)); cp "${_cw_args[$_cw_i]}" "$FAKE_CLAUDE_SETTINGS_CAPTURE_FILE"; break; fi; done; fi',
       'if [ -n "${FAKE_CLAUDE_ARGS_FILE:-}" ]; then printf \'%s\\n\' "$@" > "$FAKE_CLAUDE_ARGS_FILE"; if [ -z "${FAKE_CLAUDE_ENV_FILE:-}" ]; then exit 0; fi; fi',
-      'if [ -n "${FAKE_CLAUDE_ENV_FILE:-}" ]; then printf \'%s\\n\' "${ULTRATHINK_GATEWAY_KIMI_API_KEY-unset}" "${KIMI_API_KEY-unset}" "${ANTHROPIC_MODEL-unset}" "${CLAUDE_CODE_EFFORT_LEVEL-unset}" "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-unset}" "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-unset}" "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY-unset}" "${QWEN_API_KEY-unset}" "${BAILIAN_TOKEN_PLAN_API_KEY-unset}" "${DASHSCOPE_API_KEY-unset}" "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-unset}" > "$FAKE_CLAUDE_ENV_FILE"; exit 0; fi',
+      'if [ -n "${FAKE_CLAUDE_ENV_FILE:-}" ]; then printf \'%s\\n\' "${ULTRATHINK_GATEWAY_KIMI_API_KEY-unset}" "${KIMI_API_KEY-unset}" "${ANTHROPIC_MODEL-unset}" "${CLAUDE_CODE_EFFORT_LEVEL-unset}" "${CLAUDE_CODE_AUTO_COMPACT_WINDOW-unset}" "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-unset}" "${CLAUDE_WORKFLOW_GATEWAY_MANAGED_AUTH_TOKEN-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY-unset}" "${QWEN_API_KEY-unset}" "${BAILIAN_TOKEN_PLAN_API_KEY-unset}" "${DASHSCOPE_API_KEY-unset}" "${CLAUDE_CODE_DISABLE_TERMINAL_TITLE-unset}" "${ANTHROPIC_CUSTOM_MODEL_OPTION-unset}" "${ANTHROPIC_CUSTOM_MODEL_OPTION_NAME-unset}" "${ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION-unset}" "${CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK-unset}" > "$FAKE_CLAUDE_ENV_FILE"; exit 0; fi',
       'exit 2',
       '',
     ].join('\n'),
@@ -118,7 +117,7 @@ async function installFakeNativeTools(root) {
     [
       '#!/usr/bin/env bash',
       'if [ -n "${FAKE_NATIVE_ENV_FILE:-}" ]; then printf \'codex:%s|%s|%s|%s|%s|%s|%s\\n\' "$*" "${ULTRATHINK_GATEWAY_KIMI_API_KEY+x}" "${KIMI_API_KEY+x}" "${ULTRATHINK_GATEWAY_QWEN_API_KEY+x}" "${QWEN_API_KEY+x}" "${BAILIAN_TOKEN_PLAN_API_KEY+x}" "${DASHSCOPE_API_KEY+x}" >> "$FAKE_NATIVE_ENV_FILE"; fi',
-      'if [ "${1:-}" = "--version" ]; then echo "codex-cli ${FAKE_CODEX_VERSION:-0.144.1}"; exit 0; fi',
+      'if [ "${1:-}" = "--version" ]; then echo "codex-cli ${FAKE_CODEX_VERSION:-0.150.1}"; exit 0; fi',
       'if [ "${1:-}" = "login" ] && [ "${2:-}" = "status" ]; then',
       '  if [ "${FAKE_CODEX_LOGGED_OUT:-}" = "1" ]; then echo "Not logged in"; exit 1; fi',
       '  echo "Logged in using ChatGPT"; exit 0',
@@ -201,7 +200,7 @@ test(
 );
 
 test(
-  'Claude third-party-model preparation preserves state and never rewrites persistent settings',
+  'Claude third-party-model preparation is a state-preserving compatibility no-op',
   { skip: process.platform === 'win32' },
   async function (t) {
     const home = await temporaryDirectory(t, 'claude-workflow-claude-state-');
@@ -231,33 +230,28 @@ test(
     const env = isolatedEnvironment(home);
 
     const prepared = prepareClaudeThirdPartyModelSupport(env);
-    assert.equal(prepared.changed, true);
-    assert.equal(prepared.stateChanged, true);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
     assert.equal(prepared.settingsChanged, false);
-    assert.equal(prepared.backupPath, `${target}.claude-workflow.bak`);
+    assert.equal(prepared.backupPath, null);
     assert.equal(prepared.settingsBackupPath, null);
-    assert.equal(await fsp.readFile(prepared.backupPath, 'utf8'), original);
-    const state = JSON.parse(await fsp.readFile(target, 'utf8'));
-    assert.equal(state.theme, 'dark');
-    assert.equal(state.hasCompletedOnboarding, true);
-    assert.equal(state.penguinModeOrgEnabled, true);
+    assert.equal(await fsp.readFile(target, 'utf8'), original);
     assert.equal(await fsp.readFile(settingsPath, 'utf8'), originalSettings);
-    assert.equal(inspectClaudeThirdPartyModelSupport(env).enabled, true);
-    assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
-    assert.equal((await fsp.stat(prepared.backupPath)).mode & 0o777, 0o600);
+    assert.equal((await fsp.stat(target)).mode & 0o777, 0o644);
     assert.equal((await fsp.stat(settingsPath)).mode & 0o777, 0o644);
+    await assert.rejects(fsp.access(`${target}.claude-workflow.bak`));
 
     const repeated = prepareClaudeThirdPartyModelSupport(env);
     assert.equal(repeated.changed, false);
     assert.equal(repeated.backupPath, null);
     assert.equal(repeated.settingsBackupPath, null);
-    assert.equal(await fsp.readFile(`${target}.claude-workflow.bak`, 'utf8'), original);
+    assert.equal(await fsp.readFile(target, 'utf8'), original);
     await assert.rejects(fsp.access(`${settingsPath}.claude-workflow.bak`));
   }
 );
 
 test(
-  'Claude third-party-model preparation refuses a symlink state file',
+  'Claude third-party-model preparation does not inspect or mutate a symlinked state file',
   { skip: process.platform === 'win32' },
   async function (t) {
     const home = await temporaryDirectory(t, 'claude-workflow-claude-state-link-');
@@ -265,63 +259,12 @@ test(
     const target = path.join(home, '.claude.json');
     await fsp.writeFile(real, '{"preserved":true}\n');
     await fsp.symlink(real, target);
-    assert.throws(
-      () => prepareClaudeThirdPartyModelSupport(isolatedEnvironment(home)),
-      /regular file, not a symlink/u
-    );
+    const prepared = prepareClaudeThirdPartyModelSupport(isolatedEnvironment(home));
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(prepared.backupPath, null);
+    assert.equal((await fsp.lstat(target)).isSymbolicLink(), true);
     assert.equal(await fsp.readFile(real, 'utf8'), '{"preserved":true}\n');
-  }
-);
-
-test(
-  'third-party readiness ignores malformed and symlinked persistent settings',
-  { skip: process.platform === 'win32' },
-  async function (t) {
-    const home = await temporaryDirectory(t, 'claude-workflow-claude-settings-inspection-');
-    const settingsDirectory = path.join(home, '.claude');
-    const statePath = path.join(home, '.claude.json');
-    const settingsPath = path.join(settingsDirectory, 'settings.json');
-    await fsp.mkdir(settingsDirectory);
-    await fsp.writeFile(
-      statePath,
-      '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n'
-    );
-
-    await fsp.writeFile(settingsPath, '{not-json\n');
-    assert.equal(inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)).enabled, true);
-
-    await fsp.rm(settingsPath);
-    const realSettings = path.join(home, 'real-settings.json');
-    await fsp.writeFile(realSettings, '{}\n');
-    await fsp.symlink(realSettings, settingsPath);
-    assert.equal(inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)).enabled, true);
-  }
-);
-
-test(
-  'third-party readiness still validates the state file',
-  { skip: process.platform === 'win32' },
-  async function (t) {
-    const home = await temporaryDirectory(t, 'claude-workflow-claude-state-inspection-');
-    const statePath = path.join(home, '.claude.json');
-
-    await fsp.writeFile(statePath, '{not-json\n');
-    assert.throws(
-      () => inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)),
-      /Claude state file is not valid JSON/u
-    );
-
-    await fsp.rm(statePath);
-    const realState = path.join(home, 'real-state.json');
-    await fsp.writeFile(
-      realState,
-      '{"hasCompletedOnboarding":true,"penguinModeOrgEnabled":true}\n'
-    );
-    await fsp.symlink(realState, statePath);
-    assert.throws(
-      () => inspectClaudeThirdPartyModelSupport(isolatedEnvironment(home)),
-      /Claude state path must be a regular file, not a symlink/u
-    );
   }
 );
 
@@ -361,13 +304,13 @@ test(
       assert.equal(result.status, 0, `${kind}: ${result.stderr}`);
       const claudeArgs = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
       assert.ok(claudeArgs.includes('--settings'));
-      assert.ok(claudeArgs.includes('codex'));
+      assert.ok(claudeArgs.includes('codex-terra'));
     }
   }
 );
 
 test(
-  'Claude third-party-model preparation leaves a symlinked settings file untouched',
+  'Claude third-party-model preparation leaves settings untouched and creates no state',
   { skip: process.platform === 'win32' },
   async function (t) {
     const home = await temporaryDirectory(t, 'claude-workflow-claude-settings-link-');
@@ -378,8 +321,10 @@ test(
     await fsp.writeFile(real, '{"env":{"ANTHROPIC_MODEL":"stale"}}\n');
     await fsp.symlink(real, settingsPath);
     const prepared = prepareClaudeThirdPartyModelSupport(isolatedEnvironment(home));
-    assert.equal(prepared.stateChanged, true);
-    assert.equal(fs.existsSync(path.join(home, '.claude.json')), true);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(prepared.settingsChanged, false);
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
     assert.equal(
       await fsp.readFile(real, 'utf8'),
       '{"env":{"ANTHROPIC_MODEL":"stale"}}\n'
@@ -429,6 +374,14 @@ test(
     assert.match(result.stdout, /Codex CLI .*authenticated/u);
     assert.match(result.stdout, /Ready\. Run `claude-workflow`/u);
     assert.equal(fs.existsSync(path.join(home, '.claude-workflow.env')), false);
+
+    const help = runCli(['setup', '--help'], { env });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(
+      help.stdout,
+      /--prepare-claude\s+Compatibility no-op; custom models use documented per-session settings/u
+    );
+    assert.doesNotMatch(help.stdout, /Back up.*third-party-model support/u);
   }
 );
 
@@ -624,6 +577,40 @@ test(
 );
 
 test(
+  'Linux setup rejects WSL working directories on mounted Windows storage',
+  { skip: process.platform !== 'linux' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-wsl-cwd-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      SHELL: '/bin/bash',
+      WSL_DISTRO_NAME: 'Ubuntu',
+    });
+    let output = '';
+
+    assert.throws(
+      () =>
+        runSetupCommand([], {
+          cwd: '/mnt/c/Users/example/repository',
+          env,
+          stdout: {
+            write(chunk) {
+              output += String(chunk);
+              return true;
+            },
+          },
+        }),
+      /setup checks failed/u
+    );
+    assert.match(output, /\[error\] Platform WSL/u);
+    assert.match(output, /Working directory.*resolves to Windows or \/mnt storage/u);
+  }
+);
+
+test(
   'Linux setup resolves WSL state paths through intermediate symlinks',
   { skip: process.platform !== 'linux' },
   async function (t) {
@@ -678,24 +665,24 @@ test(
       PATH: `${bin}${path.delimiter}${process.env.PATH}`,
       FAKE_CLAUDE_LOGGED_OUT: '1',
       ULTRATHINK_GATEWAY_KIMI_API_KEY: 'test-kimi-setup-key',
-      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'k3[1m]',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'k3',
       ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'kimi',
     });
 
     const withoutPreparation = runCli(['setup'], { env, timeout: 5_000 });
-    assert.equal(withoutPreparation.status, 1);
+    assert.equal(withoutPreparation.status, 0, withoutPreparation.stderr);
     assert.match(
       `${withoutPreparation.stdout}\n${withoutPreparation.stderr}`,
-      /setup --prepare-claude/u
+      /custom model routing uses documented session settings/u
     );
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
 
     const result = runCli(['setup', '--prepare-claude'], { env, timeout: 5_000 });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /provider authentication via gateway/u);
-    assert.match(result.stdout, /third-party model support enabled/u);
-    const claudeState = JSON.parse(await fsp.readFile(path.join(home, '.claude.json'), 'utf8'));
-    assert.equal(claudeState.hasCompletedOnboarding, true);
-    assert.equal(claudeState.penguinModeOrgEnabled, true);
+    assert.match(result.stdout, /No Claude state changes are required/u);
+    assert.match(result.stdout, /documented per-session settings/u);
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
   }
 );
 
@@ -715,16 +702,40 @@ test(
     });
 
     const withoutPreparation = runCli(['setup'], { env, timeout: 5_000 });
-    assert.equal(withoutPreparation.status, 1);
+    assert.equal(withoutPreparation.status, 0, withoutPreparation.stderr);
     assert.match(
       `${withoutPreparation.stdout}\n${withoutPreparation.stderr}`,
-      /setup --prepare-claude/u
+      /custom model routing uses documented session settings/u
     );
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
 
     const result = runCli(['setup', '--prepare-claude'], { env, timeout: 5_000 });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /provider authentication via gateway/u);
-    assert.match(result.stdout, /third-party model support enabled/u);
+    assert.match(result.stdout, /No Claude state changes are required/u);
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
+  }
+);
+
+test(
+  'setup rejects unsupported Claude Code versions before authentication',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-setup-old-claude-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const bin = await installFakeNativeTools(root);
+    const env = isolatedEnvironment(home, {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      FAKE_CLAUDE_VERSION: '2.1.249',
+    });
+
+    const result = runCli(['setup'], { env });
+    assert.equal(result.status, 1);
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /requires Claude Code 2\.1\.250 or newer/u
+    );
   }
 );
 
@@ -743,7 +754,7 @@ test(
 
     const result = runCli(['setup'], { env });
     assert.equal(result.status, 1);
-    assert.match(`${result.stdout}\n${result.stderr}`, /requires Codex CLI 0\.144\.1 or newer/u);
+    assert.match(`${result.stdout}\n${result.stderr}`, /requires Codex CLI 0\.150\.1 or newer/u);
   }
 );
 
@@ -880,7 +891,7 @@ test(
     assert.equal(update.status, 0, update.stderr);
     const configPath = path.join(home, '.claude-workflow.env');
     const content = await fsp.readFile(configPath, 'utf8');
-    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5\[1m\]/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5/u);
     assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5\.6-sol/u);
     assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=high/u);
     assert.match(content, /CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false/u);
@@ -896,11 +907,11 @@ test(
     assert.equal(opus.status, 0, opus.stderr);
     assert.match(
       await fsp.readFile(configPath, 'utf8'),
-      /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-opus-5\[1m\]/u
+      /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-opus-5/u
     );
     const opusShow = runCli(['config'], { env });
     assert.equal(opusShow.status, 0, opusShow.stderr);
-    assert.match(opusShow.stdout, /Main\s+Opus 5 -> anthropic \(claude-opus-5\[1m\]\)/u);
+    assert.match(opusShow.stdout, /Main\s+Opus 5 -> anthropic \(claude-opus-5\)/u);
 
     const reset = runCli(['config', '--reset'], { env });
     assert.equal(reset.status, 0, reset.stderr);
@@ -909,7 +920,7 @@ test(
 );
 
 test(
-  'config selects Kimi K3 1M/max without storing or resetting its credential',
+  'config selects Kimi K3/max without a synthetic model qualifier or stored credential',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-config-kimi-');
@@ -920,11 +931,12 @@ test(
     const update = runCli(['config', '--main', 'kimi'], { env });
     assert.equal(update.status, 0, update.stderr);
     assert.match(update.stdout, /ULTRATHINK_GATEWAY_KIMI_API_KEY/u);
+    assert.doesNotMatch(update.stdout, /setup --prepare-claude/u);
 
     const configPath = path.join(home, '.claude-workflow.env');
     const content = await fsp.readFile(configPath, 'utf8');
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=kimi/u);
-    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3\[1m\]/u);
+    assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3$/mu);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=k3/u);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=max/u);
     assert.match(content, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=1048576/u);
@@ -939,7 +951,7 @@ test(
     const oneMillion = runCli(['config', '--main', 'kimi'], { env });
     assert.equal(oneMillion.status, 0, oneMillion.stderr);
     const oneMillionContent = await fsp.readFile(configPath, 'utf8');
-    assert.match(oneMillionContent, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3\[1m\]/u);
+    assert.match(oneMillionContent, /^ULTRATHINK_GATEWAY_MAIN_MODEL_ID=k3$/mu);
     assert.match(oneMillionContent, /ULTRATHINK_GATEWAY_KIMI_CONTEXT_TOKENS=1048576/u);
 
     const fakeKey = 'test-kimi-config-key';
@@ -952,7 +964,7 @@ test(
       env: { ...env, ULTRATHINK_GATEWAY_KIMI_API_KEY: fakeKey },
     });
     assert.equal(show.status, 0, show.stderr);
-    assert.match(show.stdout, /Main\s+Kimi K3 -> kimi \(k3\[1m\]\)/u);
+    assert.match(show.stdout, /Main\s+Kimi K3 -> kimi \(k3\)/u);
 
     const reset = runCli(['config', '--reset'], { env });
     assert.equal(reset.status, 0, reset.stderr);
@@ -960,6 +972,207 @@ test(
       (await fsp.readFile(configPath, 'utf8')).trim(),
       `ULTRATHINK_GATEWAY_KIMI_API_KEY=${fakeKey}`
     );
+  }
+);
+
+test(
+  'config rejects unsupported model and effort combinations before writing',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-effort-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const env = isolatedEnvironment(home);
+    const configPath = path.join(home, '.claude-workflow.env');
+
+    for (const args of [
+      ['config', '--agents', 'luna', '--effort', 'ultra'],
+      ['config', '--agents', 'terra', '--effort', 'minimal'],
+    ]) {
+      const result = runCli(args, { env });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /does not support Codex reasoning effort/u);
+      assert.equal(fs.existsSync(configPath), false);
+    }
+
+    const supported = runCli(['config', '--agents', 'luna', '--effort', 'max'], { env });
+    assert.equal(supported.status, 0, supported.stderr);
+    assert.match(
+      await fsp.readFile(configPath, 'utf8'),
+      /ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max/u
+    );
+
+    const beforeModelOnlyChange = await fsp.readFile(configPath, 'utf8');
+    const incompatibleModelOnly = runCli(
+      ['config', '--agents', 'gpt-5.4'],
+      { env }
+    );
+    assert.equal(incompatibleModelOnly.status, 1);
+    assert.match(
+      incompatibleModelOnly.stderr,
+      /gpt-5\.4 does not support Codex reasoning effort max/u
+    );
+    assert.equal(await fsp.readFile(configPath, 'utf8'), beforeModelOnlyChange);
+  }
+);
+
+test(
+  'config reports the final overridden subagent route and its own context contract',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-effective-route-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    const env = isolatedEnvironment(home, {
+      ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+      ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
+        'codex-terra': {
+          provider: 'codex',
+          model: 'gpt-5.4',
+          reasoningEffort: 'xhigh',
+        },
+      }),
+    });
+
+    const result = runCli(['config', '--json'], { env });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.agents.displayModel, 'codex-gpt-5.4');
+    assert.equal(summary.agents.model, 'gpt-5.4');
+    assert.equal(summary.agents.effort, 'xhigh');
+    assert.equal(summary.agents.context, 'long');
+    assert.equal(summary.agents.contextTokens, 950_000);
+  }
+);
+
+test(
+  'agent config blank-shadows a stale legacy Claude-facing alias',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-legacy-alias-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    await fsp.writeFile(
+      path.join(home, '.ultrathink.env'),
+      [
+        'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=codex-terra',
+        'ULTRATHINK_GATEWAY_CODEX_MODEL=gpt-5.6-terra',
+        'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.6-terra',
+        'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max',
+        '',
+      ].join('\n'),
+      { mode: 0o600 }
+    );
+    await fsp.writeFile(
+      path.join(home, '.claude-workflow.env'),
+      [
+        'ULTRATHINK_GATEWAY_CODEX_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max',
+        '',
+      ].join('\n'),
+      { mode: 0o600 }
+    );
+    const env = isolatedEnvironment(home, {
+      ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+    });
+
+    const update = runCli(
+      ['config', '--agents', 'gpt-5.4', '--effort', 'xhigh'],
+      { env }
+    );
+    assert.equal(update.status, 0, update.stderr);
+    const primary = await fsp.readFile(path.join(home, '.claude-workflow.env'), 'utf8');
+    assert.match(primary, /^CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=$/mu);
+    assert.match(primary, /^ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=xhigh$/mu);
+
+    const show = runCli(['config', '--json'], { env });
+    assert.equal(show.status, 0, show.stderr);
+    assert.equal(JSON.parse(show.stdout).agents.displayModel, 'codex-gpt-5.4');
+  }
+);
+
+test(
+  'agent config repairs a stale direct-Codex main ID before validating the new fixed point',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-stale-codex-main-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    await fsp.writeFile(
+      path.join(home, '.claude-workflow.env'),
+      [
+        'ULTRATHINK_GATEWAY_MAIN_PROVIDER=codex',
+        'ULTRATHINK_GATEWAY_MAIN_MODEL_ID=codex-terra',
+        'ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=max',
+        'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS=none',
+        'ULTRATHINK_GATEWAY_CODEX_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max',
+        'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=codex-terra',
+        '',
+      ].join('\n'),
+      { mode: 0o600 }
+    );
+    const env = isolatedEnvironment(home, {
+      ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+    });
+
+    const update = runCli(
+      ['config', '--agents', 'gpt-5.4', '--effort', 'xhigh'],
+      { env }
+    );
+    assert.equal(update.status, 0, update.stderr);
+    const primary = await fsp.readFile(path.join(home, '.claude-workflow.env'), 'utf8');
+    assert.match(primary, /^ULTRATHINK_GATEWAY_MAIN_MODEL_ID=codex$/mu);
+    assert.match(primary, /^CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=$/mu);
+
+    const show = runCli(['config', '--json'], { env });
+    assert.equal(show.status, 0, show.stderr);
+    const summary = JSON.parse(show.stdout);
+    assert.equal(summary.main.model, 'codex-gpt-5.4');
+    assert.equal(summary.main.target, 'codex:gpt-5.4/xhigh');
+    assert.equal(summary.agents.displayModel, 'codex-gpt-5.4');
+  }
+);
+
+test(
+  'effort-only config persists every identity repair used by its mutation preview',
+  { skip: process.platform === 'win32' },
+  async function (t) {
+    const root = await temporaryDirectory(t, 'claude-workflow-config-stale-effort-');
+    const home = path.join(root, 'home');
+    await fsp.mkdir(home);
+    await fsp.writeFile(
+      path.join(home, '.ultrathink.env'),
+      ['CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=codex-terra', ''].join('\n'),
+      { mode: 0o600 }
+    );
+    await fsp.writeFile(
+      path.join(home, '.claude-workflow.env'),
+      [
+        'ULTRATHINK_GATEWAY_CODEX_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5.4',
+        'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=max',
+        '',
+      ].join('\n'),
+      { mode: 0o600 }
+    );
+    const env = isolatedEnvironment(home, {
+      ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+    });
+
+    const update = runCli(['config', '--effort', 'xhigh'], { env });
+    assert.equal(update.status, 0, update.stderr);
+    const primary = await fsp.readFile(path.join(home, '.claude-workflow.env'), 'utf8');
+    assert.match(primary, /^CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID=$/mu);
+
+    const show = runCli(['config', '--json'], { env });
+    assert.equal(show.status, 0, show.stderr);
+    const summary = JSON.parse(show.stdout);
+    assert.equal(summary.agents.displayModel, 'codex-gpt-5.4');
+    assert.equal(summary.agents.effort, 'xhigh');
   }
 );
 
@@ -972,24 +1185,28 @@ test(
     await fsp.mkdir(home);
     const env = isolatedEnvironment(home);
 
-    const update = runCli(['config', '--main', 'codex', '--agents', 'sol'], { env });
+    const update = runCli(['config', '--main', 'codex'], { env });
     assert.equal(update.status, 0, update.stderr);
-    assert.match(update.stdout, /Next: run `claude-workflow setup --prepare-claude`/u);
+    assert.doesNotMatch(update.stdout, /setup --prepare-claude/u);
+
+    const retune = runCli(['config', '--agents', 'sol', '--effort', 'ultra'], { env });
+    assert.equal(retune.status, 0, retune.stderr);
 
     const configPath = path.join(home, '.claude-workflow.env');
     const content = await fsp.readFile(configPath, 'utf8');
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=codex/u);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=codex/u);
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=gpt-5\.6-sol/u);
-    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=max/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=ultra/u);
     assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL=gpt-5\.6-sol/u);
+    assert.match(content, /ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT=ultra/u);
 
     const show = runCli(['config'], { env });
     assert.equal(show.status, 0, show.stderr);
-    assert.match(show.stdout, /Main\s+Codex direct -> codex \(codex\)/u);
+    assert.match(show.stdout, /Main\s+codex-sol -> codex \(codex-sol\)/u);
     const json = runCli(['config', '--json'], { env });
     assert.equal(json.status, 0, json.stderr);
-    assert.equal(JSON.parse(json.stdout).main.target, 'codex:gpt-5.6-sol/max');
+    assert.equal(JSON.parse(json.stdout).main.target, 'codex:gpt-5.6-sol/ultra');
 
     const resetMain = runCli(['config', '--main', 'fable'], { env });
     assert.equal(resetMain.status, 0, resetMain.stderr);
@@ -1001,7 +1218,7 @@ test(
 );
 
 test(
-  'config selects Qwen 3.8 Max at 1M/xhigh without storing or resetting its credential',
+  'config selects Qwen 3.8 Max/xhigh with a plain wire id and no stored credential',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-config-qwen-');
@@ -1028,7 +1245,7 @@ test(
     const update = runCli(['config', '--main', 'qwen'], { env });
     assert.equal(update.status, 0, update.stderr);
     assert.match(update.stdout, /ULTRATHINK_GATEWAY_QWEN_API_KEY/u);
-    assert.match(update.stdout, /setup --prepare-claude/u);
+    assert.doesNotMatch(update.stdout, /setup --prepare-claude/u);
 
     const configPath = path.join(home, '.claude-workflow.env');
     await fsp.appendFile(
@@ -1044,7 +1261,7 @@ test(
 
     const content = await fsp.readFile(configPath, 'utf8');
     assert.match(content, /ULTRATHINK_GATEWAY_MAIN_PROVIDER=qwen/u);
-    assert.match(content, /ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max\[1m\]/u);
+    assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_MODEL_ID=qwen3\.8-max$/mu);
     assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL=qwen3\.8-max$/mu);
     assert.match(content, /^ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT=xhigh$/mu);
     assert.match(content, /^ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS=983616$/mu);
@@ -1081,7 +1298,7 @@ test(
     assert.equal(show.status, 0, show.stderr);
     assert.match(
       show.stdout,
-      /Main\s+Qwen 3\.8 Max -> qwen \(qwen3\.8-max\[1m\]\)/u
+      /Main\s+Qwen 3\.8 Max -> qwen \(qwen3\.8-max\)/u
     );
     const json = runCli(['config', '--json'], {
       env: { ...env, ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey },
@@ -1186,7 +1403,7 @@ test('launcher rejects background Claude lifecycle flags before dispatch', funct
 });
 
 test(
-  'Kimi credentials stay gateway-only while Claude receives the 1M/max profile',
+  'Kimi credentials stay gateway-only while Claude receives a native truthful profile',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-kimi-child-env-');
@@ -1209,11 +1426,14 @@ test(
       FAKE_CLAUDE_SETTINGS_CAPTURE_FILE: settingsCapture,
       FAKE_NATIVE_ENV_FILE: nativeEnvFile,
       ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'kimi',
-      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'k3[1m]',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'k3',
       ULTRATHINK_GATEWAY_KIMI_API_KEY: fakeKey,
       KIMI_API_KEY: 'test-kimi-ambient-secret',
     });
-    prepareClaudeThirdPartyModelSupport(env);
+    const prepared = prepareClaudeThirdPartyModelSupport(env);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
 
     const result = runCli(['Reply with exactly OK.'], { cwd: project, env });
     assert.equal(result.status, 0, result.stderr);
@@ -1221,15 +1441,21 @@ test(
     assert.deepEqual(values.slice(0, 6), [
       'unset',
       'unset',
-      'k3[1m]',
+      'k3',
       'max',
-      '1048576',
-      '1048576',
+      '784800',
+      '828400',
     ]);
     assert.notEqual(values[6], 'unset');
     assert.equal(values[7], values[6]);
     assert.equal(values[8], values[6]);
     assert.equal(values[13], '1');
+    assert.deepEqual(values.slice(14, 18), [
+      'k3',
+      'Kimi K3 Main Route',
+      'kimi:k3/max through claude-workflow',
+      '1',
+    ]);
     assert.equal(`${result.stdout}\n${result.stderr}`.includes(fakeKey), false);
     const args = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
     assert.ok(args.includes('--settings'));
@@ -1238,11 +1464,37 @@ test(
       'max',
     ]);
     const privateSettings = JSON.parse(await fsp.readFile(settingsCapture, 'utf8'));
-    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'k3[1m]');
+    assert.deepEqual(privateSettings.modelPicker, {
+      options: [
+        {
+          model: 'k3',
+          label: 'Kimi K3',
+          description: 'kimi:k3/max through Claude Workflow',
+        },
+        {
+          model: 'codex-terra',
+          label: 'Codex Terra',
+          description: 'codex:gpt-5.6-terra/max through Claude Workflow',
+        },
+      ],
+      replaceBuiltInOptions: true,
+    });
+    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'k3');
     assert.equal(privateSettings.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
-    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '1048576');
-    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '1048576');
+    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
+    assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
     assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+    assert.equal(privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'k3');
+    assert.equal(privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Kimi K3 Main Route');
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+      'kimi:k3/max through claude-workflow'
+    );
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+      'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
+    );
     assert.equal(privateSettings.env.CLAUDE_CODE_SUBAGENT_MODEL, 'codex-terra');
     assert.equal(privateSettings.env.ULTRATHINK_GATEWAY_KIMI_API_KEY, '');
     assert.equal(privateSettings.env.KIMI_API_KEY, '');
@@ -1271,13 +1523,13 @@ test(
     assert.equal(nativeChildRecords.some((record) => record.startsWith('claude:')), true);
     assert.equal(nativeChildRecords.some((record) => record.startsWith('codex:')), true);
     for (const record of nativeChildRecords) {
-      assert.match(record, /\|\|$/u);
+      assert.match(record, /\|{6}$/u);
     }
   }
 );
 
 test(
-  'Qwen credentials stay gateway-only while Claude receives the 1M/xhigh single-request profile',
+  'Qwen credentials stay gateway-only while Claude receives a native truthful profile',
   { skip: process.platform === 'win32' },
   async function (t) {
     const root = await temporaryDirectory(t, 'claude-workflow-qwen-child-env-');
@@ -1296,28 +1548,37 @@ test(
       FAKE_CLAUDE_SETTINGS_CAPTURE_FILE: settingsCapture,
       FAKE_NATIVE_ENV_FILE: nativeEnvFile,
       ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'qwen',
-      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'qwen3.8-max[1m]',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'qwen3.8-max',
       ULTRATHINK_GATEWAY_QWEN_API_KEY: fakeKey,
       QWEN_API_KEY: 'sk-sp-test-qwen-ambient-secret',
       BAILIAN_TOKEN_PLAN_API_KEY: 'sk-sp-test-bailian-ambient-secret',
       DASHSCOPE_API_KEY: 'sk-test-dashscope-ambient-secret',
     });
-    prepareClaudeThirdPartyModelSupport(env);
+    const prepared = prepareClaudeThirdPartyModelSupport(env);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(fs.existsSync(path.join(home, '.claude.json')), false);
 
     const result = runCli(['Reply with exactly OK.'], { env });
     assert.equal(result.status, 0, result.stderr);
     const values = (await fsp.readFile(envFile, 'utf8')).trim().split('\n');
     assert.deepEqual(values.slice(2, 6), [
-      'qwen3.8-max[1m]',
+      'qwen3.8-max',
       'max',
-      '983616',
-      '983616',
+      '784800',
+      '828400',
     ]);
     assert.notEqual(values[6], 'unset');
     assert.equal(values[7], values[6]);
     assert.equal(values[8], values[6]);
     assert.deepEqual(values.slice(9, 13), ['unset', 'unset', 'unset', 'unset']);
     assert.equal(values[13], '1');
+    assert.deepEqual(values.slice(14, 18), [
+      'qwen3.8-max',
+      'Qwen 3.8 Max Main Route',
+      'qwen:qwen3.8-max/xhigh through claude-workflow',
+      '1',
+    ]);
     assert.equal(`${result.stdout}\n${result.stderr}`.includes(fakeKey), false);
 
     const args = (await fsp.readFile(argsFile, 'utf8')).trim().split('\n');
@@ -1326,11 +1587,40 @@ test(
       'max',
     ]);
     const privateSettings = JSON.parse(await fsp.readFile(settingsCapture, 'utf8'));
-    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'qwen3.8-max[1m]');
+    assert.deepEqual(privateSettings.modelPicker, {
+      options: [
+        {
+          model: 'qwen3.8-max',
+          label: 'Qwen 3.8 Max',
+          description: 'qwen:qwen3.8-max/xhigh through Claude Workflow',
+        },
+        {
+          model: 'codex-terra',
+          label: 'Codex Terra',
+          description: 'codex:gpt-5.6-terra/max through Claude Workflow',
+        },
+      ],
+      replaceBuiltInOptions: true,
+    });
+    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'qwen3.8-max');
     assert.equal(privateSettings.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
-    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '983616');
-    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '983616');
+    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
+    assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
     assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+    assert.equal(privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'qwen3.8-max');
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME,
+      'Qwen 3.8 Max Main Route'
+    );
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+      'qwen:qwen3.8-max/xhigh through claude-workflow'
+    );
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+      'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
+    );
     for (const name of [
       'ULTRATHINK_GATEWAY_QWEN_API_KEY',
       'QWEN_API_KEY',
@@ -1380,7 +1670,10 @@ test(
     assert.deepEqual(values, [
       'unset',
       'unset',
-      'claude-opus-5[1m]',
+      'claude-opus-5',
+      'max',
+      '784800',
+      '828400',
       'unset',
       'unset',
       'unset',
@@ -1389,12 +1682,37 @@ test(
       'unset',
       'unset',
       'unset',
-      'unset',
-      'unset',
-      'unset',
+      'codex-terra',
+      'Codex Terra',
+      'codex:gpt-5.6-terra/max through claude-workflow',
+      '1',
     ]);
     const privateSettings = JSON.parse(await fsp.readFile(settingsCapture, 'utf8'));
-    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'claude-opus-5[1m]');
+    assert.deepEqual(privateSettings.modelPicker, {
+      options: [
+        {
+          model: 'claude-opus-5',
+          label: 'Opus 5',
+          description: 'Anthropic claude-opus-5',
+        },
+        {
+          model: 'codex-terra',
+          label: 'Codex Terra',
+          description: 'codex:gpt-5.6-terra/max through Claude Workflow',
+        },
+      ],
+      replaceBuiltInOptions: true,
+    });
+    assert.equal(privateSettings.env.ANTHROPIC_MODEL, 'claude-opus-5');
+    assert.equal(privateSettings.env.CLAUDE_CODE_EFFORT_LEVEL, 'max');
+    assert.equal(privateSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+    assert.equal(privateSettings.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
+    assert.equal(privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-terra');
+    assert.equal(
+      privateSettings.env.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+      'effort,xhigh_effort,max_effort'
+    );
+    assert.equal(privateSettings.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
     assert.equal(Object.hasOwn(privateSettings.env, 'ANTHROPIC_AUTH_TOKEN'), false);
     assert.equal(Object.hasOwn(privateSettings.env, 'ANTHROPIC_API_KEY'), false);
   }

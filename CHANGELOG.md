@@ -1,80 +1,111 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-08-28
 
 ### Added
 
-- First-class Alibaba Qwen 3.8 Max routing. `config --main qwen` selects the
-  `qwen3.8-max[1m]` client alias, exact `qwen3.8-max` upstream model,
-  983,616-token context, 131,072-token answer cap, and xhigh reasoning through
-  the Token Plan OpenAI-compatible endpoint.
-- Qwen contract coverage for streamed reasoning, parallel tools, strict
-  reasoning replay, Token Plan credential pairing, rate-limit headers,
-  conservative local token counts, 12,000-line tool results, and an installed
-  Claude clean-home tool loop.
 - Direct Codex main routing through `claude-workflow config --main codex`, using
-  the configured Codex model and reasoning effort without an Anthropic parent
-  or login. Clean-home setup supplies private local gateway authentication and
-  disables Claude Code's extra terminal-title request.
-- First-class Kimi K3 main routing through Kimi Code's Anthropic-compatible
-  API. `claude-workflow config --main kimi` selects the `k3[1m]` client alias,
-  sends `k3` upstream with thinking enabled and `max` reasoning, and configures
-  both Claude context variables for 1,048,576 tokens. `config --main k3`
-  provides the Moderato-compatible 262,144-token profile.
-- Kimi-specific setup, entitlement, session-restart, credential, and
-  large-message guidance.
-- An explicit `setup --prepare-claude` step for clean Claude Code homes. It
-  preserves existing state, writes atomically, and creates a private backup
-  before enabling third-party main routes such as direct Codex and Kimi.
+  the configured model and reasoning effort without an Anthropic parent or
+  login.
+- Kimi K3 routing through the Kimi Code Anthropic-compatible API. The `kimi`
+  preset selects the 1,048,576-token Allegretto profile; `k3` selects the
+  262,144-token Moderato profile. Both preserve adaptive thinking and use the
+  configured reasoning effort.
+- Alibaba Qwen 3.8 Max routing through the Singapore Token Plan
+  OpenAI-compatible endpoint, with a 1,000,000-token context window, a safe
+  983,616-token thinking-mode input ceiling, a 131,072-token output limit,
+  `xhigh` reasoning, strict reasoning replay, and parallel tool continuations.
+- Installed-Codex contract tests for initialization and request attestation,
+  thread and turn lifecycle, interruption, asynchronous events, dynamic tool
+  calls, typed errors, compaction, cache-write usage, and model rerouting.
+- Capability discovery through `codex debug models`, with `standard`, `long`,
+  and exact-window configuration for Codex routes.
 
 ### Changed
 
-- Opus 5 is the default main route. Fable remains available with
-  `claude-workflow config --main fable`.
-- Direct non-Anthropic routes disable Claude Code's automatic terminal-title
-  request. Protocol conversion is local and does not add a model inference;
-  only genuine tool continuations add provider turns.
-- Shared-daemon installation and upgrades use explicit managed-state ownership,
-  current-runtime reconciliation, and self-contained global-install checks.
-- Codex final-answer selection is local and phase-aware. Commentary and
-  superseded assistant messages are excluded, and dynamic-tool boundaries
-  settle on the next event-loop turn without another inference or fixed delay.
-- Large-file guidance now distinguishes a model's context window from Kimi
-  Code's 2,097,152-byte total message-content ceiling.
-- Provider credentials remain inside the gateway process, managed
-  non-Anthropic main routes receive automatic local gateway authentication,
-  and provider-specific Claude settings are cleared when the main route
-  changes.
-- Daemon revision checks distinguish configuration inputs from generated client
-  environment values, including managed auth, provider aliases, executable
-  selection, and normalized proxy exclusions.
-- Gateway bearer secrets and dedicated upstream credentials are removed from
-  Codex app-server children and prerequisite probes.
-- Per-session Claude routing now uses an owner-only temporary CLI settings
-  layer, so user and repository settings remain unchanged while main model,
-  context, max thinking, beta, and backend-selection values stay consistent.
-- Shared setup fails closed on current Claude routing conflicts and rejects
-  project `.env` loading; deterministic routing remains available through the
-  per-session launcher.
+- The supported baseline is Node.js 20, Claude Code 2.1.250, and Codex CLI
+  0.150.1. App-server version detection accepts the current
+  `<originator>/<codex-version>` initialize user agent and the older
+  `codex_cli_rs` form.
+- Opus 5 is the default main route. Delegated agents use `gpt-5.6-terra` with
+  `max` reasoning and the concise `codex-terra` label; Fable 5 remains
+  available.
+- Canonical provider model IDs replace client-only `[1m]` aliases. Claude
+  receives documented custom-model names, descriptions, capabilities, and
+  context metadata through a private per-session settings layer. Its `/model`
+  picker contains one exact row per distinct selected main or delegated route
+  without enabling gateway discovery.
+- Codex context is read from the installed catalog. Codex CLI 0.150.1's bundled 5.6 models
+  advertise 272,000 raw and 258,400 usable tokens in `standard` mode, or 872,000
+  raw and 828,400 usable tokens in `long` mode. Native compaction starts at
+  244,800 and 784,800 respectively, and explicit requests are clamped to the
+  catalog maximum.
+- Claude's custom-model maximum is the minimum across the selected
+  non-Anthropic main and delegated routes. Canonical Opus 5 and Fable 5 keep
+  their native 1M maximum, but Claude's shared proactive-compaction setting
+  makes them compact at 784,800 with the default Terra agents. Kimi and Qwen
+  retain their larger provider capacities while using an 828,400-token client
+  maximum and the same 784,800 compaction point.
+- Codex app-server owns live context compaction and token-aware tool-output
+  truncation for generic results. The gateway no longer recycles healthy
+  sessions from estimated context pressure or adds a generic byte policy by
+  default. Claude `Read` results use a bounded contiguous paging guard so no
+  omitted middle can be mistaken for reviewed source.
+- Direct third-party responses are selected and converted locally. A plain
+  direct Codex prompt makes one provider request; only a real tool continuation
+  or delegation resume creates another turn. Terminal-title traffic and unsafe
+  non-streaming fallback retries are disabled for these routes.
+- Local Kimi and Qwen token-count responses use a conservative ceiling of one
+  estimated token per UTF-8 byte for Claude Code compaction without making
+  another provider request.
+- Every workflow Codex route starts without native execution environments,
+  capability roots, agents, memories, MCP servers, plugins, skills, web,
+  planning, permission, request-input, or clock/sleep tools. Codex 0.150.1 still
+  advertises its unavoidable code-mode `functions.exec` and `functions.wait`
+  wrappers alongside Claude's dynamic tools.
+- Claude Workflow no longer changes `.claude.json`, user settings, or project
+  settings. `setup --prepare-claude` is a compatibility no-op; custom routes use
+  documented per-session settings.
+- Third-party and dedicated gateway credentials stay in the gateway process and
+  are removed from Claude, Codex, prerequisite checks, and app-server children.
+  Anthropic passthrough continues to use Claude's own credential. Repository
+  `.env` files remain disabled for workflow entrypoints unless a trusted
+  per-session parent explicitly opts in.
+- Shared-daemon upgrades use managed-state ownership, runtime-revision
+  reconciliation, bounded shell cleanup, and self-contained global-install
+  checks. The standalone gateway accepts request bodies up to 32 MiB.
 
 ### Fixed
 
-- Schema agents retain the exact `StructuredOutput` tool name, avoiding a
-  redundant enforcement inference, while rejected schema results can still be
-  retried on their live Codex turn.
-- Coalesced Codex app-server responses can no longer race turn listener
-  registration in JSON or streaming requests, including large tool results.
-- Launcher-managed Claude options precede native subcommands, temporary
-  settings are removed on signals, and generic provider credentials do not
-  leak into Claude or Codex child processes.
-- Shared shell routing restores its complete owned environment before a
-  profile refresh, preserves later user edits and export attributes, and cannot
-  leave a stale gateway route when the manager or environment file fails. Bash
-  and zsh option state is preserved, credential-bearing updates are hidden from
-  shell xtrace, and hooks remain non-fatal under `set -e`.
-- Current Codex app-server versions are detected from the source-defined
-  `<originator>/<codex-version>` initialize user agent, while the older
-  `codex_cli_rs` form remains supported.
+- Coalesced app-server messages no longer race listener registration, including
+  streamed responses and large tool-result continuations.
+- Failed or unacknowledged interruption evicts the affected Codex process before
+  reuse. Partial and in-progress turns are never replayed after transport or
+  context failure.
+- Typed pre-output context failures can recover on a fresh thread without
+  weakening cancellation, tool-call ownership, or transcript continuity.
+- Schema agents retain the exact `StructuredOutput` tool name and can retry a
+  rejected result on the live Codex turn without an enforcement inference.
+- Launcher options remain ahead of native Claude commands, temporary settings
+  are removed on signals, and provider credentials do not leak through child
+  environments, traces, or generated settings.
+- Shell migration preserves later user edits and Bash/zsh option state, hides
+  credential-bearing updates from xtrace, and cannot leave stale workflow
+  routing when the manager or environment file is unavailable.
+- Claude 2.1.250 partial `Read` notices are correlated with the matching pending
+  call. Codex receives a verified contiguous source prefix and exact next
+  offset; malformed notices and dense single-line output fail closed without a
+  coverage claim.
+- Claude's transient transcript `system` reminders no longer change persistent
+  Codex instructions or thread identity. Read results are canonicalized with
+  the same gap-safe policy during live continuation and authoritative replay.
+- Automatic Claude-facing Codex IDs are derived after route-map overrides, and
+  conflicting generated aliases fail before launch. Concise requested IDs are
+  the default response metadata; longer resolved route strings are opt-in.
+- Kimi custom endpoints require HTTPS except for loopback development services.
+- Outbound upstream requests reject HTTP redirects. Shared-secret Anthropic
+  passthrough requires its dedicated gateway credential, and managed blank
+  compatibility aliases prevent stale legacy fallback values from resurfacing.
 
 ## 0.1.0 - 2026-07-10
 

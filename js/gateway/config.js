@@ -4,6 +4,10 @@ import path from 'node:path';
 import '../utils/env-loader.js';
 import { environmentWithoutManagedGatewayAuth } from '../utils/child-env.js';
 import { expandHomePath } from '../utils/safe-path.js';
+import {
+  normalizeCodexContextProfile,
+  resolveCodexCapabilities,
+} from './codex-capabilities.js';
 import { QWEN_TOKEN_PLAN_DEFAULTS } from './provider-profiles.js';
 
 const DEFAULT_EXPOSED_MODELS = Object.freeze([
@@ -17,7 +21,7 @@ const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-5*']);
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
 export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
-const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
+const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'total';
 const DISABLED_FLAG_VALUES = new Set(['0', 'false', 'no', 'off']);
 const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]']);
 const CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES = new Set(['total', 'body_after_prefix']);
@@ -236,6 +240,38 @@ export function loadGatewayConfig() {
     explicitQwenBaseUrl ? process.env.DASHSCOPE_API_KEY : '',
     ''
   );
+  const dedicatedAnthropicApiKey = firstDefinedString(
+    process.env.ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY
+  );
+  const genericAnthropicApiKey = firstDefinedString(credentialEnv.ANTHROPIC_API_KEY);
+  const codexCommand = firstEnvString(['ULTRATHINK_GATEWAY_CODEX_COMMAND'], 'codex');
+  const codexModel = codexProfileValue('model', DEFAULT_CODEX_MODEL);
+  const codexReasoningEffort = codexProfileValue('reasoningEffort', 'max');
+  const codexContextProfile = normalizeCodexContextProfile(
+    firstDefinedString(
+      process.env.ULTRATHINK_GATEWAY_CODEX_CONTEXT,
+      process.env.ULTRATHINK_GATEWAY_CODEX_CONTEXT_PROFILE,
+      'standard'
+    )
+  );
+  const codexRequestedContextWindow = clampNumber(
+    process.env.ULTRATHINK_GATEWAY_CODEX_CONTEXT_WINDOW,
+    0,
+    { min: 0, max: 2_000_000 }
+  );
+  const codexCapabilities = resolveCodexCapabilities({
+    command: codexCommand,
+    model: codexModel,
+    contextProfile: codexContextProfile,
+    requestedContextWindow: codexRequestedContextWindow,
+    reasoningEffort: codexReasoningEffort,
+  });
+  if (!codexCapabilities.effortSupported) {
+    throw new Error(
+      `${codexModel} does not support Codex reasoning effort ${codexReasoningEffort}; ` +
+        `choose one of ${codexCapabilities.reasoningEfforts.join(', ')}`
+    );
+  }
 
   return {
     host: firstDefinedString(process.env.ULTRATHINK_GATEWAY_HOST, '127.0.0.1'),
@@ -276,7 +312,7 @@ export function loadGatewayConfig() {
     ),
     codex: {
       enabled: envFlag('ULTRATHINK_GATEWAY_CODEX_ENABLED', true),
-      command: firstEnvString(['ULTRATHINK_GATEWAY_CODEX_COMMAND'], 'codex'),
+      command: codexCommand,
       cwd: path.resolve(
         expandHomePath(
           firstEnvString(['ULTRATHINK_GATEWAY_CODEX_CWD'], process.cwd())
@@ -290,13 +326,16 @@ export function loadGatewayConfig() {
         ['ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY'],
         DEFAULT_CODEX_APPROVAL_POLICY
       ),
-      model: codexProfileValue('model', DEFAULT_CODEX_MODEL),
-      reasoningEffort: codexProfileValue('reasoningEffort', 'max'),
+      model: codexModel,
+      reasoningEffort: codexReasoningEffort,
       verbosity: codexProfileValue('verbosity', 'low'),
+      contextProfile: codexContextProfile,
+      requestedContextWindow: codexRequestedContextWindow,
+      capabilities: codexCapabilities,
       inputMaxTokens: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS,
-        192_000,
-        { min: 0, max: 1_000_000 }
+        0,
+        { min: 0, max: 2_000_000 }
       ),
       toolResultMaxBytes: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES,
@@ -422,6 +461,7 @@ export function loadGatewayConfig() {
         QWEN_TOKEN_PLAN_DEFAULTS.contextTokens,
         { min: 1, max: QWEN_TOKEN_PLAN_DEFAULTS.contextTokens }
       ),
+      totalContextTokens: QWEN_TOKEN_PLAN_DEFAULTS.totalContextTokens,
       maxOutputTokens: clampNumber(
         process.env.ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS,
         QWEN_TOKEN_PLAN_DEFAULTS.maxOutputTokens,
@@ -429,11 +469,12 @@ export function loadGatewayConfig() {
       ),
     },
     anthropic: {
-      apiKey: firstDefinedString(
-        process.env.ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY,
-        credentialEnv.ANTHROPIC_API_KEY,
-        ''
-      ),
+      apiKey: firstDefinedString(dedicatedAnthropicApiKey, genericAnthropicApiKey),
+      apiKeySource: dedicatedAnthropicApiKey
+        ? 'dedicated'
+        : genericAnthropicApiKey
+          ? 'generic'
+          : 'none',
       baseUrl: firstDefinedString(
         process.env.ULTRATHINK_GATEWAY_ANTHROPIC_BASE_URL,
         'https://api.anthropic.com'

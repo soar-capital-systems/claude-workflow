@@ -167,7 +167,7 @@ function processExists(pid) {
 function finalAppServer(
   logPath,
   userAgent =
-    'claude_workflow_gateway/0.144.6 (Mac OS 26.4.0; arm64) ' +
+    'claude_workflow_gateway/0.150.1 (Mac OS 26.4.0; arm64) ' +
     'iTerm.app/3.6.10 (claude_workflow_gateway; 0.1.0)'
 ) {
   return `#!/usr/bin/env node
@@ -203,8 +203,26 @@ rl.on('line', function onLine(line) {
     send({ id: message.id, result: { userAgent: ${JSON.stringify(userAgent)} } });
     return;
   }
+  if (message.method === 'config/read') {
+    log({ event: 'config_read', params: message.params });
+    send({ id: message.id, result: { layers: [{
+      name: { type: 'user', file: '/private/codex/config.toml', profile: null },
+      config: {
+        mcp_servers: { 'configured.server.with.dots': { command: '/usr/bin/false' } },
+        plugins: { 'configured-plugin@test': { enabled: true } }
+      }
+    }] } });
+    return;
+  }
   if (message.method === 'thread/start') {
-    log({ event: 'thread', cwd: message.params.cwd, environments: message.params.environments, config: message.params.config });
+    log({
+      event: 'thread',
+      cwd: message.params.cwd,
+      environments: message.params.environments,
+      selectedCapabilityRoots: message.params.selectedCapabilityRoots,
+      dynamicTools: message.params.dynamicTools,
+      config: message.params.config
+    });
     send({ id: message.id, result: { thread: { id: 'thread-' + process.pid } } });
     return;
   }
@@ -727,10 +745,9 @@ async function testToolBoundaryCompletesWithoutFixedDelay() {
     });
     const boundaryEntries = await readJsonLines(logPath);
     assert.equal(
-      boundaryEntries.some(
-        (entry) => entry.event === 'thread_start' && entry.experimentalRawEvents === true
-      ),
-      true
+      boundaryEntries.every((entry) => entry.experimentalRawEvents === false),
+      true,
+      'canonical app-server threads must not request removed experimental raw events'
     );
     await waitFor(async function parallelCallRejected() {
       const entries = await readJsonLines(logPath);
@@ -789,7 +806,7 @@ async function testLegacyToolBoundaryCompletesWithoutRawEvents() {
     const threadStarts = (await readJsonLines(logPath)).filter(
       (entry) => entry.event === 'thread_start'
     );
-    assert.deepEqual(threadStarts.map((entry) => entry.hasRawEvents), [true, false]);
+    assert.deepEqual(threadStarts.map((entry) => entry.hasRawEvents), [false]);
 
     const continued = await manager.processRequest(
       request('legacy-tool'),
@@ -962,7 +979,21 @@ async function testDynamicToolsOnlyThreadMode() {
   );
   try {
     await configuredManager.processRequest(request('configured-cwd'), body('Configured cwd.'), route());
-    await dynamicOnlyManager.processRequest(request('dynamic-only'), body('Dynamic tools only.'), route());
+    await dynamicOnlyManager.processRequest(
+      request('dynamic-only'),
+      body('Dynamic tools only.', [
+        {
+          name: 'Read',
+          description: 'Read a bounded file range.',
+          input_schema: {
+            type: 'object',
+            properties: { file_path: { type: 'string' } },
+            required: ['file_path'],
+          },
+        },
+      ]),
+      route()
+    );
 
     const threadStarts = (await readJsonLines(logPath)).filter(function thread(entry) {
       return entry.event === 'thread';
@@ -974,6 +1005,41 @@ async function testDynamicToolsOnlyThreadMode() {
     assert.equal(turns.length, 2);
     assert.equal(Object.hasOwn(threadStarts[0], 'environments'), false);
     assert.deepEqual(threadStarts[1].environments, []);
+    assert.equal(Object.hasOwn(threadStarts[0], 'selectedCapabilityRoots'), false);
+    assert.deepEqual(threadStarts[1].selectedCapabilityRoots, []);
+    assert.deepEqual(
+      threadStarts[1].dynamicTools.map((tool) => tool.name),
+      ['ext_tool_001']
+    );
+    const configReads = (await readJsonLines(logPath)).filter(function configRead(entry) {
+      return entry.event === 'config_read';
+    });
+    assert.equal(configReads.length, 1);
+    assert.deepEqual(configReads[0].params, { cwd: tempDir, includeLayers: true });
+    const isolationConfig = threadStarts[1].config;
+    assert.equal(isolationConfig['agents.enabled'], false);
+    assert.equal(isolationConfig['orchestrator.skills.enabled'], false);
+    assert.equal(isolationConfig['orchestrator.mcp.enabled'], false);
+    assert.equal(isolationConfig['memories.use_memories'], false);
+    assert.equal(isolationConfig['memories.dedicated_tools'], false);
+    assert.deepEqual(isolationConfig['features.code_mode'], {
+      enabled: false,
+      direct_only_tool_namespaces: ['functions'],
+    });
+    assert.deepEqual(isolationConfig['features.current_time_reminder'], {
+      enabled: false,
+      sleep_tool: false,
+    });
+    assert.equal(isolationConfig['features.memories'], false);
+    assert.equal(isolationConfig['features.sleep_tool'], false);
+    assert.equal(Object.hasOwn(isolationConfig, 'features.memory_tool'), false);
+    assert.equal(Object.hasOwn(isolationConfig, 'features.write_stdin_approval'), false);
+    assert.deepEqual(isolationConfig.mcp_servers, {
+      'configured.server.with.dots': { enabled: false },
+    });
+    assert.deepEqual(isolationConfig.plugins, {
+      'configured-plugin@test': { enabled: false },
+    });
     assert.equal(turns[0].effort, 'max');
     assert.equal(turns[1].effort, 'max');
     assert.equal(threadStarts[0].config.model_verbosity, 'low');
@@ -1054,7 +1120,7 @@ async function testDynamicToolsOnlyVersionGate() {
   try {
     await assert.rejects(
       manager.processRequest(request('old-dynamic-only'), body('Reject old Codex.'), route()),
-      /requires Codex CLI 0\.144\.1 or newer/u
+      /requires Codex CLI 0\.150\.1 or newer/u
     );
   } finally {
     await manager.close();

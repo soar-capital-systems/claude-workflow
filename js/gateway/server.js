@@ -18,6 +18,33 @@ import { createGatewayTracer } from './trace.js';
 
 const proxyDispatchers = new Map();
 const TOOL_REASONING_CACHE_MAX_ENTRIES = 2_048;
+const CLAUDE_REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
+const DEFAULT_SSE_KEEPALIVE_INTERVAL_MS = 10_000;
+const SSE_KEEPALIVE_CHUNK = 'event: ping\ndata: {"type":"ping"}\n\n';
+const CREDENTIAL_LIKE_HEADER_PATTERN =
+  /(?:^|-)(?:auth|authorization|bearer|cookie|credential|csrf|key|nonce|oauth|password|secret|signature|token)(?:-|$)/u;
+const SAFE_ANTHROPIC_IDENTITY_HEADERS = new Set([
+  'user-agent',
+  'x-app',
+]);
+const BLOCKED_FORWARD_HEADERS = new Set([
+  'authorization',
+  'connection',
+  'content-encoding',
+  'content-length',
+  'content-type',
+  'cookie',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'set-cookie',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'x-api-key',
+]);
 
 export function assertGatewayBindIsSafe(config) {
   const host = config.host || '127.0.0.1';
@@ -33,6 +60,23 @@ export function assertGatewayBindIsSafe(config) {
       500,
       'api_error',
       `${label} routes require gateway authentication, including on loopback. Set ULTRATHINK_GATEWAY_SHARED_SECRET or use a managed workflow profile.`
+    );
+  }
+  const hasAnthropicRoute =
+    (Array.isArray(config.anthropicPassthroughModels) &&
+      config.anthropicPassthroughModels.length > 0) ||
+    Object.values(config.routeMap || {}).some(function usesAnthropic(route) {
+      return String(route?.provider || '').trim().toLowerCase() === 'anthropic';
+    });
+  if (
+    config.sharedSecret &&
+    hasAnthropicRoute &&
+    (!config.anthropic?.apiKey || config.anthropic.apiKeySource === 'generic')
+  ) {
+    throw new GatewayError(
+      500,
+      'api_error',
+      'A shared-secret Anthropic route requires ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY; a generic ANTHROPIC_API_KEY is not accepted for this role.'
     );
   }
   if (isGatewayLoopbackHost(host) || config.sharedSecret) {
@@ -156,9 +200,11 @@ function estimateConservativeInputTokens(requestBody) {
     tool_choice: requestBody?.tool_choice,
   });
   // Some third-party coding plans do not expose a compatible count_tokens
-  // endpoint. A byte-aware 2:1 estimate is intentionally conservative for
-  // source code and Unicode without making another billable model request.
-  return Math.max(1, Math.ceil(Buffer.byteLength(serialized, 'utf8') / 2));
+  // endpoint. One estimated token per UTF-8 byte is a deliberately early
+  // compaction ceiling for byte-fallback tokenizers. It overcounts ordinary
+  // source code and avoids the prior 2:1 heuristic's unsafe behavior on
+  // high-entropy or multibyte input without making a second model request.
+  return Math.max(1, Buffer.byteLength(serialized, 'utf8'));
 }
 
 function copyUpstreamResponseHeaders(upstream, res, options = {}) {
@@ -185,13 +231,24 @@ function copyUpstreamResponseHeaders(upstream, res, options = {}) {
 
 async function postJson(url, headers, body, signal) {
   try {
-    return await undiciFetch(url, {
+    const upstream = await undiciFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal,
       dispatcher: fetchDispatcherForUrl(url),
+      // Never replay credentials or a model request to a redirect target.
+      redirect: 'manual',
     });
+    if (upstream.status >= 300 && upstream.status < 400) {
+      await upstream.body?.cancel().catch(() => {});
+      throw new GatewayError(
+        502,
+        'api_error',
+        'upstream redirects are disabled to protect credentials and request integrity'
+      );
+    }
+    return upstream;
   } catch (error) {
     if (signal?.aborted && signal.reason instanceof GatewayError) {
       throw signal.reason;
@@ -334,23 +391,57 @@ function matchesGatewaySharedSecret(value, config) {
   return Boolean(config.sharedSecret) && value === config.sharedSecret;
 }
 
-function copyAnthropicClientIdentityHeaders(req, headers) {
-  const exactHeaders = new Set([
-    'anthropic-dangerous-direct-browser-access',
-    'user-agent',
-    'x-app',
-  ]);
+function isCredentialLikeAnthropicHeader(name) {
+  return (
+    name === 'anthropic-api-key' ||
+    name === 'anthropic-authorization' ||
+    CREDENTIAL_LIKE_HEADER_PATTERN.test(name)
+  );
+}
 
+function connectionScopedHeaderNames(req) {
+  const connection = req.headers?.connection;
+  const values = Array.isArray(connection) ? connection : [connection];
+  return new Set(
+    values
+      .filter((value) => typeof value === 'string')
+      .flatMap((value) => value.split(','))
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function isSafeAnthropicIdentityHeader(name, connectionScopedHeaders) {
+  if (
+    BLOCKED_FORWARD_HEADERS.has(name) ||
+    connectionScopedHeaders.has(name) ||
+    isCredentialLikeAnthropicHeader(name)
+  ) {
+    return false;
+  }
+
+  return (
+    SAFE_ANTHROPIC_IDENTITY_HEADERS.has(name) ||
+    name.startsWith('anthropic-') ||
+    name.startsWith('x-claude-code-') ||
+    name.startsWith('x-stainless-')
+  );
+}
+
+function copyAnthropicClientIdentityHeaders(req, headers) {
+  const connectionScopedHeaders = connectionScopedHeaderNames(req);
   for (const [name, value] of Object.entries(req.headers || {})) {
-    if (
-      typeof value !== 'string' ||
-      (!exactHeaders.has(name) &&
-        !name.startsWith('x-claude-code-') &&
-        !name.startsWith('x-stainless-'))
-    ) {
+    if (!isSafeAnthropicIdentityHeader(name, connectionScopedHeaders)) {
       continue;
     }
-    headers[name] = value;
+
+    if (typeof value === 'string') {
+      headers[name] = value;
+      continue;
+    }
+    if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
+      headers[name] = value.join(', ');
+    }
   }
 }
 
@@ -383,11 +474,12 @@ function forwardedAnthropicCredential(req, config) {
 
 function createAnthropicCompatibleHeaders(config, req, route) {
   const providerConfig = anthropicCompatibleProviderConfig(config, route);
-  const headers = upstreamHeaders({
-    'anthropic-version': req.get('anthropic-version') || providerConfig.version,
-  });
+  const headers = upstreamHeaders();
 
   copyAnthropicClientIdentityHeaders(req, headers);
+  if (!headers['anthropic-version']) {
+    headers['anthropic-version'] = providerConfig.version;
+  }
 
   if (route.upstreamAuth === 'x-api-key') {
     headers['x-api-key'] = providerConfig.apiKey;
@@ -404,11 +496,6 @@ function createAnthropicCompatibleHeaders(config, req, route) {
         'Anthropic passthrough requires inbound Claude credentials or ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY / ANTHROPIC_API_KEY'
       );
     }
-  }
-
-  const anthropicBeta = req.get('anthropic-beta');
-  if (anthropicBeta) {
-    headers['anthropic-beta'] = anthropicBeta;
   }
 
   return headers;
@@ -484,13 +571,21 @@ async function proxyAnthropicCompatibleStream(req, res, config, route, signal) {
     signal
   );
 
+  const upstreamContentType = upstream.headers.get('content-type') || '';
+  const isSseResponse =
+    /^text\/event-stream(?:\s*;|\s*$)/iu.test(upstreamContentType) ||
+    (upstream.ok && upstreamContentType === '');
+
   res.status(upstream.status);
   copyUpstreamResponseHeaders(upstream, res, { preserveContentType: true });
-  if (!upstream.headers.get('content-type')) {
+  if (isSseResponse && !upstreamContentType) {
     res.setHeader('content-type', 'text/event-stream; charset=utf-8');
   }
-  res.setHeader('cache-control', 'no-cache');
-  res.setHeader('connection', 'keep-alive');
+  if (isSseResponse) {
+    res.setHeader('cache-control', 'no-cache');
+    res.setHeader('connection', 'keep-alive');
+    res.flushHeaders?.();
+  }
 
   if (!upstream.body) {
     res.end();
@@ -498,6 +593,17 @@ async function proxyAnthropicCompatibleStream(req, res, config, route, signal) {
   }
 
   try {
+    if (isSseResponse) {
+      await relaySseWithKeepalive(
+        upstream.body,
+        res,
+        signal,
+        configuredSseKeepaliveIntervalMs(config)
+      );
+      res.end();
+      return;
+    }
+
     for await (const chunk of upstream.body) {
       await writeResponseChunk(res, chunk);
     }
@@ -505,6 +611,113 @@ async function proxyAnthropicCompatibleStream(req, res, config, route, signal) {
     throw normalizeAbortError(error, signal);
   }
   res.end();
+}
+
+function configuredSseKeepaliveIntervalMs(config) {
+  const configured = Number(config?.sseKeepaliveIntervalMs);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.max(1, Math.trunc(configured));
+  }
+  return DEFAULT_SSE_KEEPALIVE_INTERVAL_MS;
+}
+
+function nextSseFrame(buffer) {
+  const boundary = /(?:\r\n|\r|\n){2}/u.exec(buffer);
+  if (!boundary) {
+    return null;
+  }
+
+  const end = boundary.index + boundary[0].length;
+  return {
+    frame: buffer.slice(0, end),
+    rest: buffer.slice(end),
+  };
+}
+
+async function relaySseWithKeepalive(body, res, signal, keepaliveIntervalMs) {
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let closed = false;
+  let heartbeatPending = false;
+  let lastWriteAt = Date.now();
+  let writeFailure = null;
+  let writeChain = Promise.resolve();
+
+  function queueWrite(chunk) {
+    const operation = writeChain.then(async function writeQueuedChunk() {
+      if (writeFailure) {
+        throw writeFailure;
+      }
+      await writeResponseChunk(res, chunk);
+      lastWriteAt = Date.now();
+    });
+    writeChain = operation.catch(function rememberWriteFailure(error) {
+      writeFailure ||= error;
+    });
+    return operation;
+  }
+
+  const heartbeat = setInterval(function emitSseKeepalive() {
+    if (
+      closed ||
+      heartbeatPending ||
+      writeFailure ||
+      Date.now() - lastWriteAt < keepaliveIntervalMs
+    ) {
+      return;
+    }
+
+    heartbeatPending = true;
+    void queueWrite(SSE_KEEPALIVE_CHUNK)
+      .catch(function ignoreHeartbeatWriteFailure() {
+        // The queued failure is surfaced by the relay or the request abort.
+      })
+      .finally(function markHeartbeatComplete() {
+        heartbeatPending = false;
+      });
+  }, keepaliveIntervalMs);
+  heartbeat.unref?.();
+
+  function stopHeartbeat() {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    clearInterval(heartbeat);
+  }
+
+  function stopHeartbeatOnAbort() {
+    stopHeartbeat();
+  }
+
+  signal?.addEventListener('abort', stopHeartbeatOnAbort, { once: true });
+  try {
+    for await (const chunk of body) {
+      buffered += decoder.decode(chunk, { stream: true });
+      let frame = nextSseFrame(buffered);
+      while (frame) {
+        buffered = frame.rest;
+        await queueWrite(frame.frame);
+        frame = nextSseFrame(buffered);
+      }
+    }
+
+    buffered += decoder.decode();
+    stopHeartbeat();
+    if (buffered) {
+      await queueWrite(buffered);
+    }
+    await writeChain;
+    if (writeFailure) {
+      throw writeFailure;
+    }
+  } catch (error) {
+    stopHeartbeat();
+    throw normalizeAbortError(writeFailure || error, signal);
+  } finally {
+    stopHeartbeat();
+    signal?.removeEventListener('abort', stopHeartbeatOnAbort);
+  }
 }
 
 async function writeResponseChunk(res, chunk) {
@@ -556,6 +769,11 @@ async function writeSseErrorAndClose(res, errorBody) {
     // Best effort only; the socket may already be closing.
   }
   res.end();
+}
+
+function responseUsesSseFraming(res) {
+  const contentType = String(res.getHeader('content-type') || '').toLowerCase();
+  return /^text\/event-stream(?:\s*;|\s*$)/u.test(contentType);
 }
 
 function summarizeMessageRoles(messages) {
@@ -1039,6 +1257,9 @@ function normalizeCodexUsage(usage) {
   if (Number(nextUsage.cache_read_input_tokens) > 0) {
     normalized.cache_read_input_tokens = nextUsage.cache_read_input_tokens;
   }
+  if (Number(nextUsage.cache_write_input_tokens) > 0) {
+    normalized.cache_creation_input_tokens = nextUsage.cache_write_input_tokens;
+  }
 
   return normalized;
 }
@@ -1052,7 +1273,9 @@ function sameUsage(left, right) {
     usageValue(left, 'input_tokens') === usageValue(right, 'input_tokens') &&
     usageValue(left, 'output_tokens') === usageValue(right, 'output_tokens') &&
     usageValue(left, 'cache_read_input_tokens') ===
-      usageValue(right, 'cache_read_input_tokens')
+      usageValue(right, 'cache_read_input_tokens') &&
+    usageValue(left, 'cache_creation_input_tokens') ===
+      usageValue(right, 'cache_creation_input_tokens')
   );
 }
 
@@ -1477,8 +1700,26 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       codex_input_max_tokens: config.codex?.inputMaxTokens ?? null,
       codex_tool_result_max_bytes: config.codex?.toolResultMaxBytes ?? null,
       codex_tool_result_window_max_bytes: config.codex?.toolResultWindowMaxBytes ?? null,
+      codex_context_profile:
+        config.codex?.capabilities?.profile || config.codex?.contextProfile || null,
+      codex_context_source: config.codex?.capabilities?.source || null,
+      codex_requested_raw_context_tokens:
+        config.codex?.capabilities?.requestedRawContextTokens ?? null,
+      codex_resolved_raw_context_tokens:
+        config.codex?.capabilities?.resolvedRawContextTokens ?? null,
+      codex_usable_context_tokens:
+        config.codex?.capabilities?.usableContextTokens ?? null,
+      codex_native_auto_compact_tokens:
+        config.codex?.capabilities?.autoCompactTokens ?? null,
+      codex_gateway_input_budget_tokens:
+        config.codex?.capabilities?.inputBudgetTokens ?? null,
+      codex_max_raw_context_tokens:
+        config.codex?.capabilities?.maxRawContextTokens ?? null,
       codex_auto_compact_token_limit: config.codex?.autoCompactTokenLimit ?? null,
-      codex_auto_compact_token_limit_scope: config.codex?.autoCompactTokenLimitScope || null,
+      codex_auto_compact_token_limit_scope:
+        Number(config.codex?.autoCompactTokenLimit || 0) > 0
+          ? config.codex?.autoCompactTokenLimitScope || null
+          : null,
       openai_model: config.openai?.model || null,
       openai_reasoning_effort: config.openai?.reasoningEffort || null,
       deepseek_model: config.deepseek?.model || null,
@@ -1493,6 +1734,9 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       kimi_key_configured: Boolean(config.kimi?.apiKey),
       qwen_model: config.qwen?.model || null,
       qwen_reasoning_effort: config.qwen?.reasoningEffort || null,
+      qwen_total_context_tokens: config.qwen?.totalContextTokens ?? null,
+      qwen_input_ceiling_tokens: config.qwen?.contextTokens ?? null,
+      // Retain the original field for integrations that already consume it.
       qwen_context_tokens: config.qwen?.contextTokens ?? null,
       qwen_max_output_tokens: config.qwen?.maxOutputTokens ?? null,
       qwen_key_configured: Boolean(config.qwen?.apiKey),
@@ -1506,15 +1750,25 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
   });
 
   app.use('/v1', requireGatewayAuth(config));
-  app.use('/v1', express.json({ limit: '20mb' }));
+  app.use('/v1', express.json({ limit: CLAUDE_REQUEST_BODY_LIMIT_BYTES }));
   app.use('/v1', function jsonBodyErrorHandler(error, req, res, next) {
     if (!error) {
       next();
       return;
     }
 
+    const requestTooLarge =
+      error.type === 'entity.too.large' ||
+      error.status === 413 ||
+      error.statusCode === 413;
     const formatted = formatAnthropicError(
-      new GatewayError(400, 'invalid_request_error', error.message || 'invalid JSON body')
+      requestTooLarge
+        ? new GatewayError(
+            413,
+            'request_too_large',
+            'request body exceeds the 32 MiB limit'
+          )
+        : new GatewayError(400, 'invalid_request_error', error.message || 'invalid JSON body')
     );
     res.status(formatted.status).json(formatted.body);
   });
@@ -1594,11 +1848,15 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
         res.status(formatted.status).json(formatted.body);
         return;
       }
-      if (req.body?.stream === true) {
+      if (req.body?.stream === true && responseUsesSseFraming(res)) {
         await writeSseErrorAndClose(res, formatted.body);
         return;
       }
-      res.end();
+      // A streaming request may receive a regular JSON response from an
+      // Anthropic-compatible upstream. Once those headers are committed we
+      // cannot replace or extend that body with an SSE error frame. Close the
+      // transport so the client observes a truncated response and can retry.
+      res.destroy();
     }
   });
 

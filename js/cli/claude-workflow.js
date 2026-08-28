@@ -11,10 +11,17 @@ import { createGatewayServer } from '../gateway/server.js';
 import {
   buildWorkflowClientEnv,
   buildWorkflowGatewayConfig,
+  buildWorkflowModelPicker,
   routeProvider,
   routeTargetSummary,
 } from '../gateway/workflow-config.js';
-import { runConfigCommand, runDoctorCommand, runSetupCommand } from './onboarding.js';
+import {
+  checkClaudeVersion,
+  checkWorkflowPlatform,
+  runConfigCommand,
+  runDoctorCommand,
+  runSetupCommand,
+} from './onboarding.js';
 import {
   environmentWithoutGatewayAndAnthropicCredentials,
   environmentWithoutGatewayCredentials,
@@ -23,7 +30,6 @@ import {
   CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
   buildClaudeSettingsOverrideEnvironment,
   createPrivateClaudeSettingsOverride,
-  inspectClaudeThirdPartyModelSupport,
 } from '../utils/claude-config.js';
 
 const SIGNAL_NUMBERS = {
@@ -346,6 +352,11 @@ function buildClaudeArgs(
 }
 
 function assertPreflight(config, mainRoute) {
+  const platform = checkWorkflowPlatform(process.env, config.codex.command);
+  if (!platform.ok) {
+    throw new Error(`${platform.label}: ${platform.detail}`);
+  }
+
   if (!isGatewayLoopbackHost(config.host) && !config.sharedSecret) {
     throw new Error(
       `ULTRATHINK_GATEWAY_HOST=${config.host} is not loopback. Set ULTRATHINK_GATEWAY_SHARED_SECRET for non-local binds, or use 127.0.0.1 for local workflow launches.`
@@ -364,6 +375,11 @@ function assertPreflight(config, mainRoute) {
     if (!isExecutableCommand(requirement.command)) {
       throw new Error(requirement.error);
     }
+  }
+
+  const claudeVersion = checkClaudeVersion();
+  if (!claudeVersion.ok) {
+    throw new Error(`${claudeVersion.label}: ${claudeVersion.detail}`);
   }
 
   if (!codexLoginReady(config.codex.command)) {
@@ -505,16 +521,6 @@ async function main() {
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
     buildWorkflowGatewayConfig();
   const resolvedMainRoute = resolveModelRoute(mainModelId, config);
-  if (routeProvider(resolvedMainRoute) !== 'anthropic') {
-    const thirdPartyState = inspectClaudeThirdPartyModelSupport();
-    if (!thirdPartyState.enabled) {
-      throw new Error(
-        `Claude Code third-party model support is not ready in ${thirdPartyState.path}.` +
-          ' ' +
-          'Run `claude-workflow setup --prepare-claude` first.'
-      );
-    }
-  }
   // Fail fast on launcher-managed subagent routes before starting Claude.
   resolveModelRoute(rawSubagentModelId, config);
   if (subagentModelId !== rawSubagentModelId) {
@@ -572,7 +578,8 @@ async function main() {
     );
     const claudeChildEnvironment = buildClaudeChildEnvironment(claudeEnvironment);
     claudeSettingsOverride = createPrivateClaudeSettingsOverride(
-      buildClaudeSettingsOverrideEnvironment(claudeEnvironment, claudeChildEnvironment)
+      buildClaudeSettingsOverrideEnvironment(claudeEnvironment, claudeChildEnvironment),
+      buildWorkflowModelPicker(config, mainModelId, subagentModelId)
     );
     const managedClaudeOptions = ['--settings', claudeSettingsOverride.path];
     if (resolvedMainRoute.claudeEffort) {

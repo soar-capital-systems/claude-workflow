@@ -69,7 +69,7 @@ function sseEvent(name, data) {
 }
 
 test(
-  'installed Claude accepts K3 1M/max from a prepared clean home',
+  'installed Claude accepts plain K3/max through documented settings without state mutation',
   { skip: !CLAUDE_AVAILABLE },
   async function (t) {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-clean-kimi-'));
@@ -115,12 +115,17 @@ test(
       HOME: home,
       USERPROFILE: home,
     });
-    assert.equal(prepared.changed, true);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
     assert.equal(prepared.settingsChanged, false);
     assert.equal(prepared.path, path.join(claudeConfig, '.claude.json'));
+    assert.equal(prepared.backupPath, null);
+    assert.equal(prepared.settingsBackupPath, null);
+    await assert.rejects(fsp.access(prepared.path));
     assert.equal(await fsp.readFile(settingsPath, 'utf8'), staleSettingsText);
     assert.equal(await fsp.readFile(projectSettingsPath, 'utf8'), staleSettingsText);
     const requests = [];
+    const requestPaths = [];
     const server = http.createServer(async function reply(request, response) {
       const chunks = [];
       for await (const chunk of request) {
@@ -128,6 +133,7 @@ test(
       }
       const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
       const pathname = new URL(request.url, 'http://127.0.0.1').pathname;
+      requestPaths.push(pathname);
       if (pathname.endsWith('/count_tokens')) {
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ input_tokens: 32 }));
@@ -223,18 +229,31 @@ test(
       ANTHROPIC_API_KEY: 'test-local-gateway-key',
       ANTHROPIC_AUTH_TOKEN: 'test-local-gateway-key',
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
-      ANTHROPIC_MODEL: 'k3[1m]',
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1048576',
+      ANTHROPIC_CUSTOM_MODEL_OPTION: 'k3',
+      ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION: 'kimi:k3/max through claude-workflow',
+      ANTHROPIC_CUSTOM_MODEL_OPTION_NAME: 'Kimi K3 Main Route',
+      ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES:
+        'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking',
+      ANTHROPIC_MODEL: 'k3',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '784800',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: '1',
       CLAUDE_CODE_EFFORT_LEVEL: 'max',
-      CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1048576',
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: '828400',
       CLAUDE_CODE_SUBAGENT_MODEL: 'codex-terra',
       NO_PROXY: '127.0.0.1',
       no_proxy: '127.0.0.1',
     });
 
     const settingsOverride = createPrivateClaudeSettingsOverride(
-      buildClaudeSettingsOverrideEnvironment(env, env)
+      buildClaudeSettingsOverrideEnvironment(env, env),
+      {
+        options: [
+          { model: 'k3', label: 'Kimi K3' },
+          { model: 'codex-terra', label: 'Codex Terra' },
+        ],
+        replaceBuiltInOptions: true,
+      }
     );
     t.after(() => settingsOverride.cleanup());
 
@@ -244,7 +263,7 @@ test(
         '--output-format',
         'json',
         '--model',
-        'k3[1m]',
+        'k3',
         '--effort',
         'max',
         '--settings',
@@ -261,6 +280,11 @@ test(
     assert.equal(requests.every((entry) => entry.model === 'k3'), true);
     assert.equal(requests.every((entry) => entry.thinking?.type === 'adaptive'), true);
     assert.equal(requests.every((entry) => entry.outputConfig?.effort === 'max'), true);
-    assert.equal(requests.some((entry) => /context-1m/u.test(entry.beta)), true);
+    assert.equal(requests.every((entry) => !/context-1m/u.test(entry.beta)), true);
+    assert.equal(
+      requestPaths.some((pathname) => pathname.endsWith('/models')),
+      false,
+      'the private picker must not trigger gateway model discovery'
+    );
   }
 );

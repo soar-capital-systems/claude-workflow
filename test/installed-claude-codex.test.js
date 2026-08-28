@@ -82,7 +82,7 @@ const args = process.argv.slice(2);
 const logPath = ${JSON.stringify(logPath)};
 
 if (args[0] === '--version') {
-  process.stdout.write('codex-cli 0.144.6\\n');
+  process.stdout.write('codex-cli 0.150.1\\n');
   process.exit(0);
 }
 if (args[0] === 'login' && args[1] === 'status') {
@@ -123,10 +123,14 @@ input.on('line', function onLine(line) {
       id: message.id,
       result: {
         userAgent:
-          'claude_workflow_gateway/0.144.6 (Linux 6.6; x86_64) ' +
+          'claude_workflow_gateway/0.150.1 (Linux 6.6; x86_64) ' +
           'terminal/1.0.0 (claude_workflow_gateway; 0.1.0)',
       },
     });
+    return;
+  }
+  if (message.method === 'config/read') {
+    send({ id: message.id, result: { layers: [] } });
     return;
   }
   if (message.method === 'thread/start') {
@@ -248,6 +252,20 @@ test('direct Codex main generates local client auth and strips it from the Codex
       assert.equal(clientEnv.ANTHROPIC_API_KEY, config.sharedSecret);
       assert.equal(clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME], config.sharedSecret);
       assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
+      assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
+      assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
+      assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
+      assert.equal(mainModelId, 'codex-terra');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-terra');
+      assert.match(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, /^Codex /u);
+      assert.match(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
+        /^codex:gpt-5\.6-terra\/max through claude-workflow$/u
+      );
+      assert.equal(
+        clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
+        'effort,xhigh_effort,max_effort'
+      );
       assert.equal(
         buildClaudeSettingsOverrideEnvironment(clientEnv, clientEnv)
           .CLAUDE_CODE_DISABLE_TERMINAL_TITLE,
@@ -300,7 +318,7 @@ test('direct Codex keeps explicit Anthropic routes behind a separate upstream cr
 });
 
 test(
-  'installed Claude accepts the direct Codex preset from a prepared clean home',
+  'installed Claude accepts direct Codex from a clean home without prepare-state mutation',
   { skip: !CLAUDE_AVAILABLE || process.platform === 'win32' },
   async function (t) {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-clean-codex-'));
@@ -320,7 +338,12 @@ test(
       ULTRATHINK_GATEWAY_MAIN_MODEL_ID: DIRECT_MAIN_MODEL_ID,
       ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'codex',
     });
-    prepareClaudeThirdPartyModelSupport(env);
+    const prepared = prepareClaudeThirdPartyModelSupport(env);
+    assert.equal(prepared.changed, false);
+    assert.equal(prepared.stateChanged, false);
+    assert.equal(prepared.settingsChanged, false);
+    assert.equal(prepared.backupPath, null);
+    await assert.rejects(fsp.access(prepared.path));
 
     const result = await runLauncher(env, cwd);
     assert.equal(result.timedOut, false, result.stderr || result.stdout);

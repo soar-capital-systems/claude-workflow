@@ -24,7 +24,8 @@ function Invoke-WslBash {
     [string[]]$ScriptArguments = @()
   )
 
-  $arguments = @('-d', $Distro, '-u', 'root', '--', 'bash', '-lc', $Script, '_')
+  $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
+  $arguments = @('-d', $Distro, '-u', 'root', '--', 'bash', '-lc', $normalizedScript, '_')
   $arguments += $ScriptArguments
   Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $arguments
 }

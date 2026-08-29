@@ -128,7 +128,13 @@ node_version="$3"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update -qq
-apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends ca-certificates curl git xz-utils
+apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends \
+  build-essential \
+  ca-certificates \
+  curl \
+  git \
+  python3 \
+  xz-utils
 
 # Recreate the checked-out commit through Git so executable bits come from the
 # index, not from the synthetic Unix modes exposed by the Windows mount.

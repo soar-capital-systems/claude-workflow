@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $Distro = 'Ubuntu-24.04'
 $NodeVersion = '24.16.0'
 $LinuxWorkspace = '/opt/claude-workflow-ci'
+$env:WSL_UTF8 = '1'
 
 function Invoke-NativeCommand {
   param(
@@ -36,6 +37,24 @@ function Get-WslVerboseListing {
   return $listing
 }
 
+function ConvertTo-WslPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$WindowsPath
+  )
+
+  if ($WindowsPath -match "[`r`n]") {
+    throw 'Windows workspace path must occupy one line.'
+  }
+  $translated = $WindowsPath |
+    & wsl.exe -d $Distro -u root -- bash -lc 'IFS= read -r windows_path; wslpath -u "$windows_path"'
+  $translationStatus = $LASTEXITCODE
+  $linuxPath = (($translated | Out-String) -replace "`0", '').Trim()
+  if ($translationStatus -ne 0 -or -not $linuxPath) {
+    throw "Could not translate the Windows workspace into a WSL path (status $translationStatus)."
+  }
+  return $linuxPath
+}
+
 Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2')
 $installedText = ((& wsl.exe --list --quiet | Out-String) -replace "`0", '').Trim()
 if ($LASTEXITCODE -ne 0) {
@@ -57,17 +76,19 @@ $escapedDistro = [Regex]::Escape($Distro)
 $wsl2Pattern = "(?m)^\s*\*?\s*$escapedDistro\s+\S+\s+2\s*$"
 $verboseListing = Get-WslVerboseListing
 if ($verboseListing -notmatch $wsl2Pattern) {
-  Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $Distro, '2')
+  Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--terminate', $Distro)
+  & wsl.exe --set-version $Distro 2
+  $conversionStatus = $LASTEXITCODE
   $verboseListing = Get-WslVerboseListing
+  if ($conversionStatus -ne 0 -and $verboseListing -notmatch $wsl2Pattern) {
+    throw "wsl.exe --set-version exited with status $conversionStatus and $Distro is not WSL 2:`n$verboseListing"
+  }
 }
 if ($verboseListing -notmatch $wsl2Pattern) {
   throw "$Distro was not registered as WSL 2:`n$verboseListing"
 }
 
-$mountedWorkspace = ((& wsl.exe -d $Distro -u root -- wslpath -u $env:GITHUB_WORKSPACE | Out-String) -replace "`0", '').Trim()
-if ($LASTEXITCODE -ne 0 -or -not $mountedWorkspace) {
-  throw 'Could not translate GITHUB_WORKSPACE into a WSL path.'
-}
+$mountedWorkspace = ConvertTo-WslPath -WindowsPath $env:GITHUB_WORKSPACE
 
 Invoke-WslBash -Script @'
 set -euo pipefail
@@ -76,8 +97,8 @@ workspace="$2"
 node_version="$3"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends ca-certificates curl git xz-utils
+apt-get -o Acquire::Retries=3 update -qq
+apt-get -o Acquire::Retries=3 install -y -qq --no-install-recommends ca-certificates curl git xz-utils
 
 # Recreate the checked-out commit through Git so executable bits come from the
 # index, not from the synthetic Unix modes exposed by the Windows mount.
@@ -104,7 +125,16 @@ download_root="https://nodejs.org/dist/v${node_version}"
 temporary_directory="$(mktemp -d)"
 trap 'rm -rf -- "$temporary_directory"' EXIT
 cd "$temporary_directory"
-curl --fail --silent --show-error --location --remote-name "${download_root}/${archive}"
+curl \
+  --fail \
+  --silent \
+  --show-error \
+  --location \
+  --retry 3 \
+  --retry-delay 2 \
+  --retry-all-errors \
+  --remote-name \
+  "${download_root}/${archive}"
 printf '%s  %s\n' "$node_sha256" "$archive" | sha256sum --check --strict -
 tar -xJf "$archive" -C /usr/local --strip-components=1
 

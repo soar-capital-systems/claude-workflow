@@ -34,6 +34,8 @@
   Git metadata, preserving real executable bits instead of DrvFS modes.
 - WSL CI inspects the registered distribution before requesting conversion,
   avoiding the nonzero response from setting an existing WSL 2 distro to WSL 2.
+- Windows checkout paths are passed to `wslpath` without native-command
+  backslash loss, and network-dependent package downloads use bounded retries.
 
 ## 0.2.3 - 2026-08-28
 

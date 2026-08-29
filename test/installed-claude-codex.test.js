@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,16 +20,13 @@ import {
   buildClaudeSettingsOverrideEnvironment,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
+import { installedCliPolicy } from './helpers/installed-cli-policy.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = path.join(ROOT, 'js', 'cli', 'claude-workflow.js');
 const DIRECT_MAIN_MODEL_ID = 'codex';
 const DIRECT_RESULT = 'CLEAN_HOME_CODEX_DIRECT_OK';
-const CLAUDE_AVAILABLE =
-  spawnSync('claude', ['--version'], {
-    encoding: 'utf8',
-    timeout: 5_000,
-  }).status === 0;
+const CLAUDE_CLI = installedCliPolicy({ command: 'claude', displayName: 'Claude Code' });
 const WORKFLOW_ENV_PREFIXES = Object.freeze([
   'ANTHROPIC_',
   'CLAUDE_CODE_',
@@ -319,7 +316,11 @@ test('direct Codex keeps explicit Anthropic routes behind a separate upstream cr
 
 test(
   'installed Claude accepts direct Codex from a clean home without prepare-state mutation',
-  { skip: !CLAUDE_AVAILABLE || process.platform === 'win32' },
+  {
+    skip:
+      CLAUDE_CLI.skip ||
+      (process.platform === 'win32' ? 'installed Claude/Codex contract requires POSIX signals' : false),
+  },
   async function (t) {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-clean-codex-'));
     const home = path.join(root, 'home');

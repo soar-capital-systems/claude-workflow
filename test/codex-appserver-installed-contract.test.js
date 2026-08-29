@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
@@ -10,26 +10,17 @@ import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
 
 import { DEFAULT_CODEX_MODEL } from '../js/gateway/config.js';
 import { CodexSessionManager } from '../js/gateway/codex-provider.js';
+import { installedCliPolicy } from './helpers/installed-cli-policy.js';
 
 const execFileAsync = promisify(execFile);
 const CODEX_COMMAND = process.env.ULTRATHINK_GATEWAY_CODEX_COMMAND || 'codex';
 const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
 
-function installedCodexProbe() {
-  const result = spawnSync(CODEX_COMMAND, ['--version'], {
-    encoding: 'utf8',
-    windowsHide: true,
-  });
-  return {
-    missing: result.error?.code === 'ENOENT',
-    version: String(result.stdout || result.stderr || '').trim(),
-  };
-}
-
-const CODEX_PROBE = installedCodexProbe();
-const CODEX_SKIP = CODEX_PROBE.missing
-  ? `installed Codex CLI was not found (${CODEX_COMMAND})`
-  : false;
+const CODEX_PROBE = installedCliPolicy({
+  command: CODEX_COMMAND,
+  displayName: 'Codex CLI',
+});
+const CODEX_SKIP = CODEX_PROBE.skip;
 
 async function runCodex(args, environment) {
   try {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
+import { effectiveCodexHome, executableIdentity } from '../utils/runtime-identity.js';
 
 const DEFAULT_RAW_CONTEXT_TOKENS = 272_000;
 const DEFAULT_MAX_RAW_CONTEXT_TOKENS = 272_000;
@@ -12,6 +13,7 @@ const GATEWAY_OUTPUT_RESERVE_TOKENS = 64_000;
 const GATEWAY_PROMPT_HEADROOM_TOKENS = 32_000;
 const CATALOG_TIMEOUT_MS = 5_000;
 const CATALOG_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+const CATALOG_NEGATIVE_CACHE_TTL_MS = 30_000;
 const DEFAULT_TOOL_OUTPUT_TRUNCATION_POLICY = Object.freeze({
   mode: 'bytes',
   limit: 10_000,
@@ -95,9 +97,20 @@ function parseCatalog(stdout) {
 
 function readCatalog(command, cwd, env, bundledOnly) {
   const catalogCwd = path.resolve(String(cwd || process.cwd()));
-  const cacheKey = `${command}\u0000${catalogCwd}\u0000${env?.CODEX_HOME || ''}\u0000${bundledOnly ? 'bundled' : 'online'}`;
-  if (catalogCache.has(cacheKey)) {
-    return catalogCache.get(cacheKey);
+  const environment = env || process.env;
+  const cacheKey = JSON.stringify([
+    command,
+    catalogCwd,
+    executableIdentity(command, { cwd: catalogCwd, environment }),
+    effectiveCodexHome(environment, catalogCwd),
+    bundledOnly ? 'bundled' : 'online',
+  ]);
+  const cached = catalogCache.get(cacheKey);
+  if (cached) {
+    if (cached.catalog !== null || cached.expiresAt > Date.now()) {
+      return cached.catalog;
+    }
+    catalogCache.delete(cacheKey);
   }
 
   const args = ['debug', 'models'];
@@ -109,7 +122,7 @@ function readCatalog(command, cwd, env, bundledOnly) {
     encoding: 'utf8',
     // Model discovery is local metadata lookup. Never expose unrelated
     // provider or gateway credentials to the Codex subprocess.
-    env: environmentWithoutGatewayAndAnthropicCredentials(env),
+    env: environmentWithoutGatewayAndAnthropicCredentials(environment),
     maxBuffer: CATALOG_MAX_BUFFER_BYTES,
     shell: process.platform === 'win32',
     timeout: CATALOG_TIMEOUT_MS,
@@ -123,7 +136,12 @@ function readCatalog(command, cwd, env, bundledOnly) {
       catalog = null;
     }
   }
-  catalogCache.set(cacheKey, catalog);
+  catalogCache.set(cacheKey, {
+    catalog,
+    // Successful metadata is deterministic for an executable/home identity.
+    // Retry transient spawn/parse failures after a short bounded quiet period.
+    expiresAt: catalog === null ? Date.now() + CATALOG_NEGATIVE_CACHE_TTL_MS : Infinity,
+  });
   return catalog;
 }
 

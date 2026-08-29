@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.4 - 2026-08-29
+
+### Added
+
+- Required installed-client CI against Claude Code 2.1.251 and Codex CLI
+  0.150.1. Separate weekly or manually triggered jobs test current upstream
+  releases, clean installs from matching canonical and mirror tags, and Ubuntu
+  24.04 running under WSL 2 on a Windows runner.
+
+### Changed
+
+- Detached shared gateways expose their managed state directory through both
+  the kernel working directory and `PWD`.
+- Runtime revisions include Node.js process-start, certificate, TLS, and proxy
+  settings that can change gateway behavior. Referenced certificate and OpenSSL
+  files, symlink targets, and bounded certificate-directory state are tracked,
+  so same-path rotations recycle the daemon.
+
+### Fixed
+
+- A transient Codex model-catalog failure is retried after a bounded
+  negative-cache interval. Successful catalogs remain cached by resolved
+  executable identity and effective Codex home.
+- Installed-client compatibility jobs fail when a required CLI is absent or
+  unusable instead of reporting a skipped test as a passing gate.
+- Support guidance now respects a custom daemon port and explains when shared
+  gateways must be reconciled. Release guidance distinguishes the supported
+  release from historical tags.
+- WSL CI reconstructs the committed tree on the native Linux filesystem from
+  Git metadata, preserving real executable bits instead of DrvFS modes.
+
 ## 0.2.3 - 2026-08-28
 
 ### Changed

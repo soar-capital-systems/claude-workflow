@@ -101,6 +101,7 @@ try {
     'js/cli/claude-workflow-runtime-revision.js',
     'js/gateway/codex-capabilities.js',
     'js/gateway/provider-profiles.js',
+    'js/utils/runtime-identity.js',
     'scripts/claude-workflow-daemon.sh',
     'scripts/reconcile-installed-daemon.mjs',
     'scripts/validate-local-install.mjs',

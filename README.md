@@ -38,13 +38,13 @@ installing under WSL.
 
 ## Getting started
 
-Install release `v0.2.3` from the canonical GitHub repository. npm 12 blocks
+Install release `v0.2.4` from the canonical GitHub repository. npm 12 blocks
 Git dependencies by default, so the command grants access only to the package
 named on the command line:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.3
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.4
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
@@ -341,7 +341,7 @@ isolation policy applies to per-session and shared gateways.
 
 A large context window does not make a 12,000-line review complete by itself.
 Claude Code, a tool result, the HTTP transport, and the provider each have
-independent limits. Claude Workflow correlates Claude 2.1.250's partial `Read`
+independent limits. Claude Workflow correlates Claude Code's partial `Read`
 notice with the matching pending call, then gives Codex only a verified
 contiguous prefix of numbered source lines plus an exact next offset. It never
 presents a head-and-tail preview as complete source.
@@ -543,8 +543,8 @@ claude-workflow config
 
 - **Claude reports `[claude-code:unrecognized_model]`:** check `/model` or
   `/status`. If each distinct selected route still appears by its exact ID and
-  requests succeed, the diagnostic is cosmetic: Claude Code 2.1.250 supports
-  only one custom-model metadata profile. If a row is absent or requests fail,
+  requests succeed, the diagnostic is cosmetic: Claude Code accepts only one
+  explicit custom-model metadata profile. If a row is absent or requests fail,
   inspect organization-managed `availableModels` and other policy settings.
   Claude Workflow does not bypass organization policy or disguise Codex as an
   Anthropic model.
@@ -582,6 +582,14 @@ streaming, one-call passthrough, large tool results, provider contracts,
 installed Claude clean-home flows, WSL safety, packaging, and self-contained
 GitHub-tag global installation. Live provider calls are excluded from CI.
 
+CI installs Claude Code 2.1.251 and Codex CLI 0.150.1 for the required
+installed-client contracts. A separate weekly or manually triggered workflow
+tests current upstream releases and clean installs from the latest matching
+canonical and mirror tags. Its failures report compatibility drift; they do
+not change the minimum supported versions. A Windows 2025 job installs Ubuntu
+24.04 under WSL 2 and runs the WSL safety contract on its native Linux
+filesystem. The hosted Linux matrix is not used as a substitute for WSL.
+
 See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
 
 ## Upgrade and uninstall
@@ -590,12 +598,12 @@ Reinstall this release, then run the setup checks and upgrade maintenance:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.3
+  git+https://github.com/yshaaban/claude-workflow.git#v0.2.4
 claude-workflow setup
 ```
 
-Replace `v0.2.3` with another published tag when you intentionally select a
-different release. npm registry publication is not required for GitHub
+Use another tag only to reproduce older behavior; the latest release is the
+supported version. npm registry publication is not required for GitHub
 installation.
 
 Remove Claude Workflow with:

@@ -51,5 +51,27 @@ For large files or diffs, follow the bounded coverage procedure in
 [docs/LARGE_FILES_AND_DIFFS.md](docs/LARGE_FILES_AND_DIFFS.md). A passing test
 does not replace review of every changed hunk.
 
+## Release checklist
+
+- Use the same install command in the README and release notes, pinned to the
+  supported tag and canonical repository:
+
+  ```bash
+  npm install --global --allow-git=root \
+    git+https://github.com/yshaaban/claude-workflow.git#vX.Y.Z
+  ```
+
+- Create the release tag once and push that tag to the canonical and mirror
+  remotes. Verify that both `refs/tags/<tag>^{}` entries peel to the same commit.
+- Wait for the tag-triggered CI run to pass in both repositories before
+  publishing the GitHub releases.
+- After both tags and releases are public, manually run the latest-upstream
+  workflow in the canonical repository with `public_tag` set to the new tag.
+  Its public-install job must verify that the canonical and mirror tags resolve
+  to the same commit and install cleanly before the release is announced.
+- On every older release page, replace the existing supersession and install
+  block. Do not stack notices. Each old page must point only to the supported
+  release and its canonical install command.
+
 By submitting a contribution, you agree that it may be distributed under the
 project's MIT License.

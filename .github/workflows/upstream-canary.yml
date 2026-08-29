@@ -1,0 +1,58 @@
+name: Latest Upstream Canary
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      public_tag:
+        description: Optional vMAJOR.MINOR.PATCH tag for the public-install check
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: latest-upstream-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  latest-upstream:
+    name: Latest Claude Code and Codex CLI
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'yshaaban/claude-workflow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CLAUDE_WORKFLOW_REQUIRE_INSTALLED_CLIS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install latest upstream CLIs
+        run: >-
+          npm install --global --no-audit --no-fund
+          @anthropic-ai/claude-code@latest
+          @openai/codex@latest
+      - run: npm run -s test:upstream-compatibility
+
+  public-github-install:
+    name: Public canonical and mirror tag installs
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'yshaaban/claude-workflow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CLAUDE_WORKFLOW_PUBLIC_TAG: ${{ inputs.public_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --global npm@12.0.2
+      - run: test "$(npm --version)" = '12.0.2'
+      - run: npm ci
+      - run: node .github/scripts/public-github-tag-install.mjs

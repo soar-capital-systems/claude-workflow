@@ -308,7 +308,9 @@ const child = spawn(
   {
     detached: true,
     cwd: statePath,
-    env: process.env,
+    // Keep both the kernel cwd and the conventional POSIX cwd environment in
+    // agreement. Some subprocesses inspect PWD instead of calling getcwd().
+    env: { ...process.env, PWD: statePath },
     stdio: ['ignore', logFd, logFd],
   }
 );

@@ -42,14 +42,16 @@ the private Claude Code `/model` picker. Select the 1M profile with
 `ULTRATHINK_GATEWAY_KIMI_API_KEY` to the owner-only
 `~/.claude-workflow.env` file, and verify a new session with Claude Code's
 `/status` command. Kimi Code keys and Kimi Open Platform keys are not
-interchangeable. In shared mode, run `claude-workflow-gateway reconcile` or
-rerun setup after changing the route, provider, endpoint, or credential.
+interchangeable.
 
 For Qwen, select `claude-workflow config --main qwen`, add
 `ULTRATHINK_GATEWAY_QWEN_API_KEY` to the owner-only configuration, and start a
 new session. The built-in profile uses the Singapore Token Plan
 OpenAI-compatible endpoint. Standard DashScope keys require an explicit
 matching base URL and are not interchangeable with Token Plan keys.
+
+In shared mode, run `claude-workflow-gateway reconcile` or rerun setup after
+changing any route, provider, endpoint, credential, model, or executable.
 
 ## Context reporting
 
@@ -92,7 +94,7 @@ For shared-mode problems, also run:
 ```bash
 claude-workflow-gateway status
 claude-workflow-gateway log 100
-curl -s http://127.0.0.1:4318/healthz
+curl -s "http://127.0.0.1:${ULTRATHINK_GATEWAY_DAEMON_PORT:-4318}/healthz"
 ```
 
 Include the failing command, OS/shell, sanitized health response, and the first
@@ -111,12 +113,12 @@ relevant error. Never attach credentials or an unredacted gateway env file.
   `functions.exec` and `functions.wait` wrappers alongside Claude's dynamic
   tools.
 - Claude Workflow supplies one exact `/model` picker row for each distinct
-  selected route in its private session settings. Claude Code 2.1.250 still
-  accepts only one explicit custom metadata profile. An unrecognized-model
+  selected route in its private session settings. Claude Code accepts only one
+  explicit custom metadata profile. An unrecognized-model
   diagnostic is cosmetic only when `/model` or `/status` retains the exact ID
   and requests succeed; organization-managed `availableModels` can still block
-  it. Gateway discovery remains disabled because Claude Code 2.1.250 filters
-  truthful non-Anthropic IDs and discovery would add startup traffic.
+  it. Gateway discovery remains disabled because Claude Code filters truthful
+  non-Anthropic IDs and discovery would add startup traffic.
 - Large-output truncation is never proof of complete review. Follow
   `docs/LARGE_FILES_AND_DIFFS.md` for coverage accounting.
 - Kimi's provider-side 1M context window does not raise its 2,097,152-byte total

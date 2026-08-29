@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -19,9 +19,9 @@ import {
   createPrivateClaudeSettingsOverride,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
+import { installedCliPolicy } from './helpers/installed-cli-policy.js';
 
-const CLAUDE_AVAILABLE =
-  spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 5_000 }).status === 0;
+const CLAUDE_CLI = installedCliPolicy({ command: 'claude', displayName: 'Claude Code' });
 const QWEN_API_KEY = 'sk-sp-test-installed-claude-qwen-key';
 const WORKFLOW_PREFIXES = Object.freeze([
   'ANTHROPIC_',
@@ -184,7 +184,7 @@ function runClaude(args, options) {
 
 test(
   'installed Claude accepts Qwen 3.8 Max with truthful context and preserves a streamed tool loop',
-  { skip: !CLAUDE_AVAILABLE },
+  { skip: CLAUDE_CLI.skip },
   async function (t) {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-clean-qwen-'));
     const home = path.join(root, 'home');

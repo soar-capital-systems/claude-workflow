@@ -437,7 +437,7 @@ async function testEquivalentShellsUseOneSemanticRuntimeRevision() {
   await fs.writeFile(
     path.join(baselineBin, 'configured-codex'),
     `#!/usr/bin/env node\n` +
-      `require('node:fs').writeFileSync(${JSON.stringify(codexCwdLog)}, process.cwd());\n` +
+      `require('node:fs').writeFileSync(${JSON.stringify(codexCwdLog)}, JSON.stringify({cwd:process.cwd(),pwd:process.env.PWD||''}));\n` +
       `process.exit(1);\n`,
     { mode: 0o755 }
   );
@@ -495,8 +495,13 @@ async function testEquivalentShellsUseOneSemanticRuntimeRevision() {
     const originalRevision = (await fs.readFile(revisionFile, 'utf8')).trim();
     const originalHealth = await readHealth(port);
     assert.equal(originalHealth.trace_enabled, false);
+    const observedCodexLocation = JSON.parse(await fs.readFile(codexCwdLog, 'utf8'));
     assert.equal(
-      await fs.realpath((await fs.readFile(codexCwdLog, 'utf8')).trim()),
+      await fs.realpath(observedCodexLocation.cwd),
+      await fs.realpath(stateDir)
+    );
+    assert.equal(
+      await fs.realpath(observedCodexLocation.pwd),
       await fs.realpath(stateDir)
     );
 
@@ -684,6 +689,217 @@ async function testDefaultCodexHomeChangesRuntimeRevision() {
     assert.equal(first.code, 0, first.stderr || first.stdout);
     assert.equal(second.code, 0, second.stderr || second.stdout);
     assert.notEqual(first.stdout, second.stdout);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testProcessStartEnvironmentChangesRuntimeRevision() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-process-env-revision-'));
+  const home = path.join(root, 'home');
+  const stateDir = path.join(root, 'state');
+  await fs.mkdir(home);
+  const scrubbedEnvironment = environmentWithoutGatewayAndAnthropicCredentials(process.env);
+  for (const name of Object.keys(scrubbedEnvironment)) {
+    if (name.startsWith('CLAUDE_WORKFLOW_') || name.startsWith('ULTRATHINK_')) {
+      delete scrubbedEnvironment[name];
+    }
+  }
+  const processStartEnvironment = [
+    'NODE_OPTIONS',
+    'NODE_EXTRA_CA_CERTS',
+    'NODE_TLS_REJECT_UNAUTHORIZED',
+    'NODE_USE_ENV_PROXY',
+    'NODE_USE_SYSTEM_CA',
+    'OPENSSL_CONF',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+  ];
+  for (const name of processStartEnvironment) {
+    delete scrubbedEnvironment[name];
+  }
+  const baseEnvironment = { ...scrubbedEnvironment, HOME: home };
+
+  try {
+    const baseline = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      baseEnvironment
+    );
+    assert.equal(baseline.code, 0, baseline.stderr || baseline.stdout);
+    assert.match(baseline.stdout.trim(), /^[a-f0-9]{64}$/u);
+
+    for (const [name, value] of [
+      ['NODE_OPTIONS', '--no-warnings'],
+      ['NODE_EXTRA_CA_CERTS', path.join(root, 'extra-ca.pem')],
+      ['NODE_TLS_REJECT_UNAUTHORIZED', '0'],
+      ['NODE_USE_ENV_PROXY', '1'],
+      ['NODE_USE_SYSTEM_CA', '1'],
+      ['OPENSSL_CONF', path.join(root, 'openssl.cnf')],
+      ['SSL_CERT_FILE', path.join(root, 'cert-file.pem')],
+      ['SSL_CERT_DIR', path.join(root, 'cert-directory')],
+    ]) {
+      const changed = await runProcess(
+        process.execPath,
+        [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+        { ...baseEnvironment, [name]: value }
+      );
+      assert.equal(changed.code, 0, changed.stderr || changed.stdout);
+      assert.match(changed.stdout.trim(), /^[a-f0-9]{64}$/u);
+      assert.notEqual(changed.stdout, baseline.stdout, `${name} must affect daemon revision`);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testProcessStartupPathStateChangesRuntimeRevision() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-startup-paths-'));
+  const home = path.join(root, 'home');
+  const stateDir = path.join(root, 'state');
+  await fs.mkdir(home);
+  await fs.mkdir(stateDir);
+  const scrubbedEnvironment = environmentWithoutGatewayAndAnthropicCredentials(process.env);
+  for (const name of Object.keys(scrubbedEnvironment)) {
+    if (name.startsWith('CLAUDE_WORKFLOW_') || name.startsWith('ULTRATHINK_')) {
+      delete scrubbedEnvironment[name];
+    }
+  }
+  for (const name of [
+    'NODE_EXTRA_CA_CERTS',
+    'OPENSSL_CONF',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+  ]) {
+    delete scrubbedEnvironment[name];
+  }
+  const baseEnvironment = { ...scrubbedEnvironment, HOME: home };
+
+  async function runtimeRevision(environment) {
+    const result = await runProcess(
+      process.execPath,
+      [RUNTIME_REVISION_HELPER, REPO_ROOT, stateDir, '4318'],
+      environment
+    );
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.match(result.stdout.trim(), /^[a-f0-9]{64}$/u);
+    assert.doesNotMatch(
+      `${result.stdout}\n${result.stderr}`,
+      /do-not-leak-startup-material/u
+    );
+    return result.stdout.trim();
+  }
+
+  try {
+    for (const [name, relativePath] of [
+      ['NODE_EXTRA_CA_CERTS', 'extra-ca.pem'],
+      ['OPENSSL_CONF', 'openssl.cnf'],
+      ['SSL_CERT_FILE', 'cert-file.pem'],
+    ]) {
+      const startupFile = path.join(stateDir, relativePath);
+      await fs.writeFile(startupFile, 'generation-one do-not-leak-startup-material\n');
+      const first = await runtimeRevision({ ...baseEnvironment, [name]: relativePath });
+      await fs.writeFile(startupFile, 'generation-two do-not-leak-startup-material\n');
+      const second = await runtimeRevision({ ...baseEnvironment, [name]: relativePath });
+      assert.notEqual(
+        second,
+        first,
+        `${name} must track same-path file replacement from the daemon working directory`
+      );
+    }
+
+    const missingRelativePath = 'created-after-first-revision.pem';
+    const missing = await runtimeRevision({
+      ...baseEnvironment,
+      SSL_CERT_FILE: missingRelativePath,
+    });
+    await fs.writeFile(path.join(stateDir, missingRelativePath), 'created\n');
+    const created = await runtimeRevision({
+      ...baseEnvironment,
+      SSL_CERT_FILE: missingRelativePath,
+    });
+    assert.notEqual(created, missing, 'creating a previously missing startup file must be visible');
+
+    if (process.platform !== 'win32') {
+      const firstTarget = path.join(stateDir, 'cert-target-one.pem');
+      const secondTarget = path.join(stateDir, 'cert-target-two.pem');
+      const link = path.join(stateDir, 'cert-current.pem');
+      await fs.writeFile(firstTarget, 'same-size-one\n');
+      await fs.writeFile(secondTarget, 'same-size-two\n');
+      await fs.symlink(path.basename(firstTarget), link);
+      const first = await runtimeRevision({
+        ...baseEnvironment,
+        SSL_CERT_FILE: path.basename(link),
+      });
+      await fs.unlink(link);
+      await fs.symlink(path.basename(secondTarget), link);
+      const second = await runtimeRevision({
+        ...baseEnvironment,
+        SSL_CERT_FILE: path.basename(link),
+      });
+      assert.notEqual(second, first, 'retargeting a startup-file symlink must be visible');
+    }
+
+    const firstCertificateDirectory = path.join(stateDir, 'certificates-one');
+    const secondCertificateDirectory = path.join(stateDir, 'certificates-two');
+    await fs.mkdir(firstCertificateDirectory);
+    await fs.mkdir(secondCertificateDirectory);
+    const certificateDirectoryList = [
+      path.basename(firstCertificateDirectory),
+      path.basename(secondCertificateDirectory),
+    ].join(path.delimiter);
+    const emptyDirectories = await runtimeRevision({
+      ...baseEnvironment,
+      SSL_CERT_DIR: certificateDirectoryList,
+    });
+    const certificate = path.join(secondCertificateDirectory, '01234567.0');
+    await fs.writeFile(certificate, 'generation-one do-not-leak-startup-material\n');
+    const populatedDirectories = await runtimeRevision({
+      ...baseEnvironment,
+      SSL_CERT_DIR: certificateDirectoryList,
+    });
+    assert.notEqual(
+      populatedDirectories,
+      emptyDirectories,
+      'SSL_CERT_DIR membership changes must be visible across a path list'
+    );
+    await fs.writeFile(certificate, 'generation-two do-not-leak-startup-material\n');
+    const rotatedCertificate = await runtimeRevision({
+      ...baseEnvironment,
+      SSL_CERT_DIR: certificateDirectoryList,
+    });
+    assert.notEqual(
+      rotatedCertificate,
+      populatedDirectories,
+      'same-path certificate rotation inside SSL_CERT_DIR must be visible below the scan cap'
+    );
+
+    const largeCertificateDirectory = path.join(stateDir, 'certificates-over-cap');
+    await fs.mkdir(largeCertificateDirectory);
+    for (let index = 0; index < 4097; index += 1) {
+      await fs.writeFile(
+        path.join(largeCertificateDirectory, `${index.toString(16).padStart(8, '0')}.0`),
+        ''
+      );
+    }
+    const overCapEnvironment = {
+      ...baseEnvironment,
+      SSL_CERT_DIR: path.basename(largeCertificateDirectory),
+    };
+    const overCapFirst = await runtimeRevision(overCapEnvironment);
+    const overCapSecond = await runtimeRevision(overCapEnvironment);
+    assert.equal(
+      overCapSecond,
+      overCapFirst,
+      'over-cap directory fallback must remain deterministic'
+    );
+    await fs.writeFile(path.join(largeCertificateDirectory, 'ffffffff.0'), 'new\n');
+    const overCapChanged = await runtimeRevision(overCapEnvironment);
+    assert.notEqual(
+      overCapChanged,
+      overCapFirst,
+      'over-cap directory membership changes must remain visible through directory metadata'
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -1005,6 +1221,8 @@ await testInstallationMaintenanceIgnoresNpmLifecyclePath();
 await testEquivalentShellsUseOneSemanticRuntimeRevision();
 await testExecutableAliasSelectionChangesRuntimeRevision();
 await testDefaultCodexHomeChangesRuntimeRevision();
+await testProcessStartEnvironmentChangesRuntimeRevision();
+await testProcessStartupPathStateChangesRuntimeRevision();
 await testSourcedManagedAuthKeepsKimiDaemonCurrent();
 await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
 process.stdout.write('PASS daemon revision recycling and health diagnostics\n');

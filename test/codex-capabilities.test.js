@@ -259,6 +259,155 @@ test('capability discovery refreshes online only for a model missing from the bu
   );
 });
 
+test('transient catalog failures expire while successful discovery stays cached', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-capabilities-negative-cache-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const command = path.join(directory, 'codex');
+  const log = path.join(directory, 'args.log');
+  const ready = path.join(directory, 'ready');
+  await makeExecutable(
+    command,
+    `#!/usr/bin/env node\n` +
+      `const fs = require('node:fs');\n` +
+      `fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');\n` +
+      `if (!fs.existsSync(${JSON.stringify(ready)})) process.exit(1);\n` +
+      `process.stdout.write(JSON.stringify({models:[{slug:'recovered-model',context_window:500000,max_context_window:700000,effective_context_window_percent:95,supported_reasoning_levels:[]}]}));\n`
+  );
+
+  const realDateNow = Date.now;
+  let now = realDateNow();
+  Date.now = () => now;
+  clearCodexCapabilityCacheForTests();
+  try {
+    const failed = resolveCodexCapabilities({
+      command,
+      model: 'recovered-model',
+      contextProfile: 'long',
+      env: process.env,
+    });
+    assert.equal(failed.source, 'conservative-fallback');
+    assert.equal(
+      await fs.readFile(log, 'utf8'),
+      'debug models --bundled\ndebug models\n'
+    );
+
+    await fs.writeFile(ready, 'ready\n');
+    const negativelyCached = resolveCodexCapabilities({
+      command,
+      model: 'recovered-model',
+      contextProfile: 'long',
+      env: process.env,
+    });
+    assert.equal(negativelyCached.source, 'conservative-fallback');
+    assert.equal(
+      await fs.readFile(log, 'utf8'),
+      'debug models --bundled\ndebug models\n'
+    );
+
+    now += 60_000;
+    const recovered = resolveCodexCapabilities({
+      command,
+      model: 'recovered-model',
+      contextProfile: 'long',
+      env: process.env,
+    });
+    assert.equal(recovered.source, 'codex-catalog');
+    assert.equal(recovered.resolvedRawContextTokens, 700_000);
+    assert.equal(
+      await fs.readFile(log, 'utf8'),
+      'debug models --bundled\ndebug models\ndebug models --bundled\n'
+    );
+
+    now += 24 * 60 * 60_000;
+    const successCached = resolveCodexCapabilities({
+      command,
+      model: 'recovered-model',
+      contextProfile: 'long',
+      env: process.env,
+    });
+    assert.equal(successCached.source, 'codex-catalog');
+    assert.equal(
+      await fs.readFile(log, 'utf8'),
+      'debug models --bundled\ndebug models\ndebug models --bundled\n'
+    );
+  } finally {
+    Date.now = realDateNow;
+    clearCodexCapabilityCacheForTests();
+  }
+});
+
+test('capability cache follows replacement of the resolved Codex executable', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-capabilities-identity-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const command = path.join(directory, 'codex');
+  const log = path.join(directory, 'args.log');
+  const executable = (model, padding) =>
+    `#!/usr/bin/env node\n` +
+    `const fs = require('node:fs');\n` +
+    `fs.appendFileSync(${JSON.stringify(log)}, ${JSON.stringify(model)} + ':' + process.argv.slice(2).join(' ') + '\\n');\n` +
+    `process.stdout.write(JSON.stringify({models:[{slug:${JSON.stringify(model)},context_window:500000,max_context_window:500000,effective_context_window_percent:95,supported_reasoning_levels:[]}]}));\n` +
+    `// ${padding}\n`;
+  await makeExecutable(command, executable('before-replacement', 'short'));
+
+  clearCodexCapabilityCacheForTests();
+  const initial = resolveCodexCapabilities({
+    command,
+    model: 'missing-before-replacement',
+    env: process.env,
+  });
+  assert.equal(initial.source, 'conservative-fallback');
+
+  await makeExecutable(
+    command,
+    executable('after-replacement', 'padding-that-changes-the-executable-file-identity')
+  );
+  const replaced = resolveCodexCapabilities({
+    command,
+    model: 'after-replacement',
+    env: process.env,
+  });
+  assert.equal(replaced.source, 'codex-catalog');
+  assert.equal(replaced.resolvedRawContextTokens, 500_000);
+  assert.equal(
+    await fs.readFile(log, 'utf8'),
+    'before-replacement:debug models --bundled\n' +
+      'before-replacement:debug models\n' +
+      'after-replacement:debug models --bundled\n'
+  );
+});
+
+test('capability cache distinguishes the effective default Codex home', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-capabilities-home-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const command = path.join(directory, 'codex');
+  const firstHome = path.join(directory, 'first-home');
+  const secondHome = path.join(directory, 'second-home');
+  await fs.mkdir(firstHome);
+  await fs.mkdir(secondHome);
+  await makeExecutable(
+    command,
+    `#!/usr/bin/env node\n` +
+      `const context = process.env.HOME.endsWith('first-home') ? 400000 : 600000;\n` +
+      `process.stdout.write(JSON.stringify({models:[{slug:'home-sensitive',context_window:context,max_context_window:context,effective_context_window_percent:95,supported_reasoning_levels:[]}]}));\n`
+  );
+
+  clearCodexCapabilityCacheForTests();
+  const first = resolveCodexCapabilities({
+    command,
+    model: 'home-sensitive',
+    env: { ...process.env, HOME: firstHome, CODEX_HOME: undefined },
+  });
+  const second = resolveCodexCapabilities({
+    command,
+    model: 'home-sensitive',
+    env: { ...process.env, HOME: secondHome, CODEX_HOME: undefined },
+  });
+  assert.equal(first.source, 'codex-catalog');
+  assert.equal(second.source, 'codex-catalog');
+  assert.equal(first.resolvedRawContextTokens, 400_000);
+  assert.equal(second.resolvedRawContextTokens, 600_000);
+});
+
 test('workflow long context gives Claude the truthful Codex usable and compact windows', async () => {
   await withEnvironment(
     {

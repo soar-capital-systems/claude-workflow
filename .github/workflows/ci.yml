@@ -36,3 +36,25 @@ jobs:
       - run: npm install --global npm@12.0.2
       - run: npm ci
       - run: npm run test:package
+
+  upstream-compatibility:
+    name: Supported Claude/Codex compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CLAUDE_WORKFLOW_REQUIRE_INSTALLED_CLIS: '1'
+      CLAUDE_WORKFLOW_EXPECT_CLAUDE_VERSION: '2.1.251'
+      CLAUDE_WORKFLOW_EXPECT_CODEX_VERSION: '0.150.1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install supported upstream CLIs
+        run: >-
+          npm install --global --no-audit --no-fund
+          @anthropic-ai/claude-code@2.1.251
+          @openai/codex@0.150.1
+      - run: npm run -s test:upstream-compatibility

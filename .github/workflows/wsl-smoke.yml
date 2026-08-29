@@ -1,0 +1,25 @@
+name: WSL Smoke
+
+on:
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl-smoke-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  wsl-smoke:
+    name: Ubuntu 24.04 under WSL 2
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'yshaaban/claude-workflow'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install WSL distro and run native-filesystem smoke
+        shell: pwsh
+        run: ./.github/scripts/run-wsl-smoke.ps1

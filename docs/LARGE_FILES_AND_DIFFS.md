@@ -15,7 +15,7 @@ Several independent limits apply to one review:
   provider context limits and can bind first for unusually large tool results.
 - Generic Codex tool output may be shortened before it enters model history.
   An omission marker identifies an unseen gap; it is not a continuation cursor.
-- For a matching Claude `Read` result, the gateway validates Claude 2.1.250's
+- For a matching Claude `Read` result, the gateway validates Claude Code's
   immediately adjacent partial-view notice and forwards only a contiguous
   numbered prefix no larger than 36,000 UTF-8 bytes. It adds machine-readable
   coverage metadata with the exact next 1-based offset. A malformed or

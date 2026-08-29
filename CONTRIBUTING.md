@@ -63,6 +63,9 @@ does not replace review of every changed hunk.
 
 - Create the release tag once and push that tag to the canonical and mirror
   remotes. Verify that both `refs/tags/<tag>^{}` entries peel to the same commit.
+- Before tagging, manually run `WSL Smoke` at the current `main` commit in
+  UltraThink, the canonical standalone repository, and its mirror. All three
+  runs must pass.
 - Wait for the tag-triggered CI run to pass in both repositories before
   publishing the GitHub releases.
 - After both tags and releases are public, manually run the latest-upstream

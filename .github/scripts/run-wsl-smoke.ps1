@@ -25,9 +25,12 @@ function Invoke-WslBash {
   )
 
   $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
-  $arguments = @('-d', $Distro, '-u', 'root', '--', 'bash', '-lc', $normalizedScript, '_')
+  $arguments = @('-d', $Distro, '-u', 'root', '--', 'bash', '-s', '--')
   $arguments += $ScriptArguments
-  Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $arguments
+  $normalizedScript | & wsl.exe @arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "wsl.exe exited with status $LASTEXITCODE"
+  }
 }
 
 function Get-WslVerboseListing {
@@ -96,6 +99,10 @@ set -euo pipefail
 source_path="$1"
 workspace="$2"
 node_version="$3"
+[[ -n "$source_path" && -n "$workspace" && -n "$node_version" ]] || {
+  echo 'WSL smoke arguments must be nonempty.' >&2
+  exit 1
+}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update -qq

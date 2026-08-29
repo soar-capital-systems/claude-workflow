@@ -57,6 +57,7 @@ test(
       const home = await temporaryDirectory(t, `claude-workflow-${expected}-marker-`);
       const rcPath = path.join(home, '.bashrc');
       await fsp.copyFile(path.join(FIXTURES, fixtureName), rcPath);
+      await fsp.chmod(rcPath, 0o644);
 
       for (const action of ['install-shell', 'uninstall-shell']) {
         const result = spawnSync('bash', [MANAGER, action], {
@@ -102,6 +103,7 @@ test(
     const malformed =
       'export PRESERVED=1\n# >>> claude-workflow gateway >>>\nexport IMPORTANT_AFTER=1\n';
     await fsp.writeFile(rcPath, malformed, { encoding: 'utf8', mode: 0o640 });
+    await fsp.chmod(rcPath, 0o640);
     const result = spawnSync('bash', [MANAGER, 'migrate-shell'], {
       encoding: 'utf8',
       env: managerEnvironment(home),
@@ -521,6 +523,7 @@ test(
     const rcPath = path.join(home, '.bashrc');
     const sentinel = path.join(home, 'sentinel');
     await fsp.writeFile(rcPath, 'export PRESERVED=yes\n', { mode: 0o640 });
+    await fsp.chmod(rcPath, 0o640);
     await fsp.writeFile(sentinel, 'do-not-overwrite\n');
     await fsp.symlink(sentinel, `${rcPath}.claude-workflow.bak`);
     const collision = spawnSync('bash', [MANAGER, 'migrate-shell'], {

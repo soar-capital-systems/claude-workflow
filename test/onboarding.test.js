@@ -165,6 +165,7 @@ test(
     const target = path.join(root, 'home with spaces', '.claude-workflow.env');
     await fsp.mkdir(path.dirname(target));
     await fsp.writeFile(target, '# keep me\nUNMANAGED=yes\n', { mode: 0o644 });
+    await fsp.chmod(target, 0o644);
 
     const first = writeUserConfiguration(target, {
       ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.6-terra',
@@ -208,6 +209,7 @@ test(
     const target = path.join(home, '.claude.json');
     const original = '{\n  "theme": "dark"\n}\n';
     await fsp.writeFile(target, original, { mode: 0o644 });
+    await fsp.chmod(target, 0o644);
     const settingsPath = path.join(home, '.claude', 'settings.json');
     await fsp.mkdir(path.dirname(settingsPath), { recursive: true });
     const originalSettings = `${JSON.stringify(
@@ -228,6 +230,7 @@ test(
       2
     )}\n`;
     await fsp.writeFile(settingsPath, originalSettings, { mode: 0o644 });
+    await fsp.chmod(settingsPath, 0o644);
     const env = isolatedEnvironment(home);
 
     const prepared = prepareClaudeThirdPartyModelSupport(env);

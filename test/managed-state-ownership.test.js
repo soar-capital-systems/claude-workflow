@@ -49,6 +49,7 @@ test('arbitrary env paths and alias collisions are rejected without mutation', P
   const externalSentinel = path.join(root, 'external.env');
   await fs.mkdir(stateDirectory, { mode: 0o700 });
   await fs.writeFile(externalSentinel, 'external-sentinel\n', { mode: 0o644 });
+  await fs.chmod(externalSentinel, 0o644);
 
   assert.throws(
     () => writeWorkflowEnvironmentFile(externalSentinel, { VALUE: 'unsafe' }),

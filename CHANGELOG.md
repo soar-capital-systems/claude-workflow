@@ -37,6 +37,8 @@
 - Windows checkout paths are passed to `wslpath` without native-command
   backslash loss, inline Bash is normalized to LF and streamed over stdin, and
   network-dependent package downloads use bounded retries.
+- Permission-sensitive tests set their intended fixture modes explicitly, so a
+  restrictive caller umask cannot weaken WSL security coverage.
 
 ## 0.2.3 - 2026-08-28
 

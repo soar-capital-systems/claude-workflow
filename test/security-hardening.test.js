@@ -606,6 +606,7 @@ test(
     const link = path.join(root, 'linked.env');
     await fsp.writeFile(safe, 'SAFE=value\n', { mode: 0o600 });
     await fsp.writeFile(shared, 'UNSAFE=value\n', { mode: 0o644 });
+    await fsp.chmod(shared, 0o644);
     await fsp.symlink(safe, link);
 
     assert.equal(assertSafeUserEnvironmentFile(path.join(root, 'missing.env')), false);
@@ -774,6 +775,7 @@ test(
 
     const arbitraryTarget = path.join(root, 'arbitrary-sentinel');
     await fsp.writeFile(arbitraryTarget, 'keep-me\n', { mode: 0o644 });
+    await fsp.chmod(arbitraryTarget, 0o644);
     assert.throws(
       () => writeWorkflowEnvironmentFile(arbitraryTarget, { VALUE: 'unsafe' }),
       /must be exactly/u
@@ -831,6 +833,7 @@ test(
       `${JSON.stringify({ ts: new Date().toISOString(), event: 'legacy' })}\n`,
       { mode: 0o644 }
     );
+    await fsp.chmod(activeTrace, 0o644);
 
     const tracer = createGatewayTracer({
       traceDir: traceDirectory,

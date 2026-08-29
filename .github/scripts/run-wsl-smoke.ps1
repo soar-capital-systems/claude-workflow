@@ -27,9 +27,31 @@ function Invoke-WslBash {
   $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
   $arguments = @('-d', $Distro, '-u', 'root', '--', 'bash', '-s', '--')
   $arguments += $ScriptArguments
-  $normalizedScript | & wsl.exe @arguments
-  if ($LASTEXITCODE -ne 0) {
-    throw "wsl.exe exited with status $LASTEXITCODE"
+
+  # A native PowerShell pipeline appends a Windows record separator. Write the
+  # exact LF-normalized program instead so the final Bash token cannot gain CR.
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = 'wsl.exe'
+  $startInfo.UseShellExecute = $false
+  $startInfo.RedirectStandardInput = $true
+  $startInfo.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+  foreach ($argument in $arguments) {
+    [void]$startInfo.ArgumentList.Add($argument)
+  }
+
+  $child = [System.Diagnostics.Process]::Start($startInfo)
+  if ($null -eq $child) {
+    throw 'Could not start wsl.exe.'
+  }
+  try {
+    $child.StandardInput.Write($normalizedScript)
+    $child.StandardInput.Close()
+    $child.WaitForExit()
+    if ($child.ExitCode -ne 0) {
+      throw "wsl.exe exited with status $($child.ExitCode)"
+    }
+  } finally {
+    $child.Dispose()
   }
 }
 

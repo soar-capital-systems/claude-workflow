@@ -270,8 +270,13 @@ rl.on('line', function onLine(line) {
   }
   if (message.method === 'turn/start') {
     log({ event: 'turn_start' });
+    const errorMessages = {
+      serverOverloaded: 'typed overload',
+      rateLimitExceeded: 'typed rate limit',
+      usageLimitExceeded: 'typed usage limit'
+    };
     const turnError = {
-      message: errorType === 'serverOverloaded' ? 'typed overload' : 'typed context overflow',
+      message: errorMessages[errorType] || 'typed context overflow',
       codexErrorInfo: errorType,
       additionalDetails: 'typed-details'
     };
@@ -632,6 +637,62 @@ test('typed serverOverloaded notifications map to retryable 503 without replay',
         assert.equal(error.codexErrorType, 'serverOverloaded');
         assert.equal(error.codexAdditionalDetails, 'typed-details');
         assert.equal(error.retryable, true);
+        return true;
+      }
+    );
+    const entries = await readJsonLines(logPath);
+    assert.equal(entries.filter((entry) => entry.event === 'turn_start').length, 1);
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('typed rateLimitExceeded maps to retryable 429 without replay', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-typed-rate-limit-'));
+  const command = path.join(tempDir, 'fake-codex');
+  const logPath = path.join(tempDir, 'events.jsonl');
+  await makeExecutable(command, typedTurnErrorAppServer(logPath, 'rateLimitExceeded', true));
+  const manager = new CodexSessionManager(managerConfig(command, tempDir));
+
+  try {
+    await assert.rejects(
+      manager.processRequest(request('typed-rate-limit'), body('Typed rate limit.'), route()),
+      (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.type, 'rate_limit_error');
+        assert.equal(error.codexErrorInfo, 'rateLimitExceeded');
+        assert.equal(error.codexErrorType, 'rateLimitExceeded');
+        assert.equal(error.codexAdditionalDetails, 'typed-details');
+        assert.equal(error.retryable, true);
+        return true;
+      }
+    );
+    const entries = await readJsonLines(logPath);
+    assert.equal(entries.filter((entry) => entry.event === 'turn_start').length, 1);
+  } finally {
+    await manager.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('typed usageLimitExceeded maps to non-retryable 429 without replay', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-typed-usage-limit-'));
+  const command = path.join(tempDir, 'fake-codex');
+  const logPath = path.join(tempDir, 'events.jsonl');
+  await makeExecutable(command, typedTurnErrorAppServer(logPath, 'usageLimitExceeded', true));
+  const manager = new CodexSessionManager(managerConfig(command, tempDir));
+
+  try {
+    await assert.rejects(
+      manager.processRequest(request('typed-usage-limit'), body('Typed usage limit.'), route()),
+      (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.type, 'rate_limit_error');
+        assert.equal(error.codexErrorInfo, 'usageLimitExceeded');
+        assert.equal(error.codexErrorType, 'usageLimitExceeded');
+        assert.equal(error.codexAdditionalDetails, 'typed-details');
+        assert.equal(error.retryable, false);
         return true;
       }
     );

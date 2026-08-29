@@ -237,9 +237,12 @@ function codexTurnGatewayError(turnError, fallbackMessage) {
   const codexErrorInfo = turnError?.codexErrorInfo ?? turnError?.codex_error_info ?? null;
   const codexErrorType = codexErrorInfoType(codexErrorInfo);
   const overloaded = codexErrorType === 'serverOverloaded';
+  const rateLimited = codexErrorType === 'rateLimitExceeded';
+  const usageLimited = codexErrorType === 'usageLimitExceeded';
+  const limitExceeded = rateLimited || usageLimited;
   const error = new GatewayError(
-    overloaded ? 503 : 502,
-    overloaded ? 'overloaded_error' : 'api_error',
+    overloaded ? 503 : limitExceeded ? 429 : 502,
+    overloaded ? 'overloaded_error' : limitExceeded ? 'rate_limit_error' : 'api_error',
     turnError?.message || fallbackMessage || 'Codex turn failed'
   );
   return attachCodexErrorMetadata(error, {
@@ -247,7 +250,7 @@ function codexTurnGatewayError(turnError, fallbackMessage) {
     codexErrorType,
     codexAdditionalDetails:
       turnError?.additionalDetails ?? turnError?.additional_details ?? undefined,
-    retryable: overloaded,
+    retryable: overloaded || rateLimited,
   });
 }
 

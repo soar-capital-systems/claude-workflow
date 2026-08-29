@@ -48,6 +48,7 @@ for (const file of [
 
 for (const file of [
   ...filesUnder(path.join(ROOT, 'scripts'), '.sh'),
+  ...filesUnder(path.join(ROOT, '.github', 'scripts'), '.sh'),
   ...filesUnder(path.join(ROOT, 'test'), '.sh'),
   path.join(ROOT, 'cleanup.sh'),
   path.join(ROOT, 'ui', 'start-test.sh'),

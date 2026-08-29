@@ -20,6 +20,9 @@
 
 ### Fixed
 
+- Codex CLI 0.151.0's typed transient rate-limit and non-retryable usage-limit
+  turn errors are returned as Anthropic-shaped 429 responses without replaying
+  a started turn.
 - Concurrent managed-state claims revalidate an ownership marker published
   between the initial lookup and claim, avoiding a stale missing-marker failure.
 - A transient Codex model-catalog failure is retried after a bounded
@@ -39,6 +42,10 @@
   network-dependent package downloads use bounded retries.
 - Permission-sensitive tests set their intended fixture modes explicitly, so a
   restrictive caller umask cannot weaken WSL security coverage.
+- Latest-upstream CI resolves one exact Codex release and uses bounded,
+  verified fresh-cache retries while npm finishes processing its native
+  platform packages. Persistent packaging and compatibility failures still
+  fail the canary without falling back to an older release.
 
 ## 0.2.3 - 2026-08-28
 

@@ -727,11 +727,17 @@ async function testToolBoundaryCompletesWithoutFixedDelay() {
   ];
   const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
   try {
+    const immediateRequest = request('immediate-tool');
+    const immediateBody = body('Run the tool immediately.', tools);
+    const immediateRoute = route();
+    const session = manager.ensureSession(immediateRequest, immediateBody, immediateRoute);
+    await session.ensureThread();
+
     const startedAt = performance.now();
     const first = await manager.processRequest(
-      request('immediate-tool'),
-      body('Run the tool immediately.', tools),
-      route()
+      immediateRequest,
+      immediateBody,
+      immediateRoute
     );
     const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');
@@ -792,11 +798,17 @@ async function testLegacyToolBoundaryCompletesWithoutRawEvents() {
   ];
   const manager = trackManager(new CodexSessionManager(managerConfig(command, tempDir)));
   try {
+    const legacyRequest = request('legacy-tool');
+    const legacyBody = body('Run the legacy tool.', tools);
+    const legacyRoute = route();
+    const session = manager.ensureSession(legacyRequest, legacyBody, legacyRoute);
+    await session.ensureThread();
+
     const startedAt = performance.now();
     const first = await manager.processRequest(
-      request('legacy-tool'),
-      body('Run the legacy tool.', tools),
-      route()
+      legacyRequest,
+      legacyBody,
+      legacyRoute
     );
     const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');
@@ -1152,11 +1164,17 @@ async function testPendingToolRetentionAndHardCapacity() {
   );
 
   try {
+    const pendingRequest = request('pending-session');
+    const pendingBody = body('Run the external tool.', tools);
+    const pendingRoute = route();
+    const session = manager.ensureSession(pendingRequest, pendingBody, pendingRoute);
+    await session.ensureThread();
+
     const startedAt = performance.now();
     const first = await manager.processRequest(
-      request('pending-session'),
-      body('Run the external tool.', tools),
-      route()
+      pendingRequest,
+      pendingBody,
+      pendingRoute
     );
     const elapsedMs = performance.now() - startedAt;
     assert.equal(first.type, 'tool_use');

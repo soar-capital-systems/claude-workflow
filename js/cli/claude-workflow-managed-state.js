@@ -386,9 +386,10 @@ export function claimManagedState(
 
   try {
     return verifyManagedState(stateDirectory);
-  } catch (error) {
+  } catch {
     if (fs.existsSync(ownerPath(stateDirectory))) {
-      throw error;
+      // Another claimant may have published after verifyManagedState observed ENOENT.
+      return verifyManagedState(stateDirectory);
     }
   }
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -197,6 +198,50 @@ test('concurrent custom-state claims publish one complete ownership marker', POS
   assert.deepEqual(
     (await fs.readdir(stateDirectory)).sort(),
     [MANAGED_STATE_OWNER_BASENAME]
+  );
+});
+
+test('a claim revalidates ownership published after its initial missing-marker check', POSIX_ONLY, async function (t) {
+  const root = await temporaryRoot(t, 'claude-workflow-interleaved-claim-');
+  const stateDirectory = path.join(root, 'state');
+  const marker = path.join(stateDirectory, MANAGED_STATE_OWNER_BASENAME);
+  await fs.mkdir(stateDirectory, { mode: 0o700 });
+
+  const originalLstatSync = fsSync.lstatSync;
+  let publishedDuringMissingCheck = false;
+  fsSync.lstatSync = function lstatSyncWithInterleavedPublication(target, ...args) {
+    try {
+      return originalLstatSync.call(fsSync, target, ...args);
+    } catch (error) {
+      if (
+        !publishedDuringMissingCheck &&
+        target === marker &&
+        error?.code === 'ENOENT'
+      ) {
+        fsSync.writeFileSync(
+          marker,
+          'claude-workflow-gateway managed state v1\n',
+          { flag: 'wx', mode: 0o600 }
+        );
+        publishedDuringMissingCheck = true;
+      }
+      throw error;
+    }
+  };
+
+  try {
+    assert.equal(
+      claimManagedState(stateDirectory, { kind: 'custom' }),
+      stateDirectory
+    );
+  } finally {
+    fsSync.lstatSync = originalLstatSync;
+  }
+
+  assert.equal(publishedDuringMissingCheck, true);
+  assert.equal(
+    await fs.readFile(marker, 'utf8'),
+    'claude-workflow-gateway managed state v1\n'
   );
 });
 

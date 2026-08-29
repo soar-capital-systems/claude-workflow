@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- Concurrent managed-state claims revalidate an ownership marker published
+  between the initial lookup and claim, avoiding a stale missing-marker failure.
 - A transient Codex model-catalog failure is retried after a bounded
   negative-cache interval. Successful catalogs remain cached by resolved
   executable identity and effective Codex home.

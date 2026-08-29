@@ -139,6 +139,14 @@ git -C "$source_path" archive --format=tar HEAD | tar -xf - -C "$workspace"
 test -x "$workspace/scripts/claude-workflow-daemon.sh"
 test ! -x "$workspace/package.json"
 
+# Package smoke tests operate on HEAD. Recreate a clean repository around the
+# archived tree without carrying DrvFS object files or checkout modes forward.
+git -C "$workspace" init --quiet
+git -C "$workspace" config user.name 'Claude Workflow WSL Tests'
+git -C "$workspace" config user.email 'tests@invalid.example'
+git -C "$workspace" add --all
+git -C "$workspace" commit --quiet -m 'WSL smoke fixture'
+
 case "$(uname -m)" in
   x86_64)
     node_arch="x64"

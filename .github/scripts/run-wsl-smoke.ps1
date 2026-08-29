@@ -28,6 +28,14 @@ function Invoke-WslBash {
   Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $arguments
 }
 
+function Get-WslVerboseListing {
+  $listing = ((& wsl.exe --list --verbose | Out-String) -replace "`0", '')
+  if ($LASTEXITCODE -ne 0) {
+    throw "wsl.exe --list --verbose exited with status $LASTEXITCODE"
+  }
+  return $listing
+}
+
 Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2')
 $installedText = ((& wsl.exe --list --quiet | Out-String) -replace "`0", '').Trim()
 if ($LASTEXITCODE -ne 0) {
@@ -45,13 +53,14 @@ if ($installedDistros -notcontains $Distro) {
 
 # Starting the distro once completes registration before version inspection.
 Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('-d', $Distro, '-u', 'root', '--', 'true')
-Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $Distro, '2')
-$verboseListing = ((& wsl.exe --list --verbose | Out-String) -replace "`0", '')
-if ($LASTEXITCODE -ne 0) {
-  throw "wsl.exe --list --verbose exited with status $LASTEXITCODE"
-}
 $escapedDistro = [Regex]::Escape($Distro)
-if ($verboseListing -notmatch "(?m)^\s*\*?\s*$escapedDistro\s+\S+\s+2\s*$") {
+$wsl2Pattern = "(?m)^\s*\*?\s*$escapedDistro\s+\S+\s+2\s*$"
+$verboseListing = Get-WslVerboseListing
+if ($verboseListing -notmatch $wsl2Pattern) {
+  Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $Distro, '2')
+  $verboseListing = Get-WslVerboseListing
+}
+if ($verboseListing -notmatch $wsl2Pattern) {
   throw "$Distro was not registered as WSL 2:`n$verboseListing"
 }
 

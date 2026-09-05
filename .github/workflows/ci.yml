@@ -43,8 +43,8 @@ jobs:
     timeout-minutes: 15
     env:
       CLAUDE_WORKFLOW_REQUIRE_INSTALLED_CLIS: '1'
-      CLAUDE_WORKFLOW_EXPECT_CLAUDE_VERSION: '2.1.251'
-      CLAUDE_WORKFLOW_EXPECT_CODEX_VERSION: '0.150.1'
+      CLAUDE_WORKFLOW_EXPECT_CLAUDE_VERSION: '2.1.261'
+      CLAUDE_WORKFLOW_EXPECT_CODEX_VERSION: '0.153.4'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -55,6 +55,6 @@ jobs:
       - name: Install supported upstream CLIs
         run: >-
           npm install --global --no-audit --no-fund
-          @anthropic-ai/claude-code@2.1.251
-          @openai/codex@0.150.1
+          @anthropic-ai/claude-code@2.1.261
+          @openai/codex@0.153.4
       - run: npm run -s test:upstream-compatibility

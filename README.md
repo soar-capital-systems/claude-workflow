@@ -1,7 +1,7 @@
 # Claude Workflow
 
-Claude Workflow runs Claude Code through a per-launch loopback gateway. Opus 5
-handles the main session by default. Delegated agents run on Codex Terra with
+Claude Workflow runs Claude Code through a per-launch loopback gateway. Fable 5.1
+handles the main session by default. Delegated agents run on GPT-6 Astra with
 max reasoning and the Codex long-context profile. The main session can also run
 directly on Codex, Kimi K3, or Alibaba Qwen 3.8 Max.
 
@@ -22,13 +22,14 @@ represented safely across providers.
 
 ## Requirements
 
-- Node.js 20 or newer, with npm
+- Node.js 22 or newer recommended, with npm (the gateway also runs on Node 20)
 - Git
-- [Claude Code](https://code.claude.com/docs/en/setup) 2.1.250 or newer
-- [Codex CLI](https://developers.openai.com/codex/cli) 0.150.1 or newer
+- [Claude Code](https://code.claude.com/docs/en/setup) 2.1.261 or newer
+- [Codex CLI](https://developers.openai.com/codex/cli) 0.153.4 or newer
 - macOS, Linux, or WSL 2
 
-The default Opus/Codex route requires both `claude auth login` and `codex login`.
+The default Fable/Codex route requires both `claude auth login` and `codex login`,
+with access to Fable 5.1 and GPT-6 Astra on the respective accounts.
 A direct Codex main route does not require Anthropic authentication. Kimi and
 Qwen use their own provider keys, but delegated Codex agents still require a
 Codex login.
@@ -38,13 +39,13 @@ installing under WSL.
 
 ## Getting started
 
-Install release `v0.2.4` from the canonical GitHub repository. npm 12 blocks
+Install release `v0.3.0` from the canonical GitHub repository. npm 12 blocks
 Git dependencies by default, so the command grants access only to the package
 named on the command line:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.4
+  git+https://github.com/yshaaban/claude-workflow.git#v0.3.0
 ```
 
 Use a user-owned npm prefix, nvm, Volta, or another Node version manager if a
@@ -90,7 +91,7 @@ is not required:
 
 ```bash
 codex login
-claude-workflow config --main codex --agents terra --effort max --context long
+claude-workflow config --main codex --agents astra --effort max --context long
 claude-workflow setup
 ```
 
@@ -101,19 +102,19 @@ first, then run setup. Delegated Codex agents still require `codex login`.
 
 | Traffic | Claude-facing ID | Upstream | Context |
 | --- | --- | --- | ---: |
-| Main session | `claude-opus-5` | Anthropic Opus 5 | Native 1M |
-| Delegated agents | `codex-terra` | Codex `gpt-5.6-terra`, max reasoning | 828,400 usable |
+| Main session | `claude-fable-5-1` | Anthropic Fable 5.1 | Native 1M |
+| Delegated agents | `codex-astra` | Codex `gpt-6-astra`, max reasoning | 828,400 usable |
 
-Canonical Anthropic model IDs keep their native maximum, so the default Opus 5
+Canonical Anthropic model IDs keep their native maximum, so the default Fable 5.1
 main session remains 1M. Claude's proactive compaction threshold is shared,
-however: with default Terra agents, Opus 5 and Fable 5 compact at 784,800.
+however: with default Astra agents, Fable 5.1 and Opus 5 compact at 784,800.
 Non-Anthropic IDs also share Claude's custom-model maximum. The launcher sets
 that maximum to the smallest truthful window across the custom main route, when
-present, and the delegated Codex route. With default agents, `codex-terra`,
+present, and the delegated Codex route. With default agents, `codex-astra`,
 Kimi, and Qwen get an 828,400-token client maximum and compact at 784,800, even
 when the main provider accepts more.
 
-The concise `codex-terra` ID is intentional. Claude Code receives its display
+The concise `codex-astra` ID is intentional. Claude Code receives its display
 name, description, context limit, and supported capabilities through documented
 custom-model settings. Codex receives the exact upstream model and context
 values from its installed model catalog. Custom Codex models use the same short
@@ -126,10 +127,19 @@ when they use the same ID. The picker and its metadata live in an owner-only
 temporary settings file; they do not modify Claude Code's user or project
 settings and do not require gateway model discovery.
 
+Claude's documented Fable fallback stays on Anthropic: Opus 5 for biology and
+Opus 4.8 for cybersecurity. These fallback targets do not add picker rows or
+become Codex aliases. Conflicting custom routes fail configuration explicitly.
+The launcher forces ordinary subagents to the selected Codex model using
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Claude's native forks and skill subagents
+that explicitly inherit the main model remain exceptions. See
+[Claude's subagent model rules](https://code.claude.com/docs/en/sub-agents#run-every-subagent-on-one-model).
+
 Change the Codex tier, effort, or context profile with the configuration
 command:
 
 ```bash
+claude-workflow config --agents astra --effort max --context long
 claude-workflow config --agents terra --effort max --context long
 claude-workflow config --agents sol --effort max --context long
 claude-workflow config --agents luna --effort high --context standard
@@ -137,11 +147,13 @@ claude-workflow config --agents luna --effort high --context standard
 
 The context profile sets Claude's launch-wide proactive-compaction ceiling.
 Choosing `standard` lowers it to 244,800 tokens even when the main model is
-canonical 1M Opus 5 or Fable 5.
+canonical 1M Fable 5.1 or Opus 5.
 
-Terra is the balanced default. Sol prioritizes capability; Luna prioritizes
-latency and cost. You may also pass a full model ID available to your Codex
-workspace.
+Astra is the default for capability-focused work. `astra` selects `gpt-6-astra`;
+`sol`, `terra`, and `luna` select their GPT-5.6 models. Terra is a balanced
+alternative and Luna prioritizes latency and cost. Changing tiers never invents
+an unavailable model such as `gpt-6-terra`. You may also pass a full model ID
+available to your Codex workspace.
 
 ### Codex context profiles
 
@@ -150,7 +162,7 @@ Claude Workflow reads the selected model's limits from
 window. It refreshes the online catalog only when the selected model is absent
 from the installed binary's catalog.
 
-For the Codex CLI 0.150.1 bundled catalog:
+For GPT-6 Astra in the Codex CLI 0.153.4 bundled catalog:
 
 | Profile | Raw Codex window | Usable window exposed to Claude | Native compaction point |
 | --- | ---: | ---: | ---: |
@@ -163,7 +175,7 @@ If a future Codex release changes the catalog, the gateway follows the installed
 catalog and clamps explicit overrides to the model's advertised maximum.
 
 Literal 1,000,000-token Codex models are supported when the installed catalog
-advertises them. For example, Codex CLI 0.150.1 gives `gpt-5.4` a 1,000,000
+advertises them. For example, Codex CLI 0.153.4 gives `gpt-5.4` a 1,000,000
 raw / 950,000 usable long profile:
 
 ```bash
@@ -179,15 +191,18 @@ claude-workflow config --main codex --agents gpt-5.4 --effort xhigh --context lo
 Because both routes have the same truthful ID, Claude's picker shows one
 `codex-gpt-5.4` row.
 
-This is an explicit compatibility choice, not the default; Terra remains the
-recommended balanced agent route.
+This is an explicit compatibility choice, not a recommendation to replace
+Astra with an older model for its context window alone. The
+[GPT-6 Astra API](https://developers.openai.com/api/docs/models/gpt-6-astra)
+advertises 1,050,000 tokens, but the installed Codex app-server catalog is the
+authority for this integration. A `[1m]` label does not enlarge that window.
 
 ## Choose a main route
 
 ```bash
-claude-workflow config --main opus   # default Opus 5 coordinator
+claude-workflow config --main fable  # default Fable 5.1 coordinator
+claude-workflow config --main opus   # Anthropic Opus 5
 claude-workflow config --main codex  # direct Codex response
-claude-workflow config --main fable  # Anthropic Fable 5
 claude-workflow config --main kimi   # Kimi K3, 1,048,576-token plan
 claude-workflow config --main k3     # Kimi K3, 262,144-token plan
 claude-workflow config --main qwen   # Qwen 3.8 Max, 1M context / 983,616 max input
@@ -196,13 +211,21 @@ claude-workflow config --main qwen   # Qwen 3.8 Max, 1M context / 983,616 max in
 Start a new Claude Code session after changing routes. `claude-workflow config`
 prints the effective model, provider, effort, and Codex context.
 
+Fable 5.1 uses adaptive thinking and does not accept forced tool selection
+(`tool_choice: any` or a named tool). The gateway forwards its requests,
+thinking blocks, tool schemas, and errors without rewriting them. Keep
+Claude Code current and start a new session when changing model families:
+Fable 5.1 binds thinking to the preceding conversation, and older models
+cannot reuse its thinking blocks. See Anthropic's
+[migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide).
+
 ### Direct Codex
 
 Direct mode removes the Anthropic coordinator from the main response path:
 
 ```bash
 codex login
-claude-workflow config --main codex --agents terra --effort max --context long
+claude-workflow config --main codex --agents astra --effort max --context long
 claude-workflow
 ```
 
@@ -218,7 +241,7 @@ orchestration, not response-rewriting overhead.
 Return to the default coordinator with:
 
 ```bash
-claude-workflow config --main opus
+claude-workflow config --main fable
 ```
 
 ### Kimi K3
@@ -331,7 +354,12 @@ without bound, and in-progress turns are never replayed after partial output.
 
 Workflow Codex sessions disable optional Codex agents, memories, MCP servers,
 plugins, skills, web tools, planning tools, permission prompts, clock/sleep
-tools, and native execution environments. Codex 0.150.1 still exposes its
+tools, experimental context management, and native execution environments.
+An owner-only catalog snapshot also removes experimental native tools, including
+async questions and clock, that model metadata enables independently of feature
+flags. Questions and project operations use Claude's supplied tools. The snapshot preserves the rest of the
+installed catalog and lasts only for that app-server process; restart the
+gateway after updating Codex to load fresh metadata. Codex 0.153.4 still exposes its
 built-in `functions.exec` and `functions.wait` code-mode control wrappers; they
 are protocol orchestration primitives, not inherited repository integrations.
 Repository operations use the dynamic tools supplied by Claude Code. The same
@@ -346,7 +374,7 @@ notice with the matching pending call, then gives Codex only a verified
 contiguous prefix of numbered source lines plus an exact next offset. It never
 presents a head-and-tail preview as complete source.
 
-The Codex CLI 0.150.1 bundled catalog declares a 10,000-token function-output policy.
+The Codex CLI 0.153.4 bundled catalog declares a 10,000-token function-output policy.
 The Read guard stays below that history threshold with a page no larger than
 36,000 UTF-8 bytes. Malformed notices, mismatched paths or ranges, and dense
 single-line output fail closed without a coverage claim. Generic tool results
@@ -555,7 +583,7 @@ claude-workflow config
 - **Claude shows an old model or context:** close the session, run
   `claude-workflow config`, and start a new one. Run
   `claude-workflow-gateway reconcile` if you use shared mode.
-- **Codex setup fails:** update to Codex CLI 0.150.1 or newer, run `codex login`,
+- **Codex setup fails:** update to Codex CLI 0.153.4 or newer, run `codex login`,
   then rerun `claude-workflow setup`.
 - **A large review is incomplete:** follow the bounded coverage process in
   `docs/LARGE_FILES_AND_DIFFS.md`; do not infer the contents of a truncated gap.
@@ -582,7 +610,7 @@ streaming, one-call passthrough, large tool results, provider contracts,
 installed Claude clean-home flows, WSL safety, packaging, and self-contained
 GitHub-tag global installation. Live provider calls are excluded from CI.
 
-CI installs Claude Code 2.1.251 and Codex CLI 0.150.1 for the required
+CI installs Claude Code 2.1.261 and Codex CLI 0.153.4 for the required
 installed-client contracts. A separate weekly or manually triggered workflow
 tests current upstream releases and clean installs from the latest matching
 canonical and mirror tags. Its failures report compatibility drift; they do
@@ -591,6 +619,8 @@ not change the minimum supported versions. A Windows 2025 job installs Ubuntu
 filesystem. The hosted Linux matrix is not used as a substitute for WSL.
 
 See [SUPPORT.md](SUPPORT.md) for supported environments and known boundaries.
+See [Upstream compatibility](docs/UPSTREAM_COMPATIBILITY.md) for the model,
+context, and tool-isolation contracts and their upstream sources.
 
 ## Upgrade and uninstall
 
@@ -598,13 +628,34 @@ Reinstall this release, then run the setup checks and upgrade maintenance:
 
 ```bash
 npm install --global --allow-git=root \
-  git+https://github.com/yshaaban/claude-workflow.git#v0.2.4
+  git+https://github.com/yshaaban/claude-workflow.git#v0.3.0
 claude-workflow setup
 ```
 
 Use another tag only to reproduce older behavior; the latest release is the
 supported version. npm registry publication is not required for GitHub
 installation.
+
+Upgrades preserve explicitly saved model IDs and shell overrides. To adopt the
+current defaults, update both CLIs and select the new profile:
+
+```bash
+codex update
+claude update
+claude-workflow config --main fable --agents astra --effort max --context long
+claude-workflow setup
+claude-workflow doctor
+```
+
+Use your package manager to update Codex if it does not support `codex update`.
+Start a new terminal and Claude Workflow session. Shared-mode users can run
+`claude-workflow-gateway reconcile` to replace a running stale gateway.
+
+To retain an older model pair, rerun its preset instead, for example
+`claude-workflow config --main opus --agents terra --effort max --context long`.
+This refreshes the managed native-fallback list without changing that pair.
+Manually maintained route maps must preserve the fallback targets named in any
+configuration error.
 
 Remove Claude Workflow with:
 

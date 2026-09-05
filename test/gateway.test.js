@@ -16,6 +16,7 @@ import { buildCodexDynamicToolRegistry, CodexSessionManager } from '../js/gatewa
 import {
   buildWorkflowClientEnv,
   buildWorkflowGatewayConfig,
+  defaultWorkflowAnthropicPassthroughModels,
 } from '../js/gateway/workflow-config.js';
 import {
   GatewayError,
@@ -93,7 +94,7 @@ async function makeExecutable(filePath, content) {
   await fs.chmod(filePath, 0o755);
 }
 
-async function makeClaudeExecutable(filePath, content, version = '2.1.250') {
+async function makeClaudeExecutable(filePath, content, version = '2.1.261') {
   const firstNewline = content.indexOf('\n');
   assert.notEqual(firstNewline, -1, 'fake Claude executable must start with a shebang');
   const versionProbe = content.startsWith('#!/usr/bin/env node')
@@ -235,7 +236,7 @@ function parseSsePayloads(text) {
 
 const CODEX_REQUEST_MODEL = 'claude-sonnet-4-7';
 const CODEX_UPSTREAM_MODEL = 'gpt-5.6-terra';
-const WORKFLOW_DISPLAY_SUBAGENT_MODEL = 'codex-terra';
+const WORKFLOW_DISPLAY_SUBAGENT_MODEL = 'codex-astra';
 const CLEAN_PROXY_ENV = Object.freeze({
   HTTP_PROXY: '',
   http_proxy: '',
@@ -1153,14 +1154,14 @@ await runTest(
   }
 );
 
-await runTest('workflow defaults use the canonical Opus 5 model id', async function testWorkflowMainAliasStripping() {
+await runTest('workflow defaults use the canonical Fable 5.1 model id', async function testWorkflowMainAliasStripping() {
   await withTemporaryEnv(CLEAN_WORKFLOW_ENV, async function assertWorkflowMainAlias() {
     const { config, mainModelId } = buildWorkflowGatewayConfig();
     const route = resolveModelRoute(mainModelId, config);
-    assert.equal(mainModelId, 'claude-opus-5');
+    assert.equal(mainModelId, 'claude-fable-5-1');
     assert.equal(route.provider, 'anthropic');
-    assert.equal(route.upstreamModel, 'claude-opus-5');
-    ok('workflow defaults preserve the native 1M Opus 5 API model id');
+    assert.equal(route.upstreamModel, 'claude-fable-5-1');
+    ok('workflow defaults preserve the native 1M Fable 5.1 API model id');
   });
 });
 
@@ -1336,7 +1337,7 @@ await runTest(
           workflow.mainModelId
         );
 
-        assert.equal(workflow.mainModelId, 'codex-terra');
+        assert.equal(workflow.mainModelId, 'codex-astra');
         assert.equal(workflow.config.routeMap[workflow.mainModelId].provider, 'codex');
         assert.equal(workflow.config.routeMap[workflow.mainModelId].verbosity, 'high');
         assert.equal(
@@ -6159,6 +6160,7 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
   const child = spawn(process.execPath, [daemonPath], {
     env: {
       ...process.env,
+      ...CLEAN_WORKFLOW_ENV,
       ULTRATHINK_GATEWAY_DAEMON_PORT: String(port),
       CLAUDE_WORKFLOW_GATEWAY_STATE_DIR: tempDir,
       CLAUDE_WORKFLOW_GATEWAY_ENV_FILE: envFile,
@@ -6186,6 +6188,7 @@ await runTest('claude-workflow-gateway daemon publishes env exports and serves h
     const baseUrlMatch = envText.match(/^export ANTHROPIC_BASE_URL='([^']+)'$/mu);
     assert.notEqual(baseUrlMatch, null);
     assert.match(envText, /^export CLAUDE_CODE_SUBAGENT_MODEL='[^']+'$/mu);
+    assert.match(envText, /^export CLAUDE_CODE_SUBAGENT_MODEL_FORCE='1'$/mu);
     assert.match(envText, /^export ANTHROPIC_DEFAULT_SONNET_MODEL='[^']+'$/mu);
     assert.equal((await fs.stat(envFile)).mode & 0o777, 0o600);
 
@@ -7379,7 +7382,7 @@ await runTest(
         ULTRATHINK_GATEWAY_CODEX_COMMAND: loggedInCodexPath,
       });
       assert.equal(outdatedClaude.code, 1);
-      assert.match(outdatedClaude.stderr, /requires Claude Code 2\.1\.250 or newer/u);
+      assert.match(outdatedClaude.stderr, /requires Claude Code 2\.1\.261 or newer/u);
 
       await makeClaudeShouldNotRunCommand(claudePath);
 
@@ -7550,7 +7553,8 @@ await runTest(
           ULTRATHINK_GATEWAY_CODEX_COMMAND: codexPath,
           ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-5[1m]',
           ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'anthropic',
-          ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-opus-5*',
+          ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS:
+            defaultWorkflowAnthropicPassthroughModels('claude-opus-5').join(','),
           ULTRATHINK_GATEWAY_ANTHROPIC_API_KEY: 'anthropic-key',
           ULTRATHINK_GATEWAY_ANTHROPIC_BASE_URL: `http://127.0.0.1:${anthropicPort}`,
           ULTRATHINK_TEST_CLAUDE_RESPONSE_PATH: responsePath,
@@ -7674,7 +7678,8 @@ await runTest(
       });
       const frontierHealth = await runWithDisplayEnv('frontier-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-fable-5',
-        ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-fable-5*',
+        ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS:
+          defaultWorkflowAnthropicPassthroughModels('claude-fable-5').join(','),
         ULTRATHINK_GATEWAY_CODEX_MODEL: 'gpt-5.6-sol',
         ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT: 'xhigh',
         ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: 'gpt-5.6-sol',
@@ -7709,32 +7714,35 @@ await runTest(
       assert.equal(defaultHealth.health.display_routed_model, false);
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
       assert.equal(defaultHealth.autoCompactWindow, '784800');
-      // The launcher defaults the main model to native-1M Opus 5 and keeps
-      // the Opus 5 family on Anthropic; lower-tier Claude ids route to Codex Terra.
+      // Native Fable fallback retains its exact Anthropic Opus targets;
+      // regular workflow agents stay on the configured Codex Astra route.
       assert.deepEqual(
         defaultHealth.health.anthropic_passthrough_models,
-        ['claude-opus-5*']
+        ['claude-fable-5-1*', 'claude-opus-5', 'claude-opus-5[1m]', 'claude-opus-4-8', 'claude-opus-4-8[1m]']
       );
       assert.equal(
-        defaultHealth.health.exposed_models.includes('claude-opus-5'),
+        defaultHealth.health.exposed_models.includes('claude-fable-5-1'),
         true
       );
-      assert.equal(defaultHealth.health.codex_target_model, 'gpt-5.6-terra');
+      assert.equal(defaultHealth.health.codex_target_model, 'gpt-6-astra');
       assert.equal(defaultHealth.health.codex_reasoning_effort, 'max');
       assert.match(
         modelDisplayName(defaultHealth, 'claude-sonnet-4-7') || '',
-        /Codex gpt-5\.6-terra/u
+        /Codex gpt-6-astra/u
       );
       assert.equal(optedInHealth.health.display_routed_model, true);
-      assert.equal(optedInHealth.subagentModel, 'codex-terra');
+      assert.equal(optedInHealth.subagentModel, 'codex-astra');
       assert.equal(workflowOptOutHealth.health.display_routed_model, false);
-      assert.equal(workflowOptOutHealth.subagentModel, 'codex-terra');
+      assert.equal(workflowOptOutHealth.subagentModel, 'codex-astra');
       assert.equal(customRouteHealth.subagentModel, 'codex-gpt-custom');
       assert.equal(
         customRouteHealth.health.exposed_models.includes(customRouteHealth.subagentModel),
         true
       );
-      assert.deepEqual(frontierHealth.health.anthropic_passthrough_models, ['claude-fable-5*']);
+      assert.deepEqual(
+        frontierHealth.health.anthropic_passthrough_models,
+        defaultWorkflowAnthropicPassthroughModels('claude-fable-5')
+      );
       assert.equal(frontierHealth.health.codex_target_model, 'gpt-5.6-sol');
       assert.equal(frontierHealth.health.codex_reasoning_effort, 'xhigh');
       assert.equal(

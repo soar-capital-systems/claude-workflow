@@ -70,6 +70,28 @@ async function withEnvironment(values, callback) {
   }
 }
 
+test('Codex Astra fallback exposes the app-server window, not the API marketing window', () => {
+  for (const [profile, raw, usable, compact] of [
+    ['standard', 272_000, 258_400, 244_800],
+    ['long', 872_000, 828_400, 784_800],
+  ]) {
+    const capability = resolveCodexCapabilities({
+      command: '/definitely/missing/codex',
+      model: 'gpt-6-astra',
+      contextProfile: profile,
+      reasoningEffort: 'ultra',
+      env: {},
+    });
+    assert.equal(capability.source, 'known-model');
+    assert.equal(capability.resolvedRawContextTokens, raw);
+    assert.equal(capability.usableContextTokens, usable);
+    assert.equal(capability.autoCompactTokens, compact);
+    assert.equal(capability.effortSupported, true);
+    assert.deepEqual(capability.reasoningEfforts, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    assert.deepEqual(capability.toolOutputTruncationPolicy, { mode: 'tokens', limit: 10_000 });
+  }
+});
+
 test('Codex 5.6 long context resolves to the current app-server maximum', () => {
   const capability = resolveCodexCapabilities({
     command: '/definitely/missing/codex',
@@ -90,6 +112,20 @@ test('Codex 5.6 long context resolves to the current app-server maximum', () => 
     limit: 10_000,
   });
   assert.equal(capability.effortSupported, true);
+});
+
+test('Astra raw context requests are capped at the Codex maximum', () => {
+  const capability = resolveCodexCapabilities({
+    command: '/definitely/missing/codex',
+    model: 'gpt-6-astra',
+    requestedContextWindow: 1_050_000,
+    reasoningEffort: 'max',
+    env: {},
+  });
+
+  assert.equal(capability.requestedRawContextTokens, 1_050_000);
+  assert.equal(capability.resolvedRawContextTokens, 872_000);
+  assert.equal(capability.usableContextTokens, 828_400);
 });
 
 test('gpt-5.4 literal 1M fallback remains deterministic without a catalog', () => {
@@ -429,18 +465,21 @@ test('workflow long context gives Claude the truthful Codex usable and compact w
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
       assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
       assert.equal(clientEnv.CLAUDE_CODE_EFFORT_LEVEL, 'max');
-      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-terra');
-      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Codex Terra');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-astra');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, 'Codex Astra');
       assert.equal(
         clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
         'effort,xhigh_effort,max_effort'
       );
+      assert.equal(clientEnv.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME, null);
+      assert.equal(clientEnv.ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION, null);
+      assert.equal(clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-opus-5');
       assert.equal(clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, null);
-      assert.equal(clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION, null);
-      assert.equal(clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, 'Codex Terra');
+      assert.equal(clientEnv.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '1');
+      assert.equal(clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME, 'Codex Astra');
       assert.equal(
         clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION,
-        'codex:gpt-5.6-terra/max through claude-workflow'
+        'codex:gpt-6-astra/max through claude-workflow'
       );
       assert.equal(
         clientEnv.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES,
@@ -455,14 +494,14 @@ test('workflow long context gives Claude the truthful Codex usable and compact w
         {
           options: [
             {
-              model: 'claude-opus-5',
-              label: 'Opus 5',
-              description: 'Anthropic claude-opus-5',
+              model: 'claude-fable-5-1',
+              label: 'Fable 5.1',
+              description: 'Anthropic claude-fable-5-1',
             },
             {
-              model: 'codex-terra',
-              label: 'Codex Terra',
-              description: 'codex:gpt-5.6-terra/max through Claude Workflow',
+              model: 'codex-astra',
+              label: 'Codex Astra',
+              description: 'codex:gpt-6-astra/max through Claude Workflow',
             },
           ],
           replaceBuiltInOptions: true,
@@ -636,6 +675,7 @@ test('workflow resolves raw subagent and Anthropic main wildcards before default
   await withEnvironment(
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-5',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
         'claude-sonnet-*': {
           provider: 'codex',
@@ -666,6 +706,7 @@ test('workflow evaluates deceptive main wildcards and rejects their Claude ident
   await withEnvironment(
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
+      ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-opus-5',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
         'claude-opus-5*': {
           provider: 'codex',
@@ -688,17 +729,17 @@ test('workflow returns a fully resolved effective subagent route for partial ove
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-        'codex-terra': { provider: 'codex' },
+        'codex-astra': { provider: 'codex' },
       }),
     },
     () => {
       const workflow = buildWorkflowGatewayConfig();
       assert.equal(workflow.subagentRoute.provider, 'codex');
-      assert.equal(workflow.subagentRoute.upstreamModel, 'gpt-5.6-terra');
+      assert.equal(workflow.subagentRoute.upstreamModel, 'gpt-6-astra');
       assert.equal(workflow.subagentRoute.reasoningEffort, 'max');
       assert.equal(
         routeTargetSummary(workflow.subagentRoute),
-        'codex:gpt-5.6-terra/max'
+        'codex:gpt-6-astra/max'
       );
     }
   );
@@ -709,7 +750,7 @@ test('workflow derives its automatic Claude-facing ID after exact route override
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-        'codex-terra': {
+        'codex-astra': {
           provider: 'codex',
           model: 'gpt-5.4',
           reasoningEffort: 'xhigh',
@@ -755,7 +796,7 @@ test('workflow rejects a conflicting alias for an automatically derived model ID
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-        'codex-terra': {
+        'codex-astra': {
           provider: 'codex',
           model: 'gpt-5.4',
           reasoningEffort: 'xhigh',
@@ -781,7 +822,7 @@ test('workflow re-derives an automatic ID when an override changes providers', a
     {
       ULTRATHINK_GATEWAY_CODEX_COMMAND: '/definitely/missing/codex',
       ULTRATHINK_GATEWAY_ROUTE_MAP_JSON: JSON.stringify({
-        'codex-terra': {
+        'codex-astra': {
           provider: 'anthropic',
           model: 'claude-sonnet-5',
         },

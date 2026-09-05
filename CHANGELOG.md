@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.0 - 2026-09-05
+
+### Changed
+
+- New installations use Anthropic Fable 5.1 for the main session and GPT-6
+  Astra with max reasoning for Codex agents. Existing explicit model pins stay
+  intact. Select `--main fable --agents astra --effort max --context long` to
+  migrate. Opus 5 and the GPT-5.6 Sol, Terra, and Luna aliases remain available.
+- Required upstream versions are Claude Code 2.1.261 and Codex CLI 0.153.4.
+  Node 22+ is recommended for npm-based Claude installations; the gateway still
+  supports Node 20 with a native Claude installation.
+- Astra appears as `codex-astra` / “Codex Astra.” Its context follows the
+  installed Codex catalog: 872,000 raw and 828,400 usable tokens in the default
+  long profile, with compaction at 784,800. The API's larger advertised context
+  is not substituted for the app-server's limit.
+
+### Fixed
+
+- Isolated Codex sessions suppress experimental native tools enabled through
+  model metadata, including Astra's async questions and clock. A private
+  per-process catalog snapshot preserves all other model fields. This keeps
+  user questions on Claude's tool channel instead of silently hiding them.
+- Inherited experimental Codex context management cannot re-enable native
+  conversation-management tools inside a workflow thread.
+- Closing an app-server connection settles active text, stream, and pending
+  tool-continuation requests instead of leaving response consumers waiting.
+- Anthropic token-count responses preserve request IDs and retry/rate-limit
+  headers, matching the Messages passthrough.
+- Native Fable fallback targets stay on Anthropic instead of being disabled
+  by a Codex Opus alias or rerouted to Codex. Ordinary agents use Claude's
+  documented subagent-model force setting; conflicting fallback routes fail
+  configuration with an explicit diagnostic.
+- Updated the transitive `qs` dependency to 6.16.0 to address its published
+  parsing and denial-of-service advisories.
+
+### Added
+
+- Real installed-client tests for Astra's tool isolation and Fable 5.1's native
+  adaptive-thinking/tool replay, plus HTTP contracts for untouched thinking
+  prefixes, progress events, forced-tool errors, and one-call passthrough.
+- Catalog snapshot lifecycle, permission, failure, cancellation, and restart
+  coverage. Supported-version CI and latest-upstream canaries run the new tests.
+
 ## 0.2.4 - 2026-08-29
 
 ### Added

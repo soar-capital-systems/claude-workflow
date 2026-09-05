@@ -32,6 +32,14 @@ const CREDENTIAL_LIKE_HEADER_PATTERN =
 const SAFE_ANTHROPIC_IDENTITY_HEADERS = new Set([
   'user-agent',
   'x-app',
+  // Native Claude fallback provenance accompanies the retried request. Keep
+  // these exact fields without admitting arbitrary x-cc-* headers.
+  'x-is-refusal-fallback',
+  'x-cc-fallback-latched-by',
+  'x-cc-fallback-from-model',
+  'x-cc-fallback-category',
+  'x-cc-fallback-trigger',
+  'x-cc-original-request-id',
 ]);
 const BLOCKED_FORWARD_HEADERS = new Set([
   'authorization',
@@ -1781,6 +1789,7 @@ async function handleCountTokens(req, res, config, signal) {
         signal
       );
       const body = await safeJson(upstream);
+      copyUpstreamResponseHeaders(upstream, res);
       res.status(upstream.status).json(body);
       return;
     }

@@ -34,9 +34,10 @@ import {
 } from '../utils/claude-config.js';
 import {
   buildWorkflowGatewayConfig,
-  DEFAULT_MAIN_MODEL_ID,
+  defaultWorkflowAnthropicPassthroughModels,
   DEFAULT_SUBAGENT_REASONING_EFFORT,
   FABLE_MAIN_MODEL_ID,
+  OPUS_MAIN_MODEL_ID,
   KIMI_MAIN_MODEL_ID,
   QWEN_MAIN_MODEL_ID,
   routeProvider,
@@ -46,8 +47,8 @@ import {
 const COMMAND_TIMEOUT_MS = 10_000;
 const CONFIG_LOCK_TIMEOUT_MS = 5_000;
 const CONFIG_LOCK_POLL_MS = 25;
-const MINIMUM_CLAUDE_VERSION = Object.freeze([2, 1, 250]);
-const MINIMUM_CODEX_VERSION = Object.freeze([0, 150, 1]);
+const MINIMUM_CLAUDE_VERSION = Object.freeze([2, 1, 261]);
+const MINIMUM_CODEX_VERSION = Object.freeze([0, 153, 4]);
 const CONFIG_FILE_NAME = '.claude-workflow.env';
 const SAFE_CONFIG_VALUE = /^[A-Za-z0-9._:/[\]-]+$/u;
 const REASONING_EFFORTS = new Set([
@@ -59,11 +60,18 @@ const REASONING_EFFORTS = new Set([
   'max',
   'ultra',
 ]);
-const AGENT_TIERS = new Set(['sol', 'terra', 'luna']);
+// Codex tiers do not all advance to the same model generation. Resolve aliases
+// explicitly so switching from Astra to Terra never invents gpt-6-terra.
+const AGENT_MODEL_ALIASES = Object.freeze({
+  astra: 'gpt-6-astra',
+  sol: 'gpt-5.6-sol',
+  terra: 'gpt-5.6-terra',
+  luna: 'gpt-5.6-luna',
+});
 const PERMISSION_MODES = new Set(['bypass', 'prompt']);
 const CONTEXT_PROFILES = new Set(['standard', 'long']);
 const MAIN_PRESETS = Object.freeze({
-  opus: Object.freeze({ model: DEFAULT_MAIN_MODEL_ID, provider: 'anthropic' }),
+  opus: Object.freeze({ model: OPUS_MAIN_MODEL_ID, provider: 'anthropic' }),
   fable: Object.freeze({ model: FABLE_MAIN_MODEL_ID, provider: 'anthropic' }),
   codex: Object.freeze({ model: 'codex', provider: 'codex' }),
   kimi: Object.freeze({ model: KIMI_MAIN_MODEL_ID, provider: 'kimi' }),
@@ -354,7 +362,7 @@ export function checkClaudeVersion(run = commandResult, env = process.env) {
       ok: false,
       label: `Claude Code ${version}`,
       detail:
-        'Claude Workflow requires Claude Code 2.1.250 or newer. Update Claude Code and try again.',
+        'Claude Workflow requires Claude Code 2.1.261 or newer. Update Claude Code and try again.',
     };
   }
 
@@ -466,7 +474,7 @@ function codexCheck(commandName, run = commandResult, env = process.env) {
     return {
       ok: false,
       label: `Codex CLI ${version}`,
-      detail: 'Claude Workflow requires Codex CLI 0.150.1 or newer. Update Codex and try again.',
+      detail: 'Claude Workflow requires Codex CLI 0.153.4 or newer. Update Codex and try again.',
     };
   }
   const authResult = run(commandName, ['login', 'status'], { env });
@@ -486,6 +494,9 @@ function codexCheck(commandName, run = commandResult, env = process.env) {
 }
 
 function friendlyMainName(modelId) {
+  if (/^claude-fable-5-1(?:-|\[|$)/u.test(modelId)) {
+    return 'Fable 5.1';
+  }
   if (/^claude-opus-5(?:\[|$)/u.test(modelId)) {
     return 'Opus 5';
   }
@@ -537,7 +548,7 @@ function kimiConfigurationGuidance(issue) {
 }
 
 function friendlyAgentName(modelId) {
-  const tier = String(modelId || '').match(/-(sol|terra|luna)$/u)?.[1];
+  const tier = String(modelId || '').match(/-(astra|sol|terra|luna)$/u)?.[1];
   return tier ? `${tier[0].toUpperCase()}${tier.slice(1)}` : modelId;
 }
 
@@ -684,7 +695,9 @@ function assertSafeConfigurationValues(updates) {
         ? true
       : key === 'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS'
         ? value === 'none' ||
-          (value.endsWith('*') && SAFE_CONFIG_VALUE.test(value.slice(0, -1)))
+          value.split(',').every((pattern) =>
+            SAFE_CONFIG_VALUE.test(pattern.endsWith('*') ? pattern.slice(0, -1) : pattern)
+          )
         : SAFE_CONFIG_VALUE.test(value);
     if (!safeValue) {
       throw new Error(`invalid value for ${key}`);
@@ -906,28 +919,21 @@ function normalizeModel(value, label) {
   return normalized;
 }
 
-function agentModel(value, currentModel) {
+function agentModel(value) {
   const trimmed = String(value || '').trim();
   const normalized = trimmed.toLowerCase();
-  if (!AGENT_TIERS.has(normalized)) {
-    return normalizeModel(trimmed, '--agents');
-  }
-
-  const family = String(currentModel || '').match(/^(gpt-\d+(?:\.\d+)*-)(?:sol|terra|luna)$/u)?.[1]
-    || DEFAULT_CODEX_MODEL.match(/^(gpt-\d+(?:\.\d+)*-)/u)?.[1];
-  if (!family) {
-    throw new Error('could not determine the current Codex model family; pass a full model id');
-  }
-  return `${family}${normalized}`;
+  return Object.hasOwn(AGENT_MODEL_ALIASES, normalized)
+    ? AGENT_MODEL_ALIASES[normalized]
+    : normalizeModel(trimmed, '--agents');
 }
 
 function configUsage() {
   return [
     'Usage:',
     '  claude-workflow config',
-    '  claude-workflow config --agents terra --effort max --context long',
-    '  claude-workflow config --main opus --permissions bypass',
-    '  claude-workflow config --main fable',
+    '  claude-workflow config --agents astra --effort max --context long',
+    '  claude-workflow config --main fable --permissions bypass',
+    '  claude-workflow config --main opus',
     '  claude-workflow config --main codex',
     '  claude-workflow config --main kimi',
     '  claude-workflow config --main qwen',
@@ -935,7 +941,7 @@ function configUsage() {
     '',
     'Options:',
     '  --main <opus|fable|codex|kimi|k3|qwen|anthropic-model-id>  Main route; kimi/qwen use coding-plan profiles',
-    '  --agents <sol|terra|luna|id>  Shared Codex model for agents and direct main',
+    '  --agents <astra|sol|terra|luna|id>  Shared Codex model for agents and direct main',
     '  --effort <level>              Codex effort, validated against the selected model catalog',
     '  --context <standard|long>     Codex context profile; also sets the launch-wide shared compaction ceiling',
     '  --permissions <mode>          bypass or prompt',
@@ -1010,10 +1016,13 @@ export function runConfigCommand(args, options = {}) {
     }
   } else {
     const provisionalAgentModel = parsed.agents
-      ? agentModel(
-          parsed.agents,
-          process.env.ULTRATHINK_GATEWAY_CODEX_MODEL || DEFAULT_CODEX_MODEL
-        )
+      ? agentModel(parsed.agents)
+      : null;
+    const selectedMainModel = parsed.main
+      ? selectedMainPreset?.model || normalizeModel(parsed.main, '--main')
+      : null;
+    const selectedMainProvider = parsed.main
+      ? selectedMainPreset?.provider || 'anthropic'
       : null;
     // A config mutation must be able to repair stale legacy identities and an
     // effort/model pair that the proposed values replace. Build the preview
@@ -1052,8 +1061,40 @@ export function runConfigCommand(args, options = {}) {
           parsed.effort.toLowerCase();
       }
     }
+    if (selectedMainModel) {
+      // Preview the proposed main route as well as the agent route. Otherwise
+      // upgrading an old Fable-only passthrough configuration fails validation
+      // before this command can restore its required native fallback targets.
+      // Kimi/Qwen presets must be configurable before their keys are stored.
+      // Their post-save guidance diagnoses provider setup; this preview only
+      // needs the proposed Codex agent profile, not an authenticated main route.
+      const previewMainProvider = selectsKimiMain || selectsQwenMain
+        ? 'codex'
+        : selectedMainProvider;
+      const previewMainModel = selectsKimiMain || selectsQwenMain
+        ? 'codex'
+        : selectedMainModel;
+      mutationPreviewEnv.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = previewMainModel;
+      mutationPreviewEnv.ULTRATHINK_GATEWAY_MAIN_PROVIDER = previewMainProvider;
+      mutationPreviewEnv.ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL =
+        previewMainProvider === 'codex'
+          ? provisionalAgentModel ||
+            mutationPreviewEnv.ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL ||
+            mutationPreviewEnv.ULTRATHINK_GATEWAY_CODEX_MODEL || DEFAULT_CODEX_MODEL
+          : modelIdWithoutBracketQualifiers(previewMainModel);
+      mutationPreviewEnv.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS =
+        previewMainProvider === 'anthropic'
+          ? defaultWorkflowAnthropicPassthroughModels(previewMainModel).join(',')
+          : 'none';
+      mutationPreviewEnv.ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT =
+        previewMainProvider === 'codex'
+          ? parsed.effort?.toLowerCase() ||
+            mutationPreviewEnv.ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT ||
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+          : '';
+    }
     const current =
-      parsed.agents || parsed.effort || selectsCodexMain
+      parsed.agents || parsed.effort || selectsCodexMain || selectedMainProvider === 'anthropic'
         ? effectiveConfigurationSummary(mutationPreviewEnv)
         : null;
     const requestedMainProvider = parsed.main
@@ -1062,10 +1103,6 @@ export function runConfigCommand(args, options = {}) {
     const directCodexMainActive = requestedMainProvider === 'codex';
     const selectedAgentModel = provisionalAgentModel;
     if (parsed.main) {
-      const selectedMainModel = selectedMainPreset
-        ? selectedMainPreset.model
-        : normalizeModel(parsed.main, '--main');
-      const selectedMainProvider = selectedMainPreset?.provider || 'anthropic';
       updates.ULTRATHINK_GATEWAY_MAIN_MODEL_ID = selectedMainModel;
       updates.ULTRATHINK_GATEWAY_MAIN_PROVIDER = selectedMainProvider;
       updates.ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL =
@@ -1074,7 +1111,7 @@ export function runConfigCommand(args, options = {}) {
           : modelIdWithoutBracketQualifiers(selectedMainModel);
       updates.ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS =
         selectedMainProvider === 'anthropic'
-          ? `${modelIdWithoutBracketQualifiers(selectedMainModel)}*`
+          ? defaultWorkflowAnthropicPassthroughModels(selectedMainModel).join(',')
           : 'none';
       removals.add('CLAUDE_WORKFLOW_MAIN_PROVIDER');
       // Main presets own the passthrough family. Writing it explicitly shadows

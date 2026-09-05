@@ -10,6 +10,7 @@ const REQUEST_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 const GATEWAY_SECRET = 'gateway-test-secret';
 const UPSTREAM_SECRET = 'upstream-test-secret';
 const TEST_MODEL = 'claude-contract-test';
+const FABLE_MODEL = 'claude-fable-5-1';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -179,6 +180,14 @@ test('Anthropic proxy forwards evolving identity headers without forwarding gate
       'user-agent': 'claude-contract-test/1.0',
       'x-api-key': GATEWAY_SECRET,
       'x-app': 'cli',
+      'x-is-refusal-fallback': 'true',
+      'x-cc-fallback-from-model': 'claude-fable-5-1',
+      'x-cc-fallback-category': 'cyber',
+      'x-cc-fallback-trigger': 'classifier',
+      'x-cc-fallback-latched-by': 'claude-code',
+      'x-cc-original-request-id': 'req_original',
+      'x-cc-api-key': 'must-not-leak',
+      'x-cc-future-unreviewed': 'must-not-forward',
       'x-claude-code-api-key': 'must-not-leak',
       'x-claude-code-agent-id': 'agent-123',
       'x-claude-code-auth': 'must-not-leak',
@@ -210,6 +219,14 @@ test('Anthropic proxy forwards evolving identity headers without forwarding gate
   assert.equal(captured.headers['x-stainless-retry-count'], '7');
   assert.equal(captured.headers['user-agent'], 'claude-contract-test/1.0');
   assert.equal(captured.headers['x-app'], 'cli');
+  assert.equal(captured.headers['x-is-refusal-fallback'], 'true');
+  assert.equal(captured.headers['x-cc-fallback-from-model'], 'claude-fable-5-1');
+  assert.equal(captured.headers['x-cc-fallback-category'], 'cyber');
+  assert.equal(captured.headers['x-cc-fallback-trigger'], 'classifier');
+  assert.equal(captured.headers['x-cc-fallback-latched-by'], 'claude-code');
+  assert.equal(captured.headers['x-cc-original-request-id'], 'req_original');
+  assert.equal(captured.headers['x-cc-api-key'], undefined);
+  assert.equal(captured.headers['x-cc-future-unreviewed'], undefined);
   assert.equal(captured.headers.authorization, undefined);
   assert.equal(captured.headers['x-api-key'], UPSTREAM_SECRET);
   assert.equal(captured.headers['anthropic-api-key'], undefined);
@@ -221,6 +238,181 @@ test('Anthropic proxy forwards evolving identity headers without forwarding gate
   assert.equal(captured.headers['x-stainless-api-key'], undefined);
   assert.notEqual(captured.headers.connection, 'close');
   assert.equal(captured.headers['content-type'], 'application/json');
+});
+
+test('Fable 5.1 preserves prefix-bound history and per-turn fields through messages and token counting', async function (t) {
+  const captured = [];
+  const reply = {
+    ...anthropicMessage(FABLE_MODEL),
+    input_transformations: [{ type: 'thinking_blocks_dropped', count: 1 }],
+  };
+  const upstream = http.createServer(async function capture(request, response) {
+    const body = JSON.parse((await readBody(request)).toString('utf8'));
+    captured.push({ body, headers: request.headers, url: request.url });
+    response.writeHead(200, {
+      'content-type': 'application/json',
+      'request-id': `req_fable_${captured.length}`,
+    });
+    response.end(JSON.stringify(request.url.includes('count_tokens') ? { input_tokens: 432 } : reply));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => closeServer(upstream));
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    exposedModels: [FABLE_MODEL],
+    anthropicPassthroughModels: [`${FABLE_MODEL}*`],
+  });
+  t.after(() => gateway.runtime.close());
+
+  // Fable 5.1 signatures bind the full earlier prefix, including system and
+  // tools. The gateway must not strip, rebuild, summarize, or repair it.
+  const prefix = {
+    system: [{ type: 'text', text: 'Keep this system prefix.', cache_control: { type: 'ephemeral' } }],
+    tools: [{
+      name: 'Read',
+      description: 'Read a file',
+      strict: true,
+      input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+      cache_control: { type: 'ephemeral' },
+    }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Read the file.' }] },
+      { role: 'assistant', content: [
+        { type: 'thinking', thinking: '', signature: 'opaque-prefix-bound-signature' },
+        { type: 'redacted_thinking', data: 'opaque-redacted-block' },
+        { type: 'tool_use', id: 'toolu_fable', name: 'Read', input: { path: 'file.txt' } },
+      ] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fable', content: 'file contents' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'The file is loaded.' }] },
+      { role: 'system', content: [], output_config: { effort: 'low' } },
+      { role: 'user', content: [{ type: 'text', text: 'Summarize it.' }] },
+      { role: 'system', clear_at: 'next_user_message', content: 'Keep this summary concise.' },
+    ],
+  };
+  const body = {
+    model: `${FABLE_MODEL}[1m]`,
+    ...prefix,
+    thinking: { type: 'adaptive', display: 'updates', block_binding: { prefix_mismatch_behavior: 'drop_block' } },
+    tool_choice: { type: 'auto' },
+    output_config: { effort: 'xhigh' },
+  };
+  const beta = 'thinking-display-updates-2026-08-18,thinking-binding-controls-2026-08-01,mid-conversation-output-config-2026-07-01,mid-conversation-system-clear-at-2026-08-21';
+  const requests = [
+    { path: '/v1/messages?beta=true', body: { ...body, max_tokens: 128_000, stream: false }, reply },
+    { path: '/v1/messages/count_tokens?beta=true', body, reply: { input_tokens: 432 } },
+  ];
+  for (const [index, entry] of requests.entries()) {
+    const response = await rawPost(
+      `${gateway.url}${entry.path}`,
+      gatewayHeaders({ 'anthropic-beta': beta }),
+      JSON.stringify(entry.body)
+    );
+    assert.equal(response.status, 200, response.body);
+    assert.deepEqual(JSON.parse(response.body), entry.reply);
+    assert.equal(response.headers['request-id'], `req_fable_${index + 1}`);
+    assert.deepEqual(captured[index].body, { ...entry.body, model: FABLE_MODEL });
+    assert.equal(captured[index].headers['anthropic-beta'], beta);
+    assert.equal(captured[index].url, entry.path);
+  }
+  assert.equal(captured.length, requests.length, 'one upstream call per client request, with no inference to rewrite history or results');
+});
+
+test('Fable 5.1 streams progress, opaque signatures, and tool calls without rewriting SSE', async function (t) {
+  let requests = 0;
+  const events = [
+    ['message_start', { type: 'message_start', message: { ...anthropicMessage(FABLE_MODEL), content: [], stop_reason: null } }],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Reading λ.txt.' } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'opaque-prefix-bound-signature' } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+    ['content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_fable', name: 'Read', input: {} } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"λ.txt"}' } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 12 } }],
+    ['message_stop', { type: 'message_stop' }],
+  ];
+  const stream = events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+  const upstream = http.createServer(async function respond(request, response) {
+    await readBody(request);
+    requests += 1;
+    response.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_fable_stream' });
+    const bytes = Buffer.from(stream);
+    const split = bytes.indexOf(Buffer.from('λ')) + 1;
+    response.write(bytes.subarray(0, split));
+    setImmediate(() => response.end(bytes.subarray(split)));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => closeServer(upstream));
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    exposedModels: [FABLE_MODEL],
+    anthropicPassthroughModels: [FABLE_MODEL],
+  });
+  t.after(() => gateway.runtime.close());
+  const response = await rawPost(`${gateway.url}/v1/messages`, gatewayHeaders(), JSON.stringify({
+    model: FABLE_MODEL,
+    messages: [{ role: 'user', content: 'Read λ.txt.' }],
+    thinking: { type: 'adaptive', display: 'updates' },
+    stream: true,
+    max_tokens: 128_000,
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(response.body, stream);
+  assert.equal(response.headers['request-id'], 'req_fable_stream');
+  assert.equal(requests, 1);
+});
+
+test('Fable 5.1 forced-tool errors and refusals stay upstream decisions without retry or fallback', async function (t) {
+  const captured = [];
+  const errorBody = { type: 'error', error: { type: 'invalid_request_error', message: 'Forced tool use is not supported by this model.' } };
+  const refusalBody = {
+    ...anthropicMessage(FABLE_MODEL),
+    content: [{ type: 'text', text: 'I cannot help with this request.' }],
+    stop_reason: 'refusal',
+    stop_details: { type: 'refusal', category: 'general_harms', explanation: 'Synthetic refusal.' },
+  };
+  const upstream = http.createServer(async function respond(request, response) {
+    const body = JSON.parse((await readBody(request)).toString('utf8'));
+    captured.push(body);
+    const forced = ['any', 'tool'].includes(body.tool_choice?.type);
+    response.writeHead(forced ? 400 : 200, {
+      'content-type': 'application/json',
+      'request-id': 'req_fable_error',
+      'retry-after': '9',
+      'anthropic-ratelimit-requests-remaining': '7',
+    });
+    response.end(JSON.stringify(forced ? errorBody : refusalBody));
+  });
+  const upstreamAddress = await listen(upstream);
+  t.after(() => closeServer(upstream));
+  const gateway = await startGateway(`http://127.0.0.1:${upstreamAddress.port}/`, {
+    exposedModels: [FABLE_MODEL],
+    anthropicPassthroughModels: [FABLE_MODEL],
+  });
+  t.after(() => gateway.runtime.close());
+  const choices = [{ type: 'any' }, { type: 'tool', name: 'Read' }];
+  const endpoints = [
+    { path: '/v1/messages', fields: { stream: false, max_tokens: 16 } },
+    { path: '/v1/messages', fields: { stream: true, max_tokens: 16 } },
+    { path: '/v1/messages/count_tokens', fields: {} },
+  ];
+  for (const toolChoice of choices) {
+    for (const endpoint of endpoints) {
+      const body = { model: FABLE_MODEL, messages: [{ role: 'user', content: 'Read the file.' }], tool_choice: toolChoice, ...endpoint.fields };
+      const response = await rawPost(`${gateway.url}${endpoint.path}`, gatewayHeaders(), JSON.stringify(body));
+      assert.equal(response.status, 400);
+      assert.deepEqual(JSON.parse(response.body), errorBody);
+      assert.match(response.headers['content-type'], /^application\/json/u);
+      assert.equal(response.headers['request-id'], 'req_fable_error');
+      assert.equal(response.headers['retry-after'], '9');
+      assert.equal(response.headers['anthropic-ratelimit-requests-remaining'], '7');
+      assert.deepEqual(captured.at(-1), body, 'forced tool use must not be silently weakened to auto');
+    }
+  }
+  const response = await rawPost(`${gateway.url}/v1/messages`, gatewayHeaders(), JSON.stringify({
+    model: FABLE_MODEL, messages: [{ role: 'user', content: 'Test refusal.' }], max_tokens: 16,
+  }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(response.body), refusalBody);
+  assert.equal(captured.length, choices.length * endpoints.length + 1);
 });
 
 test('credentialed upstream redirects fail closed without replaying the Kimi key', async function (t) {

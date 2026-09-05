@@ -3,8 +3,8 @@
  *
  * Builds the routing config used by both the per-session `claude-workflow`
  * launcher and the shared `claude-workflow-gateway` daemon: the frontier main
- * model uses the selected main provider while workflow/subagent traffic and
- * every other Claude model id route to Codex-backed profiles.
+ * model and its native Anthropic fallback targets use the main provider;
+ * workflow/subagent traffic uses the configured Codex-backed profile.
  */
 import crypto from 'node:crypto';
 import process from 'node:process';
@@ -63,11 +63,12 @@ const MANAGED_PROVIDER_CLIENT_ENV_NAMES = Object.freeze([
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
 ]);
-// Opus 5 and Fable 5 expose their 1M windows natively. Keeping the canonical
+// Opus 5 and Fable 5.1 expose their 1M windows natively. Keeping the canonical
 // API IDs avoids a redundant client-only qualifier and survives model-picker
 // and resume round trips unchanged.
-export const DEFAULT_MAIN_MODEL_ID = 'claude-opus-5';
-export const FABLE_MAIN_MODEL_ID = 'claude-fable-5';
+export const OPUS_MAIN_MODEL_ID = 'claude-opus-5';
+export const FABLE_MAIN_MODEL_ID = 'claude-fable-5-1';
+export const DEFAULT_MAIN_MODEL_ID = FABLE_MAIN_MODEL_ID;
 export const DEFAULT_SUBAGENT_REASONING_EFFORT = 'max';
 export const KIMI_MAIN_MODEL_ID = 'k3';
 export const QWEN_MAIN_MODEL_ID = QWEN_TOKEN_PLAN_DEFAULTS.model;
@@ -94,6 +95,49 @@ function defaultAnthropicPassthroughPattern(mainModelId) {
   // qualifiers (e.g. [1m]) so dated variants stay on Anthropic as well.
   const family = modelIdWithoutBracketQualifiers(String(mainModelId || '').trim());
   return `${family}*`;
+}
+
+function nativeAnthropicFallbackModels(mainModelId) {
+  const model = modelIdWithoutBracketQualifiers(mainModelId);
+  // Keep the documented category-specific targets, not a broad Opus family
+  // wildcard that could silently opt future models into Anthropic routing.
+  if (/^claude-fable-5(?:-1)?(?:-\d{8})?$/u.test(model)) {
+    return [OPUS_MAIN_MODEL_ID, 'claude-opus-4-8'];
+  }
+  if (/^claude-opus-5(?:-\d{8})?$/u.test(model)) {
+    return ['claude-opus-4-8'];
+  }
+  return [];
+}
+
+function nativeFallbackModelAliases(modelId) {
+  return [modelId, `${modelId}[1m]`];
+}
+
+export function defaultWorkflowAnthropicPassthroughModels(mainModelId) {
+  return [
+    defaultAnthropicPassthroughPattern(mainModelId),
+    ...nativeAnthropicFallbackModels(mainModelId).flatMap(nativeFallbackModelAliases),
+  ];
+}
+
+function validateNativeAnthropicFallbacks(config, mainModelId, fallbackModels) {
+  for (const modelId of fallbackModels) {
+    for (const alias of nativeFallbackModelAliases(modelId)) {
+      const route = resolveModelRoute(alias, config);
+      if (
+        route.provider !== 'anthropic' ||
+        route.upstreamModel !== modelId
+      ) {
+        throw new Error(
+          `Native fallback for ${mainModelId} requires ${alias} to route unchanged to ` +
+            'Anthropic. Update ULTRATHINK_GATEWAY_ROUTE_MAP_JSON or ' +
+            'ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS to preserve this target; ' +
+            'provider or model remapping of a native fallback target is unsupported.'
+        );
+      }
+    }
+  }
 }
 
 function routeModelAliases(modelId) {
@@ -235,7 +279,7 @@ function routedModelId(provider, upstreamModel, requestedModel) {
 
   const durableCodexTier =
     provider === 'codex'
-      ? String(upstreamModel || '').match(/^gpt-\d+(?:\.\d+)*-(sol|terra|luna)$/u)?.[1]
+      ? String(upstreamModel || '').match(/^gpt-\d+(?:\.\d+)*-(astra|sol|terra|luna)$/u)?.[1]
       : null;
   if (durableCodexTier) {
     return `codex-${durableCodexTier}`;
@@ -269,11 +313,11 @@ function assertTruthfulCustomModelId(
   ) {
     throw new Error(
       `${envName} must be a truthful custom model ID without a Claude/Anthropic ` +
-        'prefix, native Claude alias, or bracket context qualifier; use codex-terra ' +
+        'prefix, native Claude alias, or bracket context qualifier; use codex-astra ' +
       'or another concise non-Anthropic ID'
     );
   }
-  if (provider === 'codex' && /^codex-(?:sol|terra|luna|gpt-)/u.test(normalized)) {
+  if (provider === 'codex' && /^codex-(?:astra|sol|terra|luna|gpt-)/u.test(normalized)) {
     const expected = routedModelId(
       provider,
       routeUpstreamModel(route, ''),
@@ -588,18 +632,20 @@ export function buildWorkflowGatewayConfig({
   ) {
     return providerRequiresGatewayAuth(routeProvider(route, ''));
   });
-  // Keep only an Anthropic-backed main model family on Anthropic. Every other
-  // Claude id (Sonnet, Haiku, Fable, ...) falls through to the configured Codex
-  // route unless the operator pins a passthrough list. Dated variants of the
-  // main model (e.g. claude-opus-5-20260724) stay on Anthropic via the family
-  // wildcard.
+  // Native Claude fallback selects exact Opus IDs, independently of agent
+  // routing. Keep those targets on Anthropic along with the main family.
+  // User passthrough lists and route-map entries retain precedence; validate
+  // them below instead of silently replacing an incompatible override.
+  const nativeFallbackModels = resolvedMainProvider === 'anthropic'
+    ? nativeAnthropicFallbackModels(mainModelId)
+    : [];
   const passthroughEnvProvided =
     envString('ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS') !== '' ||
     envString('ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS') !== '';
   const anthropicPassthroughModels = passthroughEnvProvided
     ? baseConfig.anthropicPassthroughModels
     : resolvedMainProvider === 'anthropic'
-      ? [defaultAnthropicPassthroughPattern(mainModelId)]
+      ? defaultWorkflowAnthropicPassthroughModels(mainModelId)
       : [];
   const hasAnthropicRoute =
     anthropicPassthroughModels.length > 0 ||
@@ -671,6 +717,7 @@ export function buildWorkflowGatewayConfig({
       ...(baseConfig.exposedModels || []),
     ]),
   };
+  validateNativeAnthropicFallbacks(config, mainModelId, nativeFallbackModels);
   validateEffectiveCodexRoutes(config);
   const effectiveSubagentRoute = resolveModelRoute(subagentModelId, config);
   const subagentCapabilities =
@@ -709,6 +756,15 @@ export function buildWorkflowClientEnv(
 
   const mainRoute = resolveModelRoute(mainModelId, config);
   const subagentRoute = resolveModelRoute(subagentModelId, config);
+  if (
+    mainRoute.provider === 'anthropic' &&
+    nativeAnthropicFallbackModels(mainModelId).includes(OPUS_MAIN_MODEL_ID)
+  ) {
+    // Claude validates this alias before arming Fable's native refusal
+    // fallback. The force flag below keeps explicit Opus-pinned agents on
+    // the configured agent model without disguising the fallback as Codex.
+    clientEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = OPUS_MAIN_MODEL_ID;
+  }
   const routedContextContracts = [mainRoute, subagentRoute]
     .map((route) => routeContextContract(config, route))
     .filter(Boolean);
@@ -759,7 +815,11 @@ export function buildWorkflowClientEnv(
     DEFAULT_SUBAGENT_REASONING_EFFORT
   );
   if (clientEffort) {
-    clientEnv.CLAUDE_CODE_EFFORT_LEVEL = clientEffort;
+    // Claude's effort enum is narrower than Codex's. Unsupported values are
+    // silently ignored by Claude, so translate only the client preference;
+    // the selected Codex route retains its exact upstream effort.
+    clientEnv.CLAUDE_CODE_EFFORT_LEVEL =
+      clientEffort === 'ultra' ? 'max' : clientEffort === 'minimal' ? 'low' : clientEffort;
   }
   // Claude may fall back from a broken stream to a non-streaming retry. A tool
   // turn is not safely replayable, so keep one intended boundary to one
@@ -791,7 +851,7 @@ export function buildWorkflowClientEnv(
 function customModelName(route) {
   const provider = routeProvider(route, '');
   if (provider === 'codex') {
-    const tier = String(routeUpstreamModel(route, '')).match(/-(sol|terra|luna)$/u)?.[1];
+    const tier = String(routeUpstreamModel(route, '')).match(/-(astra|sol|terra|luna)$/u)?.[1];
     return tier ? `Codex ${tier[0].toUpperCase()}${tier.slice(1)}` : 'Codex';
   }
   return route.displayName || mainRouteDisplayName(provider);
@@ -837,6 +897,7 @@ function modelPickerLabel(modelId, route) {
   if (provider === 'anthropic') {
     const normalized = modelIdWithoutBracketQualifiers(modelId);
     for (const [pattern, label] of [
+      [/^claude-fable-5-1(?:-|$)/u, 'Fable 5.1'],
       [/^claude-fable-5(?:-|$)/u, 'Fable 5'],
       [/^claude-opus-5(?:-|$)/u, 'Opus 5'],
       [/^claude-sonnet-5(?:-|$)/u, 'Sonnet 5'],
@@ -956,6 +1017,7 @@ export function buildWorkflowClaudeEnv(
     // previously configured shared daemon.
     ANTHROPIC_MODEL: mainModelId,
     CLAUDE_CODE_SUBAGENT_MODEL: subagentModelId,
+    CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1',
     ...aliasSlots,
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '0',
   };

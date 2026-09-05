@@ -28,6 +28,68 @@ const INSTALL_MAINTENANCE_SCRIPT = path.join(
   'reconcile-installed-daemon.mjs'
 );
 
+function isolatedFixtureEnvironment(fixtureHome, inherited) {
+  const environment = environmentWithoutGatewayAndAnthropicCredentials(inherited);
+  const configurationPrefixes = [
+    'ANTHROPIC_', 'BAILIAN_', 'CLAUDE_', 'CODEX_', 'DASHSCOPE_',
+    'DEEPSEEK_', 'GEMINI_', 'GLM_', 'GOOGLE_', 'KIMI_', 'OPENAI_',
+    'QWEN_', 'ULTRATHINK_', 'ZAI_',
+  ];
+  for (const name of Object.keys(environment)) {
+    if (
+      configurationPrefixes.some((prefix) => name.startsWith(prefix)) ||
+      /(?:^|_)(?:API_KEY|TOKEN|ACCESS_KEY|SECRET|PASSWORD|CREDENTIALS|PRIVATE_KEY|AUTHORIZATION)(?:_|$)/u.test(name)
+    ) {
+      delete environment[name];
+    }
+  }
+  for (const name of [
+    'BASH_ENV', 'ENV', 'ZDOTDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+    'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+    'NPM_CONFIG_USERCONFIG', 'npm_config_userconfig',
+  ]) {
+    delete environment[name];
+  }
+  return { ...environment, HOME: fixtureHome, USERPROFILE: fixtureHome };
+}
+
+function replaceEnvironment(environment) {
+  for (const name of Object.keys(process.env)) {
+    delete process.env[name];
+  }
+  Object.assign(process.env, environment);
+}
+
+function testFixtureEnvironmentIsolation(fixtureHome) {
+  const environment = isolatedFixtureEnvironment(fixtureHome, {
+    HOME: '/unrelated-user-home',
+    USERPROFILE: '/unrelated-user-profile',
+    CODEX_HOME: '/unrelated-codex-state',
+    XDG_STATE_HOME: '/unrelated-managed-state',
+    BASH_ENV: '/unrelated-shell-startup',
+    ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-fable-5',
+    ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: 'claude-fable-5*',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'codex-terra',
+    ANTHROPIC_API_KEY: 'fixture-secret',
+    KIMI_API_KEY: 'fixture-secret',
+    QWEN_API_KEY: 'fixture-secret',
+    CUSTOM_ACCESS_TOKEN: 'fixture-secret',
+    GH_TOKEN: 'fixture-secret',
+    AWS_ACCESS_KEY_ID: 'fixture-secret',
+    AWS_SECRET_ACCESS_KEY: 'fixture-secret',
+    PATH: '/fixture-tools',
+    NODE_OPTIONS: '--no-warnings',
+    NODE_EXTRA_CA_CERTS: '/fixture-ca.pem',
+  });
+  assert.deepEqual(environment, {
+    HOME: fixtureHome,
+    USERPROFILE: fixtureHome,
+    PATH: '/fixture-tools',
+    NODE_OPTIONS: '--no-warnings',
+    NODE_EXTRA_CA_CERTS: '/fixture-ca.pem',
+  });
+}
+
 function freePort() {
   return new Promise(function reservePort(resolve, reject) {
     const server = net.createServer();
@@ -189,7 +251,7 @@ async function testDaemonRevisionAndHealth() {
     await assert.rejects(fs.access(pidFile));
 
     const start = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
-    assert.equal(start.code, 0, start.stderr || start.stdout);
+    assert.equal(start.code, 0, await daemonFailureOutput(start, stateDir));
     const firstPid = await readPid(pidFile);
     const firstRevision = (await fs.readFile(revisionFile, 'utf8')).trim();
     assert.match(firstRevision, /^[a-f0-9]{64}$/u);
@@ -238,7 +300,7 @@ async function testDaemonRevisionAndHealth() {
       BAILIAN_TOKEN_PLAN_API_KEY: 'sk-sp-test-revision-key',
     };
     const restart = await runProcess('bash', [DAEMON_SCRIPT, 'reconcile'], changedEnvironment);
-    assert.equal(restart.code, 0, restart.stderr || restart.stdout);
+    assert.equal(restart.code, 0, await daemonFailureOutput(restart, stateDir));
     assert.match(restart.stdout, /healthy daemon is stale; restarting/u);
     assert.match(restart.stdout, /matches the installed runtime revision/u);
     const secondPid = await readPid(pidFile);
@@ -330,7 +392,7 @@ async function testDaemonRevisionAndHealth() {
       ULTRATHINK_GATEWAY_TRACE_DIR: 'off',
     };
     const disabledStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], traceDisabledEnv);
-    assert.equal(disabledStart.code, 0, disabledStart.stderr || disabledStart.stdout);
+    assert.equal(disabledStart.code, 0, await daemonFailureOutput(disabledStart, stateDir));
     const disabledHealth = await readHealth(port);
     assert.equal(disabledHealth.trace_enabled, false);
     assert.equal(disabledHealth.trace_dir, null);
@@ -376,7 +438,7 @@ async function testInstallationMaintenanceIgnoresNpmLifecyclePath() {
 
   try {
     const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
-    assert.equal(started.code, 0, started.stderr || started.stdout);
+    assert.equal(started.code, 0, await daemonFailureOutput(started, stateDir));
     const originalPid = await readPid(pidFile);
 
     const lifecyclePath = [
@@ -927,7 +989,7 @@ async function testSourcedManagedAuthKeepsKimiDaemonCurrent() {
 
   try {
     const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
-    assert.equal(started.code, 0, started.stderr || started.stdout);
+    assert.equal(started.code, 0, await daemonFailureOutput(started, stateDir));
 
     const sourcedStatus = await runProcess(
       'bash',
@@ -973,7 +1035,7 @@ async function testSourcedDirectCodexEnvironmentKeepsDaemonCurrent() {
 
   try {
     const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], env);
-    assert.equal(started.code, 0, started.stderr || started.stdout);
+    assert.equal(started.code, 0, await daemonFailureOutput(started, stateDir));
     const originalPid = await readPid(pidFile);
 
     const sourcedStatus = await runProcess(
@@ -1125,13 +1187,13 @@ async function testManagedPortChangeReplacesRecordedDaemon() {
 
   try {
     const firstStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], firstEnv);
-    assert.equal(firstStart.code, 0, firstStart.stderr || firstStart.stdout);
+    assert.equal(firstStart.code, 0, await daemonFailureOutput(firstStart, stateDir));
     const firstPid = await readPid(pidFile);
 
     const secondPort = await freePort();
     secondEnv = { ...baseEnv, ULTRATHINK_GATEWAY_DAEMON_PORT: String(secondPort) };
     const secondStart = await runProcess('bash', [DAEMON_SCRIPT, 'start'], secondEnv);
-    assert.equal(secondStart.code, 0, secondStart.stderr || secondStart.stdout);
+    assert.equal(secondStart.code, 0, await daemonFailureOutput(secondStart, stateDir));
     assert.match(secondStart.stdout, /recorded daemon is not healthy on requested port/u);
     const secondPid = await readPid(pidFile);
     assert.notEqual(secondPid, firstPid);
@@ -1172,7 +1234,7 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
 
   try {
     const started = await runProcess('bash', [DAEMON_SCRIPT, 'start'], daemonEnv);
-    assert.equal(started.code, 0, started.stderr || started.stdout);
+    assert.equal(started.code, 0, await daemonFailureOutput(started, stateDir));
     const daemonPid = await readPid(pidFile);
     const foreignPort = await freePort();
     const foreignEnv = {
@@ -1209,20 +1271,33 @@ async function testForeignHealthCannotClaimDaemonOwnership() {
   }
 }
 
-await testTraceDisableAndRuntimeConfig();
-await testManagedPortValidation();
-await testRelativeManagerPathsAreRejected();
-await testStateDirectorySymlinkIsRejected();
-await testStopRejectsUnrelatedPidWithDaemonPathArgument();
-await testForeignHealthCannotClaimDaemonOwnership();
-await testManagedPortChangeReplacesRecordedDaemon();
-await testDaemonRevisionAndHealth();
-await testInstallationMaintenanceIgnoresNpmLifecyclePath();
-await testEquivalentShellsUseOneSemanticRuntimeRevision();
-await testExecutableAliasSelectionChangesRuntimeRevision();
-await testDefaultCodexHomeChangesRuntimeRevision();
-await testProcessStartEnvironmentChangesRuntimeRevision();
-await testProcessStartupPathStateChangesRuntimeRevision();
-await testSourcedManagedAuthKeepsKimiDaemonCurrent();
-await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
-process.stdout.write('PASS daemon revision recycling and health diagnostics\n');
+const originalEnvironment = { ...process.env };
+const fixtureHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workflow-daemon-suite-home-'));
+try {
+  await fs.chmod(fixtureHome, 0o700);
+  // Imports may already have loaded the invoking user's env file. Sanitize the
+  // test process as well as its children, so direct configuration reads are
+  // isolated too. Individual cases can still override HOME or any test setting.
+  testFixtureEnvironmentIsolation(fixtureHome);
+  replaceEnvironment(isolatedFixtureEnvironment(fixtureHome, originalEnvironment));
+  await testTraceDisableAndRuntimeConfig();
+  await testManagedPortValidation();
+  await testRelativeManagerPathsAreRejected();
+  await testStateDirectorySymlinkIsRejected();
+  await testStopRejectsUnrelatedPidWithDaemonPathArgument();
+  await testForeignHealthCannotClaimDaemonOwnership();
+  await testManagedPortChangeReplacesRecordedDaemon();
+  await testDaemonRevisionAndHealth();
+  await testInstallationMaintenanceIgnoresNpmLifecyclePath();
+  await testEquivalentShellsUseOneSemanticRuntimeRevision();
+  await testExecutableAliasSelectionChangesRuntimeRevision();
+  await testDefaultCodexHomeChangesRuntimeRevision();
+  await testProcessStartEnvironmentChangesRuntimeRevision();
+  await testProcessStartupPathStateChangesRuntimeRevision();
+  await testSourcedManagedAuthKeepsKimiDaemonCurrent();
+  await testSourcedDirectCodexEnvironmentKeepsDaemonCurrent();
+  process.stdout.write('PASS daemon revision recycling and health diagnostics\n');
+} finally {
+  replaceEnvironment(originalEnvironment);
+  await fs.rm(fixtureHome, { recursive: true, force: true });
+}

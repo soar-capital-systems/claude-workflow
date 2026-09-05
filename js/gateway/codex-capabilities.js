@@ -24,6 +24,13 @@ const KNOWN_TOOL_OUTPUT_TRUNCATION_POLICY = Object.freeze({
 });
 
 const KNOWN_MODEL_CAPABILITIES = Object.freeze({
+  'gpt-6-astra': Object.freeze({
+    contextWindow: 272_000,
+    maxContextWindow: 872_000,
+    effectiveContextWindowPercent: 95,
+    reasoningEfforts: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']),
+    toolOutputTruncationPolicy: KNOWN_TOOL_OUTPUT_TRUNCATION_POLICY,
+  }),
   'gpt-5.4': Object.freeze({
     contextWindow: 272_000,
     maxContextWindow: 1_000_000,
@@ -95,7 +102,7 @@ function parseCatalog(stdout) {
   return Array.isArray(parsed?.models) ? parsed.models : [];
 }
 
-function readCatalog(command, cwd, env, bundledOnly) {
+export function readCodexModelCatalog(command, cwd, env, bundledOnly) {
   const catalogCwd = path.resolve(String(cwd || process.cwd()));
   const environment = env || process.env;
   const cacheKey = JSON.stringify([
@@ -178,10 +185,10 @@ function modelCapabilities(command, cwd, model, env) {
   // loads in milliseconds. Only ask Codex to refresh its online catalog when
   // the selected model is absent, which keeps normal Claude startup off the
   // network while preserving support for remotely introduced models.
-  const bundledCatalog = readCatalog(command, cwd, env, true);
+  const bundledCatalog = readCodexModelCatalog(command, cwd, env, true);
   let catalogModel = bundledCatalog?.find((entry) => entry?.slug === model);
   if (!catalogModel) {
-    const onlineCatalog = readCatalog(command, cwd, env, false);
+    const onlineCatalog = readCodexModelCatalog(command, cwd, env, false);
     catalogModel = onlineCatalog?.find((entry) => entry?.slug === model);
   }
   const discovered = normalizedCatalogModel(catalogModel);

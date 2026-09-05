@@ -345,7 +345,7 @@ test(
       selectedModel,
       `${DEFAULT_CODEX_MODEL} must exist in the installed Codex bundled model catalog`
     );
-    assert.match(selectedModel.slug, /^gpt-5\.6(?:-|$)/u);
+    assert.equal(selectedModel.slug, 'gpt-6-astra');
     assert.equal(selectedModel.supported_in_api, true);
     assert.deepEqual(selectedModel.truncation_policy, {
       mode: 'tokens',
@@ -384,7 +384,7 @@ test(
     assert.equal(
       supportedEfforts.has('max'),
       true,
-      'the selected 5.6 workflow model must support the configured max effort'
+      'the selected workflow model must support the configured max effort'
     );
 
     if (CODEX_PROBE.version) {
@@ -393,8 +393,8 @@ test(
   }
 );
 
-test(
-  'installed Codex app-server exposes only wrappers and Claude dynamic tools in isolation mode',
+['main', 'subagent'].forEach((threadKind) => test(
+  `installed Codex app-server exposes only wrappers and Claude dynamic tools in isolation mode (${threadKind})`,
   { skip: CODEX_SKIP },
   async function installedCodexDynamicToolIsolation(t) {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-installed-isolation-'));
@@ -500,6 +500,9 @@ test(
         'wire_api = "responses"',
         'supports_websockets = false',
         '',
+        '[features.context_management]',
+        'experimental_mode = true',
+        '',
         '[features.current_time_reminder]',
         'enabled = true',
         'sleep_tool = true',
@@ -556,7 +559,9 @@ test(
     });
     try {
       const headers = {
-        'x-claude-code-agent-id': 'installed-isolation-agent',
+        ...(threadKind === 'subagent'
+          ? { 'x-claude-code-agent-id': 'installed-isolation-agent' }
+          : {}),
         'x-claude-code-session-id': 'installed-isolation-session',
       };
       const request = {
@@ -579,6 +584,24 @@ test(
                   type: 'object',
                 },
                 name: 'Read',
+              },
+              {
+                name: 'AskUserQuestion',
+                description: 'Ask the user a question through Claude Code.',
+                input_schema: {
+                  type: 'object',
+                  properties: {
+                    questions: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: { question: { type: 'string' } },
+                        required: ['question'],
+                      },
+                    },
+                  },
+                  required: ['questions'],
+                },
               },
             ],
           },
@@ -610,10 +633,12 @@ test(
       assert.deepEqual(toolNames, [
         'functions.exec',
         'functions.ext_tool_001',
+        'functions.ext_tool_002',
         'functions.wait',
       ]);
 
       const serializedRequest = JSON.stringify(payload);
+      assert.match(serializedRequest, /Ask the user a question through Claude Code\./u);
       assert.doesNotMatch(serializedRequest, /CODEX_ISOLATION_SKILL_SENTINEL/u);
       assert.doesNotMatch(serializedRequest, /configured\.server\.with\.dots/u);
       assert.doesNotMatch(serializedRequest, /configured-plugin@test/u);
@@ -646,4 +671,4 @@ test(
       await fs.rm(tempRoot, { recursive: true, force: true, maxRetries: 3 });
     }
   }
-);
+));

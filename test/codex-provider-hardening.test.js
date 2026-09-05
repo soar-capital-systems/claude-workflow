@@ -167,13 +167,17 @@ function processExists(pid) {
 function finalAppServer(
   logPath,
   userAgent =
-    'claude_workflow_gateway/0.150.1 (Mac OS 26.4.0; arm64) ' +
+    'claude_workflow_gateway/0.153.4 (Mac OS 26.4.0; arm64) ' +
     'iTerm.app/3.6.10 (claude_workflow_gateway; 0.1.0)'
 ) {
   return `#!/usr/bin/env node
 const fs = require('node:fs');
 const readline = require('node:readline');
 const logPath = ${JSON.stringify(logPath)};
+if (process.argv[2] === 'debug' && process.argv[3] === 'models') {
+  process.stdout.write(JSON.stringify({ models: [{ slug: 'gpt-5.6-terra', context_window: 272000 }] }));
+  process.exit(0);
+}
 function log(value) { fs.appendFileSync(logPath, JSON.stringify(value) + '\\n'); }
 function send(value) { process.stdout.write(JSON.stringify(value) + '\\n'); }
 log({
@@ -1043,6 +1047,7 @@ async function testDynamicToolsOnlyThreadMode() {
       sleep_tool: false,
     });
     assert.equal(isolationConfig['features.memories'], false);
+    assert.equal(isolationConfig['features.context_management'], false);
     assert.equal(isolationConfig['features.sleep_tool'], false);
     assert.equal(Object.hasOwn(isolationConfig, 'features.memory_tool'), false);
     assert.equal(Object.hasOwn(isolationConfig, 'features.write_stdin_approval'), false);
@@ -1132,7 +1137,7 @@ async function testDynamicToolsOnlyVersionGate() {
   try {
     await assert.rejects(
       manager.processRequest(request('old-dynamic-only'), body('Reject old Codex.'), route()),
-      /requires Codex CLI 0\.150\.1 or newer/u
+      /requires Codex CLI 0\.153\.4 or newer/u
     );
   } finally {
     await manager.close();

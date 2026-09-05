@@ -11,16 +11,16 @@ import {
 import { QWEN_TOKEN_PLAN_DEFAULTS } from './provider-profiles.js';
 
 const DEFAULT_EXPOSED_MODELS = Object.freeze([
-  'claude-opus-5',
+  'claude-fable-5-1',
   'claude-sonnet-4-7',
   'claude-sonnet-4-5',
   'claude-haiku-4-5',
 ]);
-const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-5*']);
+const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-fable-5-1*']);
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
-export const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra';
+export const DEFAULT_CODEX_MODEL = 'gpt-6-astra';
 const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'total';
 const DEFAULT_AUTH_FAILURE_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS = 60;

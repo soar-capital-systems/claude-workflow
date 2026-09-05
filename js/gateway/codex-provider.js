@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 
 import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
 import { resolveCodexCapabilities } from './codex-capabilities.js';
+import { createCodexToolCatalog } from './codex-tool-catalog.js';
 import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
@@ -64,6 +65,7 @@ const CODEX_DYNAMIC_TOOLS_ONLY_DISABLED_FEATURES = Object.freeze([
   'guardian_ext',
   'goals',
   'token_budget',
+  'context_management',
   'rollout_budget',
   // 0.150.1 reads sleep from current_time_reminder below; newer app-server
   // builds also expose an independent sleep_tool feature. Keep both off.
@@ -90,7 +92,7 @@ const CODEX_REASONING_EFFORTS = new Set([
   'ultra',
 ]);
 const CODEX_VERBOSITIES = new Set(['low', 'medium', 'high']);
-const MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION = Object.freeze([0, 150, 1]);
+const MIN_DYNAMIC_TOOLS_ONLY_CODEX_VERSION = Object.freeze([0, 153, 4]);
 const CODEX_CONTEXT_DROP_RESET_FRACTION = 0.8;
 // Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
 // Undershooting chars-per-token overflows the upstream window (fatal);
@@ -172,7 +174,7 @@ function assertDynamicToolsOnlyCodexCompatibility(config, initializeResult) {
   throw new GatewayError(
     502,
     'api_error',
-    `shared gateway requires Codex CLI 0.150.1 or newer for isolated dynamic-tool threads (detected ${detected}); update Codex and restart claude-workflow-gateway`
+    `shared gateway requires Codex CLI 0.153.4 or newer for isolated dynamic-tool threads (detected ${detected}); update Codex and restart claude-workflow-gateway`
   );
 }
 
@@ -1357,10 +1359,10 @@ function codexDynamicToolsOnlyConfigOverrides(discoveredConfig = null) {
     'orchestrator.mcp.enabled': false,
     'memories.use_memories': false,
     'memories.dedicated_tools': false,
-    // GPT-5.6 model metadata selects code-mode-only independently of feature
+    // GPT-6/5.6 model metadata selects code-mode-only independently of feature
     // flags. Keep Claude-provided functions top-level instead of nesting them
     // behind Codex's exec wrapper. Codex still advertises exec/wait itself;
-    // app-server 0.150.1 has no supported thread override that removes them.
+    // app-server 0.153.4 has no supported thread override that removes them.
     'features.code_mode': {
       enabled: false,
       direct_only_tool_namespaces: ['functions'],
@@ -2470,10 +2472,12 @@ function validateCodexContentBlocks(requestBody) {
 }
 
 class CodexAppServerConnection extends EventEmitter {
-  constructor(config) {
+  constructor(config, model) {
     super();
     this.config = config;
+    this.model = model;
     this.child = null;
+    this.toolCatalogPromise = null;
     this.stopPromise = null;
     this.buffer = '';
     this.nextRequestId = 1;
@@ -2495,11 +2499,27 @@ class CodexAppServerConnection extends EventEmitter {
     );
     this.on('error', noop);
     this.readyPromise = this.start();
-    this.readyPromise.catch(function ignoreReadyPromiseRejection() {});
+    this.readyPromise.catch((error) => this.close(error).catch(noop));
   }
 
   async start() {
-    this.child = spawn(this.config.codex.command, ['app-server'], {
+    const args = ['app-server'];
+    if (this.config.codex.dynamicToolsOnly === true) {
+      this.toolCatalogPromise = createCodexToolCatalog({
+        command: this.config.codex.command,
+        cwd: this.config.codex.cwd,
+        model: this.model,
+      });
+      const catalog = await this.toolCatalogPromise;
+      if (this.closed) {
+        await catalog.dispose();
+        throw new GatewayError(502, 'api_error', 'Codex app-server was closed during startup');
+      }
+      // Startup is required: thread/start config cannot replace the shared
+      // models manager. This private snapshot lasts only for this connection.
+      args.push('-c', `model_catalog_json=${JSON.stringify(catalog.filePath)}`);
+    }
+    this.child = spawn(this.config.codex.command, args, {
       cwd: this.config.codex.cwd,
       detached: SUPPORTS_PROCESS_GROUP_SIGNALS,
       env: environmentWithoutGatewayAndAnthropicCredentials(),
@@ -2632,7 +2652,7 @@ class CodexAppServerConnection extends EventEmitter {
       this.rejectPendingRequest(requestId, failure);
     }
     this.emit('error', failure);
-    void this.stopChild();
+    void this.stopChild().catch(noop);
   }
 
   handleClose(code, signal) {
@@ -2828,11 +2848,15 @@ class CodexAppServerConnection extends EventEmitter {
       this.rejectPendingRequest(requestId, failure);
     }
 
-    if (!this.child) {
-      return;
-    }
-
+    // A running turn may have no outstanding RPC: its consumer is waiting for
+    // notifications. Settle that boundary before shutting down the transport.
+    this.emit('error', failure);
     await this.stopChild();
+  }
+
+  async releaseToolCatalog() {
+    const catalog = await this.toolCatalogPromise?.catch(() => null);
+    await catalog?.dispose();
   }
 
   async stopChild() {
@@ -2842,6 +2866,7 @@ class CodexAppServerConnection extends EventEmitter {
 
     const child = this.child;
     if (!child) {
+      await this.releaseToolCatalog();
       return;
     }
 
@@ -2887,7 +2912,7 @@ class CodexAppServerConnection extends EventEmitter {
       if (!signalChildProcessTree(child, 'SIGTERM')) {
         finish();
       }
-    });
+    }).finally(() => this.releaseToolCatalog());
 
     return this.stopPromise;
   }
@@ -2913,7 +2938,7 @@ class CodexGatewaySession {
       approval_policy: this.route.approvalPolicy,
     }) || null;
     this.systemPrompt = renderSystemPrompt(requestBody);
-    this.connection = new CodexAppServerConnection(config);
+    this.connection = new CodexAppServerConnection(config, route.upstreamModel);
     this.bootstrapMode = options.bootstrapMode || '';
     // Shared per-upstream-model context windows learned from app-server usage
     // events, provided by the owning session manager.

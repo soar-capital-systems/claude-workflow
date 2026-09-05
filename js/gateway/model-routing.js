@@ -83,7 +83,7 @@ const VALID_CODEX_APPROVAL_POLICIES = Object.freeze([
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
-const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-5*']);
+const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-fable-5-1*']);
 const KIMI_REASONING_EFFORT_MAP = Object.freeze({
   light: 'low',
   low: 'low',

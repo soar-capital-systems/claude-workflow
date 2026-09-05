@@ -63,7 +63,7 @@ complete private prompts or transcripts.
   or capability roots. Native agents, memories, MCP servers, plugins, skills,
   web, planning, permission, request-input, and clock/sleep tools are disabled.
   Repository operations use the dynamic tools supplied by Claude Code. Codex
-  app-server 0.150.1 still advertises its code-mode `functions.exec` and
+  app-server 0.153.4 still advertises its code-mode `functions.exec` and
   `functions.wait` wrappers; the app-server has no supported thread override
   that removes them. This isolation does not turn permission bypass into a
   sandbox.

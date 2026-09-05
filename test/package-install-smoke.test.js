@@ -97,9 +97,11 @@ try {
     'SECURITY.md',
     'SUPPORT.md',
     'docs/LARGE_FILES_AND_DIFFS.md',
+    'docs/UPSTREAM_COMPATIBILITY.md',
     'js/cli/claude-workflow-managed-state.js',
     'js/cli/claude-workflow-runtime-revision.js',
     'js/gateway/codex-capabilities.js',
+    'js/gateway/codex-tool-catalog.js',
     'js/gateway/provider-profiles.js',
     'js/utils/runtime-identity.js',
     'scripts/claude-workflow-daemon.sh',
@@ -232,12 +234,12 @@ try {
     await fs.mkdir(fakeBin);
     await fs.writeFile(
       path.join(fakeBin, 'claude'),
-      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "2.1.250 (Claude Code)"; elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then echo \'{"loggedIn":true}\'; else exit 2; fi\n',
+      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "2.1.261 (Claude Code)"; elif [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then echo \'{"loggedIn":true}\'; else exit 2; fi\n',
       { mode: 0o755 }
     );
     await fs.writeFile(
       path.join(fakeBin, 'codex'),
-      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "codex-cli 0.150.1"; elif [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in using ChatGPT"; else exit 2; fi\n',
+      '#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "codex-cli 0.153.4"; elif [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in using ChatGPT"; else exit 2; fi\n',
       { mode: 0o755 }
     );
     const setupResult = run(workflowBin, ['setup'], {

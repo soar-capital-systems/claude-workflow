@@ -79,7 +79,16 @@ const args = process.argv.slice(2);
 const logPath = ${JSON.stringify(logPath)};
 
 if (args[0] === '--version') {
-  process.stdout.write('codex-cli 0.150.1\\n');
+  process.stdout.write('codex-cli 0.153.4\\n');
+  process.exit(0);
+}
+if (args[0] === 'debug' && args[1] === 'models') {
+  process.stdout.write(JSON.stringify({ models: [{
+    slug: 'gpt-6-astra', context_window: 272000, max_context_window: 872000,
+    effective_context_window_percent: 95,
+    supported_reasoning_levels: [{ effort: 'max' }],
+    experimental_supported_tools: ['send_user_message_async', 'clock']
+  }] }));
   process.exit(0);
 }
 if (args[0] === 'login' && args[1] === 'status') {
@@ -120,7 +129,7 @@ input.on('line', function onLine(line) {
       id: message.id,
       result: {
         userAgent:
-          'claude_workflow_gateway/0.150.1 (Linux 6.6; x86_64) ' +
+          'claude_workflow_gateway/0.153.4 (Linux 6.6; x86_64) ' +
           'terminal/1.0.0 (claude_workflow_gateway; 0.1.0)',
       },
     });
@@ -252,12 +261,12 @@ test('direct Codex main generates local client auth and strips it from the Codex
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
       assert.equal(clientEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, '784800');
       assert.equal(clientEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, '1');
-      assert.equal(mainModelId, 'codex-terra');
-      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-terra');
+      assert.equal(mainModelId, 'codex-astra');
+      assert.equal(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION, 'codex-astra');
       assert.match(clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, /^Codex /u);
       assert.match(
         clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION,
-        /^codex:gpt-5\.6-terra\/max through claude-workflow$/u
+        /^codex:gpt-6-astra\/max through claude-workflow$/u
       );
       assert.equal(
         clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
@@ -367,7 +376,7 @@ test(
     assert.equal(entries.filter((entry) => entry.event === 'turn').length, 1);
     assert.equal(
       entries.filter((entry) => entry.event === 'thread').every((entry) =>
-        entry.model === 'gpt-5.6-terra'
+        entry.model === 'gpt-6-astra'
       ),
       true
     );

@@ -43,6 +43,7 @@ npm ci --no-audit --no-fund
 npm run -s check
 node --test test/local-install.test.js test/onboarding.test.js
 node --test \
+  test/codex-tool-catalog.test.js \
   test/managed-state-ownership.test.js \
   test/security-hardening.test.js \
   test/shell-migration.test.js

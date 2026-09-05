@@ -20,13 +20,13 @@ Several independent limits apply to one review:
   numbered prefix no larger than 36,000 UTF-8 bytes. It adds machine-readable
   coverage metadata with the exact next 1-based offset. A malformed or
   mismatched notice produces no coverage claim.
-- The Codex CLI 0.150.1 bundled catalog declares a 10,000-token function-output policy.
+- The Codex CLI 0.153.4 bundled catalog declares a 10,000-token function-output policy.
   A single 12,000-line result can therefore be shortened independently of the
   overall context window.
 - A context window counts the complete conversation, including system
   instructions, tool schemas, prior turns, tool results, reasoning, and output
   headroom. The source or diff gets only part of that budget.
-- Codex CLI 0.150.1's bundled 5.6 models advertise a 272,000-token standard window and an
+- Codex CLI 0.153.4's bundled GPT-6 Astra model advertises a 272,000-token standard window and an
   872,000-token maximum through the installed app-server catalog. Codex reserves
   part of that window, leaving 258,400 usable tokens in `standard` mode or
   828,400 in `long` mode. Claude Workflow uses `long` by default and passes the
@@ -39,7 +39,7 @@ Several independent limits apply to one review:
   [error reference](https://www.kimi.com/code/docs/en/kimi-code/error-reference.html).
 - Qwen 3.8 Max has a 1,000,000-token total context window, a safe
   983,616-token thinking-mode input ceiling, and a 131,072-token answer cap.
-  With the default Terra agents, Claude Code exposes the smaller shared
+  With the default Astra agents, Claude Code exposes the smaller shared
   custom-model maximum of 828,400 tokens. Qwen's `xhigh` setting can use up to
   262,144 thinking tokens, so a large review still needs room for reasoning,
   tools, and the final report.
@@ -76,10 +76,13 @@ Claude Workflow applies the following rules:
    a stale running daemon when installed code, effective user configuration, or
    the selected Node.js or Codex executable changes.
 7. Every workflow Codex thread disables optional native execution environments
-   and integrations. Codex 0.150.1 retains its built-in `functions.exec` and
+   and integrations. Codex 0.153.4 retains its built-in `functions.exec` and
    `functions.wait` code-mode control wrappers, while repository reads, writes,
    searches, and shell commands use Claude-provided dynamic tools. The same
    boundary applies to per-session and shared gateways.
+   A private catalog snapshot suppresses native async-question and clock tools
+   that model metadata enables independently of feature flags. Experimental
+   Codex context management is disabled so Claude owns the conversation tools.
 8. A dense single line, malformed partial notice, path mismatch, or noncontiguous
    numbered result fails closed and recommends a smaller Read, targeted Grep,
    or byte/character query without claiming source coverage.

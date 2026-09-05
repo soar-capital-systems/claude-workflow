@@ -235,7 +235,9 @@ function parseSsePayloads(text) {
 }
 
 const CODEX_REQUEST_MODEL = 'claude-sonnet-4-7';
-const CODEX_UPSTREAM_MODEL = 'gpt-5.6-terra';
+// These wire-format fixtures intentionally pin an older supported model;
+// assertions about loadGatewayConfig defaults must not use this fixture ID.
+const CODEX_FIXTURE_UPSTREAM_MODEL = 'gpt-5.6-terra';
 const WORKFLOW_DISPLAY_SUBAGENT_MODEL = 'codex-astra';
 const CLEAN_PROXY_ENV = Object.freeze({
   HTTP_PROXY: '',
@@ -314,7 +316,16 @@ function cleanProxyEnv(overrides = {}) {
   };
 }
 
-Object.assign(process.env, cleanProxyEnv());
+// Gateway imports load project/user defaults as a side effect. Clear those
+// values before running any tests, including keys absent from our explicit
+// clean-workflow fixture. Keep blank entries so child CLI loaders cannot
+// repopulate the same keys from the user's environment files.
+for (const name of Object.keys(process.env)) {
+  if (/^(?:ANTHROPIC_|BAILIAN_|CLAUDE_|CLAUDECODE$|CODEX_|DASHSCOPE_|DEEPSEEK_|GLM_|KIMI_|OPENAI_|QWEN_|ULTRATHINK_|ZAI_)/u.test(name)) {
+    process.env[name] = '';
+  }
+}
+Object.assign(process.env, cleanProxyEnv(), CLEAN_WORKFLOW_ENV);
 
 function routedResponseModel(route) {
   const effort = route.reasoningEffort ? `/${route.reasoningEffort}` : '';
@@ -324,7 +335,7 @@ function routedResponseModel(route) {
 function codexRoute(overrides = {}) {
   return {
     requestedModel: CODEX_REQUEST_MODEL,
-    upstreamModel: CODEX_UPSTREAM_MODEL,
+    upstreamModel: CODEX_FIXTURE_UPSTREAM_MODEL,
     sandbox: 'workspace-write',
     approvalPolicy: 'never',
     reasoningEffort: 'medium',
@@ -345,7 +356,7 @@ function gatewayConfig(overrides = {}) {
       enabled: true,
       command: 'codex',
       cwd: process.cwd(),
-      model: CODEX_UPSTREAM_MODEL,
+      model: CODEX_FIXTURE_UPSTREAM_MODEL,
       sandbox: 'workspace-write',
       approvalPolicy: 'never',
       reasoningEffort: 'medium',
@@ -361,7 +372,7 @@ function gatewayConfig(overrides = {}) {
     openai: {
       apiKey: '',
       baseUrl: 'http://127.0.0.1:1',
-      model: CODEX_UPSTREAM_MODEL,
+      model: CODEX_FIXTURE_UPSTREAM_MODEL,
       reasoningEffort: 'low',
       verbosity: 'low',
     },
@@ -1095,7 +1106,7 @@ await runTest('gateway can make a configured frontier model the only Anthropic p
       assert.equal(frontierRoute.provider, 'anthropic');
       assert.equal(frontierRoute.upstreamModel, 'claude-fable-5');
       assert.equal(olderOpusRoute.provider, 'codex');
-      assert.equal(olderOpusRoute.upstreamModel, CODEX_UPSTREAM_MODEL);
+      assert.equal(olderOpusRoute.upstreamModel, 'gpt-6-astra');
       ok('only the configured frontier model stays on Anthropic while older Claude ids route to Codex');
     }
   );
@@ -1823,7 +1834,7 @@ await runTest('gateway trace context keeps Claude session and routed model ident
     claude_parent_agent_id: 'parent-1',
     provider: 'codex',
     requested_model: 'claude-sonnet-4-7',
-    upstream_model: CODEX_UPSTREAM_MODEL,
+    upstream_model: CODEX_FIXTURE_UPSTREAM_MODEL,
     sandbox: 'workspace-write',
     approval_policy: 'never',
   });

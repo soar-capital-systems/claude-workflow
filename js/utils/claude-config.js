@@ -59,7 +59,9 @@ export function buildClaudeSettingsOverrideEnvironment(extraEnv, childEnv) {
   );
   for (const name of CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES) {
     if (name === 'ANTHROPIC_API_KEY' || name === 'ANTHROPIC_AUTH_TOKEN') {
-      if (childEnv[name]) {
+      if (Object.hasOwn(extraEnv, name) && extraEnv[name] === null) {
+        settingsEnv[name] = '';
+      } else if (childEnv[name]) {
         settingsEnv[name] = String(childEnv[name]);
       }
       continue;

@@ -208,7 +208,7 @@ test('Qwen profile exposes its exact route with the shared Codex-safe Claude con
         clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
         'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
       );
-      assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
+      assert.equal(clientEnv.ANTHROPIC_API_KEY, null);
       assert.equal(Object.values(clientEnv).includes(QWEN_API_KEY), false);
 
       const cleaned = environmentWithoutGatewayCredentials({

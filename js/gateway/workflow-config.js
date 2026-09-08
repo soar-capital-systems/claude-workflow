@@ -841,7 +841,8 @@ export function buildWorkflowClientEnv(
 
   if (config.sharedSecret) {
     clientEnv.ANTHROPIC_AUTH_TOKEN = config.sharedSecret;
-    clientEnv.ANTHROPIC_API_KEY = config.sharedSecret;
+    // Use one gateway credential; two auth sources trigger Claude's warning.
+    clientEnv.ANTHROPIC_API_KEY = null;
     clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME] = config.sharedSecret;
   }
 

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# qwen-workflow — claude-workflow launcher pinned to:
+#   main loop : Qwen 3.8 Max (qwen3.8-max[1m], xhigh reasoning, 1M context profile)
+#   subagents : Codex (gpt-5.6-terra, max reasoning)
+#
+# Everything passes through to claude-workflow, so all of its parameters work:
+#   qwen-workflow                             interactive session
+#   qwen-workflow "Review the current diff."  one-shot prompt
+#   qwen-workflow --resume [id]               resume (also -r, --continue, -c,
+#                                             --fork-session, --session-id <id>)
+#   qwen-workflow --no-yolo                   restore permission prompts
+#   qwen-workflow -- <native claude flags>    e.g. -- --add-dir /extra/dir
+#   qwen-workflow setup|doctor|config ...     claude-workflow commands
+#
+# Wrapper-only convenience:
+#   qwen-workflow --workspace <dir> ...       cd into <dir> before launching
+#
+# Per-launch overrides for the Codex agent route:
+#   QWEN_WORKFLOW_AGENT_MODEL   gpt-5.6-terra (default) | gpt-5.6-sol | gpt-5.6-luna
+#   QWEN_WORKFLOW_AGENT_EFFORT  minimal..ultra (default max)
+#
+# Requires the Alibaba Token Plan key in ~/.claude-workflow.env (chmod 600):
+#   ULTRATHINK_GATEWAY_QWEN_API_KEY=sk-sp-...
+
+set -euo pipefail
+
+args=()
+while (($#)); do
+  case "$1" in
+    --workspace)
+      if [[ $# -lt 2 ]]; then
+        echo "qwen-workflow: --workspace requires a directory" >&2
+        exit 2
+      fi
+      cd -- "$2"
+      shift 2
+      ;;
+    --workspace=*)
+      cd -- "${1#--workspace=}"
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Fail fast when no Qwen key is visible to the gateway (parent environment or
+# the user env files claude-workflow reads). Values are never printed.
+has_qwen_key() {
+  [[ -n "${ULTRATHINK_GATEWAY_QWEN_API_KEY:-}${QWEN_API_KEY:-}${BAILIAN_TOKEN_PLAN_API_KEY:-}" ]] && return 0
+  local file
+  for file in "$HOME/.claude-workflow.env" "$HOME/.ultrathink.env"; do
+    [[ -f $file ]] || continue
+    if grep -Eqs '^(ULTRATHINK_GATEWAY_QWEN_API_KEY|QWEN_API_KEY|BAILIAN_TOKEN_PLAN_API_KEY)=..' "$file"; then
+      return 0
+    fi
+  done
+  return 1
+}
+if ! has_qwen_key; then
+  {
+    echo "qwen-workflow: no Qwen API key found."
+    echo "Add this line to ~/.claude-workflow.env, then run: chmod 600 ~/.claude-workflow.env"
+    echo "  ULTRATHINK_GATEWAY_QWEN_API_KEY=your_sk_sp_token_plan_key"
+  } >&2
+  exit 1
+fi
+
+# Main loop: Qwen 3.8 Max. Exported variables take precedence over
+# ~/.claude-workflow.env, so the saved default route is left untouched.
+export ULTRATHINK_GATEWAY_MAIN_MODEL_ID='qwen3.8-max[1m]'
+export ULTRATHINK_GATEWAY_MAIN_PROVIDER='qwen'
+export ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL='qwen3.8-max'
+export ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT='xhigh'
+export ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS='none'
+export ULTRATHINK_GATEWAY_QWEN_MODEL='qwen3.8-max'
+export ULTRATHINK_GATEWAY_QWEN_REASONING_EFFORT='xhigh'
+# 983616 is the gateway-enforced ceiling behind the [1m] alias; the gateway
+# clamps larger values back down to it.
+export ULTRATHINK_GATEWAY_QWEN_CONTEXT_TOKENS='983616'
+export ULTRATHINK_GATEWAY_QWEN_MAX_OUTPUT_TOKENS='131072'
+
+# Subagents / workflow agents: Codex.
+export ULTRATHINK_GATEWAY_CODEX_MODEL="${QWEN_WORKFLOW_AGENT_MODEL:-gpt-5.6-terra}"
+export ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL="$ULTRATHINK_GATEWAY_CODEX_MODEL"
+export ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT="${QWEN_WORKFLOW_AGENT_EFFORT:-max}"
+export ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT="$ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT"
+
+# Claude Code sessions that were already running when `setup --prepare-claude`
+# last ran write their startup state back to ~/.claude.json and flip
+# penguinModeOrgEnabled off again, which makes claude-workflow refuse to
+# launch. Re-prepare only when the flag is off; the launched session reads it
+# at startup, so later flips by other sessions cannot affect it.
+if ! node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const dir = process.env.CLAUDE_CONFIG_DIR || process.env.HOME;
+  let v = {};
+  try { v = JSON.parse(fs.readFileSync(path.join(dir, ".claude.json"), "utf8")); } catch {}
+  process.exit(v.hasCompletedOnboarding === true && v.penguinModeOrgEnabled === true ? 0 : 1);
+' 2>/dev/null; then
+  echo "qwen-workflow: re-preparing Claude Code third-party model support" >&2
+  claude-workflow setup --prepare-claude
+fi
+
+exec claude-workflow ${args[@]+"${args[@]}"}

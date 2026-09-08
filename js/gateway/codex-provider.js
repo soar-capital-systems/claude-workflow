@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events';
 import { environmentWithoutGatewayAndAnthropicCredentials } from '../utils/child-env.js';
 import { resolveCodexCapabilities } from './codex-capabilities.js';
 import { createCodexToolCatalog } from './codex-tool-catalog.js';
+import { codexTurnInput } from './codex-text-input.js';
 import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
@@ -3417,12 +3418,7 @@ class CodexGatewaySession {
     });
     const result = await this.connection.request('turn/start', {
       threadId: this.threadId,
-      input: [
-        {
-          type: 'text',
-          text: preparedInput.text,
-        },
-      ],
+      ...codexTurnInput(preparedInput.text),
       effort: mapReasoningEffort(this.route.reasoningEffort),
     });
 
@@ -3503,12 +3499,7 @@ class CodexGatewaySession {
       id: this.pendingToolCall.requestId,
       result: {
         success: !toolResult.isError,
-        contentItems: [
-          {
-            type: 'inputText',
-            text: toolResult.text,
-          },
-        ],
+        contentItems: [{ type: 'inputText', text: toolResult.text }],
       },
     });
 

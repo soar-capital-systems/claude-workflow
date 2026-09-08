@@ -551,6 +551,7 @@ test(
         dynamicToolsOnly: true,
         forkIdleTimeoutMs: 1_000,
         idleTimeoutMs: 0,
+        inputMaxTokens: 828400,
         maxSessions: 1,
         model: DEFAULT_CODEX_MODEL,
         pendingToolTimeoutMs: 5_000,
@@ -573,7 +574,9 @@ test(
         .processRequest(
           request,
           {
-            messages: [{ role: 'user', content: 'Return a short isolation probe response.' }],
+            messages: [{ role: 'user', content: threadKind === 'main'
+              ? 'LARGE_INPUT_START' + 'a'.repeat(1_048_559) + '😀' + 'b'.repeat(128_000) + 'LARGE_INPUT_END'
+              : 'Return a short isolation probe response.' }],
             model: 'claude-isolation-contract',
             tools: [
               {
@@ -615,7 +618,7 @@ test(
             verbosity: 'low',
           }
         )
-        .catch(() => null);
+        .catch(error => { rejectCapturedRequest(error); return null; });
 
       const { payload, request: upstreamRequest } = await withTimeout(
         capturedRequestPromise,
@@ -624,6 +627,18 @@ test(
       );
       assert.equal(upstreamRequest.method, 'POST');
       assert.match(String(upstreamRequest.url || ''), /\/responses(?:\?|$)/u);
+      if (threadKind === 'main') {
+        const texts = (payload.input || []).flatMap(item => item.content || [])
+          .filter(item => item.type === 'input_text').map(item => item.text);
+        const fragments = texts.filter(text => text.startsWith('<external_claude_workflow_transcript_'));
+        const combined = fragments.map(text => text.replace(/^<external_claude_workflow_transcript_\d+>/u, '').replace(/<\/external_claude_workflow_transcript_\d+>$/u, '')).join('');
+        const expected = 'LARGE_INPUT_START' + 'a'.repeat(1_048_559) + '😀' + 'b'.repeat(128_000) + 'LARGE_INPUT_END';
+        assert.ok(combined.includes(expected), 'large transcript survives installed Codex without loss');
+        assert.ok(fragments.length > 1, 'Codex carries the ordered source fragments');
+        assert.ok((payload.input || []).filter(item => item.role === 'developer')
+          .every(item => !(item.content || []).some(part => part.text?.includes('LARGE_INPUT_START'))),
+        'transcript contents must not become developer instructions');
+      }
 
       const specs = [
         ...(Array.isArray(payload.tools) ? payload.tools : []),

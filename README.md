@@ -327,6 +327,53 @@ locally instead of being silently weakened. Count-token responses use a
 conservative ceiling of one estimated token per UTF-8 byte for Claude Code
 compaction. They are not tokenizer or billing counts and do not call the model.
 
+### Astra launcher
+
+`astra-workflow` uses Codex for both routes: `gpt-6-astra` with `xhigh`
+reasoning for the main session and `gpt-6-astra` with `low` for agents.
+It uses your `codex login` and the documented per-session custom model
+settings provided by Claude Workflow 0.3.0 or newer.
+
+```bash
+astra-workflow
+astra-workflow --workspace /path/to/project "Review the current diff."
+astra-workflow --main-effort high --agent-model gpt-5.6-terra --agent-effort max
+astra-workflow --resume
+astra-workflow doctor --json
+```
+
+Override either model and effort with `--main-model`, `--main-effort`,
+`--agent-model`, and `--agent-effort` (also `--name=value`). For persistent
+defaults, export `ASTRA_WORKFLOW_MAIN_MODEL`, `ASTRA_WORKFLOW_MAIN_EFFORT`,
+`ASTRA_WORKFLOW_AGENT_MODEL`, or `ASTRA_WORKFLOW_AGENT_EFFORT` in your shell
+profile. Command-line options take precedence. Astra accepts `low`, `medium`,
+`high`, `xhigh`, and `max`; alternate models must support the chosen effort.
+
+All other arguments pass through to `claude-workflow`; `--` ends wrapper
+option parsing. Shared settings managed by `claude-workflow config` remain
+shared; this wrapper selects its routes per launch. Install with the normal
+global npm installation above, or add just the launcher to an existing install:
+
+```bash
+install -m 755 scripts/astra-workflow "$(dirname "$(command -v claude-workflow)")/astra-workflow"
+```
+
+Astra requests get a 15-minute gateway deadline so long-context `xhigh`
+compaction is not interrupted by the generic five-minute limit. Override
+`ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS` if needed (gateway maximum: 1800000).
+The wrapper defaults Claude's `API_TIMEOUT_MS` to 1860000 so its client timeout
+does not interrupt the gateway first. Existing exported values take precedence.
+After upgrading, exit and reopen an affected session with `astra-workflow
+--resume SESSION_ID`, then retry `/compact`; existing gateway processes retain
+their original timeout. A longer deadline does not guarantee compaction succeeds.
+
+Codex also limits a `turn/start` input to 1,048,576 characters, independently
+of its token context window. Larger prepared transcripts (including `/compact`
+requests) travel as ordered, untrusted `additionalContext` fragments, sized
+below Codex's per-fragment truncation budget. The gateway preserves the full
+prepared text and uses a short continuation request; normal-sized inputs keep
+the usual path. Existing token-budget limits still apply.
+
 ## How requests are handled
 
 ```text

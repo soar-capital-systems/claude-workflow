@@ -1358,7 +1358,7 @@ await runTest(
         assert.equal(workflow.config.anthropicPassthroughModels.length, 0);
         assert.equal(workflow.config.sharedSecret.length > 0, true);
         assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
-        assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
+        assert.equal(clientEnv.ANTHROPIC_API_KEY, null);
         assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
         assert.equal(
           clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
@@ -7477,7 +7477,7 @@ await runTest(
       assert.equal(result.code, 0);
       const capturedEnv = JSON.parse(await fs.readFile(capturedEnvPath, 'utf8'));
       assert.equal(capturedEnv.ANTHROPIC_AUTH_TOKEN, 'gateway-secret');
-      assert.equal(capturedEnv.ANTHROPIC_API_KEY, 'gateway-secret');
+      assert.equal(capturedEnv.ANTHROPIC_API_KEY, '');
       assert.equal(capturedEnv.CLAUDE_CODE_SUBAGENT_MODEL, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
       assert.equal(capturedEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, 'user-choice');
       assert.equal(capturedEnv.privateSettingsOwnTerminalTitle, false);

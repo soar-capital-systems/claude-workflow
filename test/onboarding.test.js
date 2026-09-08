@@ -19,6 +19,7 @@ import {
 } from '../js/cli/onboarding.js';
 import {
   CLAUDE_WORKFLOW_MANAGED_SETTINGS_ENV_NAMES,
+  buildClaudeSettingsOverrideEnvironment,
   prepareClaudeThirdPartyModelSupport,
 } from '../js/utils/claude-config.js';
 
@@ -1852,7 +1853,7 @@ test(
     ]);
     assert.notEqual(values[6], 'unset');
     assert.equal(values[7], values[6]);
-    assert.equal(values[8], values[6]);
+    assert.equal(values[8], 'unset');
     assert.equal(values[13], '1');
     assert.deepEqual(values.slice(14, 18), [
       'k3',
@@ -1913,7 +1914,7 @@ test(
       assert.equal(privateSettings.env[name], '');
     }
     assert.equal(privateSettings.env.ANTHROPIC_AUTH_TOKEN, values[6]);
-    assert.equal(privateSettings.env.ANTHROPIC_API_KEY, values[6]);
+    assert.equal(privateSettings.env.ANTHROPIC_API_KEY, '');
     assert.equal(
       await fsp.readFile(path.join(project, '.claude', 'settings.json'), 'utf8'),
       persistentSettings
@@ -1974,7 +1975,7 @@ test(
     ]);
     assert.notEqual(values[6], 'unset');
     assert.equal(values[7], values[6]);
-    assert.equal(values[8], values[6]);
+    assert.equal(values[8], 'unset');
     assert.deepEqual(values.slice(9, 13), ['unset', 'unset', 'unset', 'unset']);
     assert.equal(values[13], '1');
     assert.deepEqual(values.slice(14, 18), [
@@ -2121,3 +2122,13 @@ test(
     assert.equal(Object.hasOwn(privateSettings.env, 'ANTHROPIC_API_KEY'), false);
   }
 );
+
+// An explicit unset must also override credentials saved in Claude settings.
+test('gateway auth clears the unused credential in per-session settings', () => {
+  const settings = buildClaudeSettingsOverrideEnvironment(
+    { ANTHROPIC_AUTH_TOKEN: 'local-gateway-token', ANTHROPIC_API_KEY: null },
+    { ANTHROPIC_AUTH_TOKEN: 'local-gateway-token' }
+  );
+  assert.equal(settings.ANTHROPIC_AUTH_TOKEN, 'local-gateway-token');
+  assert.equal(settings.ANTHROPIC_API_KEY, '');
+});

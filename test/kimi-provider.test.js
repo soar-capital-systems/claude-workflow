@@ -242,7 +242,7 @@ test('Kimi profile uses plain K3 with max thinking and the shared Codex-safe con
         clientEnv.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES,
         'effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking'
       );
-      assert.equal(clientEnv.ANTHROPIC_API_KEY, workflow.config.sharedSecret);
+      assert.equal(clientEnv.ANTHROPIC_API_KEY, null);
       assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, workflow.config.sharedSecret);
       assert.equal(
         clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME],

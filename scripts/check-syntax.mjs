@@ -54,6 +54,7 @@ for (const file of [
   path.join(ROOT, 'ui', 'start-test.sh'),
   path.join(ROOT, 'ui', 'bin', 'ultrathink-ui'),
   path.join(ROOT, 'scripts', 'claude-workflow-gateway.bashrc'),
+  path.join(ROOT, 'scripts', 'astra-workflow'),
 ].filter((file) => fs.existsSync(file))) {
   run('bash', ['-n', file]);
 }

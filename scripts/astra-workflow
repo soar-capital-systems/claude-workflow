@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Claude Workflow with independently configurable Codex main and agent routes.
+set -euo pipefail
+
+main_model="${ASTRA_WORKFLOW_MAIN_MODEL:-gpt-6-astra}"
+main_effort="${ASTRA_WORKFLOW_MAIN_EFFORT:-xhigh}"
+agent_model="${ASTRA_WORKFLOW_AGENT_MODEL:-gpt-6-astra}"
+agent_effort="${ASTRA_WORKFLOW_AGENT_EFFORT:-low}"
+args=()
+
+fail() { echo "astra-workflow: $*" >&2; exit 2; }
+while (($#)); do
+  case "$1" in
+    --help|-h)
+      cat <<'HELP'
+Usage: astra-workflow [options] [prompt | claude-workflow command]
+
+Defaults: main gpt-6-astra / xhigh; agents gpt-6-astra / low.
+
+  --main-model MODEL     Override the main Codex model
+  --main-effort EFFORT   Override main reasoning effort
+  --agent-model MODEL    Override the agent Codex model
+  --agent-effort EFFORT  Override agent reasoning effort
+  --workspace DIR       Launch from this directory
+  --                    Pass remaining arguments through unchanged
+
+Options also accept --name=value. Environment defaults:
+  ASTRA_WORKFLOW_MAIN_MODEL, ASTRA_WORKFLOW_MAIN_EFFORT
+  ASTRA_WORKFLOW_AGENT_MODEL, ASTRA_WORKFLOW_AGENT_EFFORT
+  ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS (default 900000, 15 minutes)
+  API_TIMEOUT_MS (default 1860000, client deadline beyond gateway's 30m cap)
+Command-line options take precedence. Astra supports low, medium, high,
+xhigh, max; other models may support minimal or ultra as well.
+
+Other arguments pass to claude-workflow (including --resume, --continue,
+--no-yolo, setup, doctor, and config). Use -- --help for its full help.
+The config command manages shared claude-workflow defaults; use the options
+or environment variables above to change this launcher's routes.
+Requires claude-workflow and an authenticated Codex CLI (codex login).
+HELP
+      exit 0
+      ;;
+    --) args+=("$@"); break ;;
+    --main-model|--main-effort|--agent-model|--agent-effort|--workspace)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "$1 requires a value"
+      option="$1"; value="$2"; shift 2
+      case "$option" in
+        --main-model) main_model="$value" ;;
+        --main-effort) main_effort="$value" ;;
+        --agent-model) agent_model="$value" ;;
+        --agent-effort) agent_effort="$value" ;;
+        --workspace) cd -- "$value" ;;
+      esac
+      ;;
+    --main-model=*|--main-effort=*|--agent-model=*|--agent-effort=*|--workspace=*)
+      option="${1%%=*}"; value="${1#*=}"; shift
+      [[ -n "$value" ]] || fail "$option requires a value"
+      case "$option" in
+        --main-model) main_model="$value" ;;
+        --main-effort) main_effort="$value" ;;
+        --agent-model) agent_model="$value" ;;
+        --agent-effort) agent_effort="$value" ;;
+        --workspace) cd -- "$value" ;;
+      esac
+      ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+validate_effort() {
+  case "$2" in
+    minimal|low|medium|high|xhigh|max|ultra) ;;
+    *) fail "invalid $3 effort '$2': expected minimal, low, medium, high, xhigh, max, or ultra" ;;
+  esac
+  if [[ "$1" == gpt-6-astra && ( "$2" == minimal || "$2" == ultra ) ]]; then
+    fail "gpt-6-astra $3 effort must be low, medium, high, xhigh, or max"
+  fi
+}
+validate_effort "$main_model" "$main_effort" main
+validate_effort "$agent_model" "$agent_effort" agent
+
+# Distinct exposed IDs keep main and agent efforts separate even on one model.
+export ULTRATHINK_GATEWAY_MAIN_MODEL_ID='astra-main'
+export ULTRATHINK_GATEWAY_MAIN_PROVIDER='codex'
+export ULTRATHINK_GATEWAY_MAIN_UPSTREAM_MODEL="$main_model"
+export ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT="$main_effort"
+export ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS='none'
+export ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID='astra-agent'
+export ULTRATHINK_GATEWAY_CODEX_MODEL="$agent_model"
+export ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL="$agent_model"
+export ULTRATHINK_GATEWAY_CODEX_REASONING_EFFORT="$agent_effort"
+export ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT="$agent_effort"
+
+# Long-context xhigh summaries can exceed the gateway's generic five-minute
+# deadline. Keep the client deadline beyond the gateway's maximum (30 minutes)
+# so the gateway owns cancellation and can return a useful error.
+export ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS="${ULTRATHINK_GATEWAY_REQUEST_TIMEOUT_MS:-900000}"
+export API_TIMEOUT_MS="${API_TIMEOUT_MS:-1860000}"
+
+exec claude-workflow ${args[@]+"${args[@]}"}

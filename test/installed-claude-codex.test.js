@@ -255,7 +255,7 @@ test('direct Codex main generates local client auth and strips it from the Codex
         mainModelId
       );
       assert.equal(clientEnv.ANTHROPIC_AUTH_TOKEN, config.sharedSecret);
-      assert.equal(clientEnv.ANTHROPIC_API_KEY, config.sharedSecret);
+      assert.equal(clientEnv.ANTHROPIC_API_KEY, null);
       assert.equal(clientEnv[MANAGED_GATEWAY_AUTH_ENV_NAME], config.sharedSecret);
       assert.equal(clientEnv.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, '1');
       assert.equal(clientEnv.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '828400');
